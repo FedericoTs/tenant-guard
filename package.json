@@ -63,6 +63,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/FedericoTs/tenant-guard"
+    "url": "git+https://github.com/FedericoTs/tenant-guard.git"
   }
 }

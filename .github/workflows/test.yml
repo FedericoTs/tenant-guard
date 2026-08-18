@@ -7,7 +7,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
+      # Installs the dev-only pglite (embedded Postgres) so the runtime RLS proof
+      # actually runs in CI instead of skipping. The shipped guards stay zero-dep;
+      # pg is an optional peer and is not installed here.
+      - run: npm ci
       - run: node --test
-      # dogfood: the tool must pass its own guards against the leaky demo? no —
-      # the demo is MEANT to fail. Run guards against the repo root (should pass).
+      # dogfood: the static guards must pass against this repo's own tree.
+      # (examples/leaky-demo is MEANT to fail, so it is not the target here.)
       - run: node bin/tenant-guard.mjs run

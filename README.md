@@ -76,6 +76,36 @@ tenant-guard  — guard tests for multi-tenant isolation
 
 `npx tenant-guard list` describes each.
 
+## How it fits your project
+
+tenant-guard runs **inside your repository**, against the files already on disk.
+It is **not** a scanner you point at a URL or a website, and there is no hosted
+service — you run it where your code is (locally or in CI). The only thing you
+ever "point it at" is a **test database connection string**, and only for the
+optional runtime proof.
+
+| Part | What it reads | What you provide |
+|---|---|---|
+| static guards (`run`) | your API-route and SQL-migration **files** in the current directory | nothing — it reads the folder |
+| runtime proof (`prove`) | a live **Postgres** database | a connection string to a *test/staging* DB (never a URL, never prod) |
+
+Three places it runs, all inside the repo:
+
+- **Locally** — `cd your-project && npx tenant-guard run` scans that folder.
+- **In CI** — your pipeline checks out the repo and runs `npx tenant-guard run`,
+  so a leak **blocks the merge** (that's the CI badge at the top).
+- **In your test suite** — `import { runAll, prove } from 'tenant-guard'` and
+  assert no violations, so it runs with `npm test`.
+
+Anyone else uses it identically in **their own** repo: `npx` pulls it from npm
+(no clone of this repo, no account, no server), `init` autodetects their layout,
+and they commit a `tenant-guard.config.json` so their team and CI share one
+baseline. It works on any stack with API-route files and SQL migrations — see
+[Config](#config) to point the signals at a non–Next.js/Supabase layout.
+
+It does **not** take a repo URL, crawl GitHub, make HTTP requests to your app, or
+run as a SaaS.
+
 ## Prove it at runtime — the part no scanner can do
 
 The three guards above read source text: they catch the obvious leak cheaply,

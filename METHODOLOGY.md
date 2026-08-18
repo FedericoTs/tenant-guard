@@ -78,15 +78,33 @@ history can't be changed and shouldn't block you. A guard that fails on
 immoverable past is a guard people delete. A guard that only polices *new*
 commits is one they keep.
 
-## Roadmap: from tripwire to proof
+## From tripwire to proof (shipped)
 
-The guards here are heuristics on source text. They catch the obvious leak
-cheaply, but they can't *prove* isolation holds. The next step is a runtime
-guard: spin up an ephemeral Postgres, create two tenants, and assert — as a test
-in your suite — that tenant A's session literally cannot read tenant B's rows,
-across every table with a tenant column. A static scanner can never do this; a
-test can. That is the guard that turns "we think RLS is on" into "the build
-proves it, on every commit." It's the direction this project is going.
+The first three guards are heuristics on source text. They catch the obvious
+leak cheaply, but they can't *prove* isolation holds. So there's now a fourth,
+runtime guard — `tenant-guard prove`. Against a real Postgres it drops to your
+non-superuser app role, assumes one tenant's identity, and asserts that session
+literally cannot read another tenant's rows, across every table with a tenant
+column. A static scanner can never do this; a query can.
+
+It catches the three ways real apps leak that no source scan proves: RLS switched
+**off** on a tenant table (the [CVE-2025-48757](https://nvd.nist.gov/vuln/detail/CVE-2025-48757)
+class — 10.3% of a sample of AI-built apps), a policy left `USING (true)`, and a
+policy that simply forgot the tenant predicate. It runs read-only inside a
+rolled-back transaction, and it distinguishes "proven isolated" from "couldn't
+be proven" so a single-tenant fixture is never mistaken for a pass.
+
+That is the guard that turns "we think RLS is on" into "the build proves it, on
+every commit." The mechanism, the config, and a zero-infrastructure demo are in
+[`examples/rls-proof/`](examples/rls-proof/README.md).
+
+## Roadmap: what's next
+
+The proof tests the tables that already carry two tenants' data. The natural next
+step is a **seeding** mode that manufactures two synthetic tenants for tables
+that don't, so coverage doesn't depend on fixture data — plus a Supabase preset
+that discovers the app role and JWT shape automatically. Those are conveniences
+on top of a mechanism that already holds.
 
 ---
 

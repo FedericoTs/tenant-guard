@@ -14,7 +14,7 @@ export const bold = (s) => c('1', s);
  * Print results and return the process exit code (0 pass, 1 any violation).
  * @param {Array} results  guard result objects
  */
-export function report(results, { title = true } = {}) {
+export function report(results, { title = true, emptyHint = true } = {}) {
   if (title) console.log(bold('\ntenant-guard') + dim('  — guard tests for multi-tenant isolation\n'));
 
   let failed = 0;
@@ -38,6 +38,12 @@ export function report(results, { title = true } = {}) {
     }
   }
 
+  // Informational notes (e.g. tables that couldn't be proven) — never fail the build.
+  for (const r of results) {
+    if (!r.notes || r.notes.length === 0) continue;
+    for (const n of r.notes) console.log(dim(`  ${r.id}: ${n.where} — ${n.message}`));
+  }
+
   const ran = results.length - skipped;
   console.log('');
   if (failed > 0) {
@@ -46,7 +52,9 @@ export function report(results, { title = true } = {}) {
     return 1;
   }
   if (ran === 0) {
-    console.log(yellow('No guards applied to this project.') + dim(' Run `tenant-guard init` to configure paths.\n'));
+    if (emptyHint) {
+      console.log(yellow('No guards applied to this project.') + dim(' Run `tenant-guard init` to configure paths.\n'));
+    }
     return 0;
   }
   console.log(green(bold(`✓ all ${ran} guard(s) passed`)) + dim(skipped ? `  (${skipped} skipped)` : '') + '\n');

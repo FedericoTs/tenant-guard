@@ -2,15 +2,19 @@
 /**
  * tenant-guard CLI.
  *
- *   tenant-guard run     run every configured guard; exit 1 on any violation
+ *   tenant-guard run     run every static guard; exit 1 on any violation
+ *   tenant-guard prove   runtime RLS proof against a database; exit 1 on a leak
  *   tenant-guard init    write a tenant-guard.config.json, seeded from this repo
  *   tenant-guard list    list the available guards and what each prevents
  *
- * Zero dependencies. Designed to run in CI without `npm ci`.
+ * `run`, `init`, `list` are zero-dependency and run in CI without `npm ci`.
+ * `prove` additionally needs a database URL and the `pg` driver; without them it
+ * skips (a skip is not a pass — it says so).
  */
 import { writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { GUARDS, runAll } from '../src/index.mjs';
+import { GUARDS, runAll, runProof } from '../src/index.mjs';
+import { rlsProof } from '../src/index.mjs';
 import { CONFIG_FILENAME, autodetect } from '../src/config.mjs';
 import { report, bold, dim, green, yellow } from '../src/runner.mjs';
 
@@ -22,9 +26,24 @@ if (cmd === 'run') {
   process.exit(code);
 }
 
+if (cmd === 'prove') {
+  // Runtime RLS proof. Async — needs a database. Exit 1 only on a proven leak.
+  const result = await runProof(cwd);
+  const code = report([result], { emptyHint: false });
+  if (result.skipped) {
+    console.log(
+      dim(
+        '  (A skip is not a pass. Point it at a seeded test/staging database:\n' +
+          `   export TENANT_GUARD_DATABASE_URL=postgres://…  &&  npm i -D pg  &&  tenant-guard prove)\n`,
+      ),
+    );
+  }
+  process.exit(code);
+}
+
 if (cmd === 'list') {
   console.log(bold('\ntenant-guard guards\n'));
-  for (const g of GUARDS) {
+  for (const g of [...GUARDS, rlsProof]) {
     console.log(`  ${bold(g.meta.id)}`);
     console.log(dim(`    ${g.meta.title}`));
     console.log(dim(`    ${g.meta.why}\n`));
@@ -53,6 +72,17 @@ if (cmd === 'init') {
       routesDir: detected.routesDir ?? 'src/app/api',
       allowlist: [],
     },
+    rlsProof: {
+      // The runtime proof runs only when a database URL is present in the
+      // environment (below), so it stays skipped until you opt in.
+      urlEnv: 'TENANT_GUARD_DATABASE_URL',
+      role: 'authenticated',
+      // How a session assumes a tenant's identity ($1 = tenant id). Default =
+      // the canonical Postgres pattern. For Supabase JWT policies use e.g.
+      // ["select set_config('request.jwt.claims', json_build_object('org_id',$1)::text, true)"]
+      becomeTenant: ["select set_config('app.current_tenant', $1, true)"],
+      grandfather: [],
+    },
   };
   writeFileSync(path, JSON.stringify(config, null, 2) + '\n');
   console.log(green(`✓ wrote ${CONFIG_FILENAME}`));
@@ -68,5 +98,5 @@ if (cmd === 'init') {
   process.exit(0);
 }
 
-console.error(`Unknown command: ${cmd}\nUsage: tenant-guard [run|init|list]`);
+console.error(`Unknown command: ${cmd}\nUsage: tenant-guard [run|prove|init|list]`);
 process.exit(2);

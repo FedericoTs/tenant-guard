@@ -1,7 +1,7 @@
 {
   "name": "tenant-guard",
   "version": "0.1.0",
-  "description": "Guard tests that fail your CI when multi-tenant code can leak across tenants. Not a scanner you run and ignore — checks that live in your repo and block the merge. Zero dependencies.",
+  "description": "Guard tests that fail your CI when multi-tenant code can leak across tenants. Static guards run zero-dependency in CI; the runtime RLS proof spins up two tenants and proves one can't read the other. Not a scanner you run and ignore — checks that live in your repo and block the merge.",
   "type": "module",
   "license": "MIT",
   "author": "Federico Sciuca",
@@ -12,7 +12,8 @@
     ".": "./src/index.mjs",
     "./guards/migration-collisions": "./src/guards/migration-collisions.mjs",
     "./guards/definer-grants": "./src/guards/definer-grants.mjs",
-    "./guards/route-org-scoping": "./src/guards/route-org-scoping.mjs"
+    "./guards/route-org-scoping": "./src/guards/route-org-scoping.mjs",
+    "./guards/rls-proof": "./src/guards/rls-proof.mjs"
   },
   "files": [
     "bin",
@@ -24,7 +25,20 @@
   ],
   "scripts": {
     "test": "node --test",
-    "selfcheck": "node bin/tenant-guard.mjs run"
+    "selfcheck": "node bin/tenant-guard.mjs run",
+    "prove": "node bin/tenant-guard.mjs prove",
+    "demo:rls": "node examples/rls-proof/demo.mjs"
+  },
+  "peerDependencies": {
+    "pg": ">=8"
+  },
+  "peerDependenciesMeta": {
+    "pg": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.5"
   },
   "keywords": [
     "multi-tenant",

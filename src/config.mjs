@@ -71,6 +71,21 @@ export function resolveGuardConfigs(config) {
   };
 }
 
+/**
+ * Resolve the runtime RLS-proof config from the user's `rlsProof` block. Only
+ * the keys the user set are returned; the guard fills the rest from its own
+ * DEFAULTS. Absent block => {} => guard runs with defaults (and skips unless a
+ * database URL is present in the environment).
+ */
+export function resolveProveConfig(config) {
+  const p = config.rlsProof ?? {};
+  const out = {};
+  for (const k of ['url', 'urlEnv', 'schemas', 'tenantColumns', 'role', 'becomeTenant', 'tables', 'grandfather', 'sampleLimit']) {
+    if (p[k] !== undefined) out[k] = p[k];
+  }
+  return out;
+}
+
 export function autodetect(cwd = process.cwd()) {
   return {
     migrationsDir: firstExisting(cwd, CANDIDATE_MIGRATION_DIRS),

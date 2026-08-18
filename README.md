@@ -4,12 +4,13 @@
 
 Not a scanner you run and then ignore. These are checks that live in your repo,
 run in `npm test` and your CI, and **block the merge** — so the cross-tenant
-leak never ships. Zero dependencies; the whole thing runs in CI without
-`npm ci`.
+leak never ships. The static guards have **zero dependencies** and run in CI
+without `npm ci`; the runtime proof adds a real Postgres check when you opt in.
 
 ```bash
 npx tenant-guard init     # detects your migrations + API routes, writes a config
-npx tenant-guard run      # exit 1 if anything can leak
+npx tenant-guard run      # static guards — exit 1 if anything can leak
+npx tenant-guard prove    # runtime proof — exit 1 if a tenant can read another tenant
 ```
 
 ---
@@ -60,8 +61,45 @@ tenant-guard  — guard tests for multi-tenant isolation
 | `route-org-scoping` | an authenticated route filters by a bare `id` and never mentions a tenant column | catches the *shape* of the IDOR (auth + bare-id + no-tenant), and it lives in your CI so it blocks the merge instead of adding one more report |
 | `definer-grants` | a new mutating `SECURITY DEFINER` function isn't revoked from `PUBLIC`/`anon` | requires knowing Postgres default grants + PostgREST exposure interact — *revoking from `anon` alone is a no-op* |
 | `migration-collisions` | two migrations share a numeric prefix | a project-specific CI invariant (your numbering scheme), not a code smell |
+| `rls-proof` *(runtime)* | a tenant's session can actually read another tenant's rows | it isn't reading source at all — it runs a real query as your app role and measures the leak; nothing static can prove isolation *holds* |
 
 `npx tenant-guard list` describes each.
+
+## Prove it at runtime — the part no scanner can do
+
+The three guards above read source text: they catch the obvious leak cheaply,
+but they can't *prove* isolation holds. `tenant-guard prove` can. Against a
+seeded test database it:
+
+1. finds every table with a tenant column, noting whether RLS is even on;
+2. as the privileged role (which bypasses RLS, like Supabase `service_role`)
+   picks two real tenant ids that already have data;
+3. drops to your **non-superuser app role** (e.g. `authenticated`), assumes
+   tenant A's identity, and asserts A's session sees **zero** of tenant B's
+   rows — then checks the other direction.
+
+If RLS is off, or a policy is `USING (true)`, or a policy forgot the tenant
+predicate, tenant A sees tenant B's rows and the proof **fails your build**.
+
+See it catch a real leak with zero infrastructure:
+
+```bash
+npm i @electric-sql/pglite        # embedded Postgres — no Docker
+node examples/rls-proof/demo.mjs  # passes a good policy, fails a leaky one
+```
+
+Against your own database (a **test/staging** one, never production):
+
+```bash
+npm i -D pg
+export TENANT_GUARD_DATABASE_URL="postgres://…/your_test_db"
+npx tenant-guard prove
+```
+
+It only ever runs `SELECT`s, inside a transaction it rolls back — non-destructive
+by construction. A skip (no database, or `pg` not installed) is **not** a pass,
+and the CLI says so. Full setup — including the Supabase JWT-claim config — is in
+[`examples/rls-proof/`](examples/rls-proof/README.md).
 
 ## Why not just a SAST scanner?
 
@@ -98,9 +136,21 @@ Or import the guards into your existing vitest/jest suite:
 
 ```js
 import { runAll } from 'tenant-guard';
-test('no cross-tenant leaks', () => {
+test('no cross-tenant leaks (static)', () => {
   const failed = runAll().filter(r => !r.ok && !r.skipped);
   expect(failed).toEqual([]);
+});
+```
+
+The runtime proof drops straight into your suite too — hand it any Postgres
+client whose `query(text, values)` returns `{ rows }` (node-postgres, or an
+embedded pglite in tests):
+
+```js
+import { prove } from 'tenant-guard';
+test('RLS actually isolates tenants', async () => {
+  const res = await prove({ query: (t, v) => pool.query(t, v) });
+  expect(res.violations).toEqual([]);
 });
 ```
 
@@ -114,9 +164,15 @@ that doesn't apply to your stack **skips**, it never fails you.
 {
   "migrations":     { "dir": "supabase/migrations", "grandfather": ["031", "101"] },
   "definerGrants":  { "baseline": 189, "allowlist": ["validate_public_token"] },
-  "routeOrgScoping":{ "routesDir": "src/app/api", "allowlist": [] }
+  "routeOrgScoping":{ "routesDir": "src/app/api", "allowlist": [] },
+  "rlsProof":       { "role": "authenticated", "tenantColumns": ["organization_id"], "grandfather": ["shared_lookup"] }
 }
 ```
+
+`rlsProof` runs only when `TENANT_GUARD_DATABASE_URL` (or `DATABASE_URL`) is set,
+so it stays skipped until you opt in. `becomeTenant` (how a session assumes a
+tenant identity) defaults to the canonical Postgres GUC pattern; override it for
+Supabase JWT policies — see [`examples/rls-proof/`](examples/rls-proof/README.md).
 
 Defaults target Next.js App Router + Supabase/Postgres, but every signal
 (auth helpers, tenant column names, route glob) is configurable, so it works on
@@ -124,13 +180,19 @@ any stack that has API routes and SQL migrations.
 
 ## Honest limits
 
-These are **heuristics on source text**, deliberately conservative — they catch
-a bug *shape*, not every instance, and the real defence for tenant isolation is
-**row-level security enforced in the database**. tenant-guard is the tripwire
-that stops the obvious leak from merging; it is not a substitute for RLS or a
-pen test. The strongest possible check — a runtime test that spins up two
-tenants and *proves* one can't read the other — is on the roadmap
-([`METHODOLOGY.md`](METHODOLOGY.md)).
+The three static guards are **heuristics on source text**, deliberately
+conservative — they catch a bug *shape*, not every instance. The real defence
+for tenant isolation is **row-level security enforced in the database**, which is
+exactly why `rls-proof` exists: it doesn't guess from source, it runs a query as
+your app role and measures whether the isolation actually holds.
+
+`rls-proof` has honest limits of its own. It proves isolation for the tables it
+can reach with the tenant identity you configure; it can only test tables that
+already hold two tenants' data (it reports the rest as *not proven*, never as
+passing); and it's only as good as the `becomeTenant` config matching how your
+app assumes a tenant — a mismatch shows up as "sees none of its own rows either",
+not a false pass. It is a strong proof on every commit, not a substitute for a
+pen test.
 
 ## Background
 

@@ -37,10 +37,11 @@ and over:
   because Postgres grants EXECUTE to `PUBLIC` by default;
 - two migrations collide on a number and apply in the wrong order.
 
-These aren't exotic. [170 of 1,645 Lovable showcase apps (10.3%) shipped with
-missing row-level security](https://nvd.nist.gov/vuln/detail/CVE-2025-48757),
-exposing 303 endpoints. [Wiz found an SSO-bypass in Base44](https://www.wiz.io/blog/wiz-research-uncovers-critical-vulnerability-in-base44)
-that reached into any private enterprise app. [Veracode's 2025 study](https://www.veracode.com/resources/analyst-reports/2025-genai-code-security-report/)
+These aren't exotic. Under [CVE-2025-48757](https://nvd.nist.gov/vuln/detail/CVE-2025-48757),
+303 endpoints across 170 Lovable projects had Supabase tables readable by
+**unauthenticated** requests using the public anon key. [Wiz found an auth
+bypass in Base44](https://www.wiz.io/blog/critical-vulnerability-base44) that
+reached into private enterprise apps. [Veracode's 2025 study](https://www.veracode.com/resources/analyst-reports/2025-genai-code-security-report/)
 found 45% of LLM-generated code introduces an OWASP Top 10 flaw — and larger,
 newer models were **not** safer.
 

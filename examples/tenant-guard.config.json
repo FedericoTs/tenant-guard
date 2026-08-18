@@ -1,0 +1,16 @@
+{
+  "migrations": {
+    "dir": "supabase/migrations",
+    "grandfather": ["031", "101"]
+  },
+  "definerGrants": {
+    "baseline": 189,
+    "allowlist": ["record_login_attempt", "check_login_rate_limit", "validate_public_token"]
+  },
+  "routeOrgScoping": {
+    "routesDir": "src/app/api",
+    "authSignals": ["withApiAuth", "requirePermission", "getUser("],
+    "tenantSignals": ["organization_id", "organizationId", "tenant_id", "account_id"],
+    "allowlist": ["src/app/api/health/route.ts"]
+  }
+}

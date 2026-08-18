@@ -1,0 +1,5 @@
+{
+  "migrations": { "dir": "supabase/migrations", "grandfather": [] },
+  "definerGrants": { "baseline": 100, "allowlist": [] },
+  "routeOrgScoping": { "routesDir": "src/app/api", "allowlist": [] }
+}

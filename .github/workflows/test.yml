@@ -1,0 +1,13 @@
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - run: node --test
+      # dogfood: the tool must pass its own guards against the leaky demo? no —
+      # the demo is MEANT to fail. Run guards against the repo root (should pass).
+      - run: node bin/tenant-guard.mjs run

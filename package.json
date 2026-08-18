@@ -1,0 +1,54 @@
+{
+  "name": "tenant-guard",
+  "version": "0.1.0",
+  "description": "Guard tests that fail your CI when multi-tenant code can leak across tenants. Not a scanner you run and ignore — checks that live in your repo and block the merge. Zero dependencies.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Federico Sciuca",
+  "bin": {
+    "tenant-guard": "bin/tenant-guard.mjs"
+  },
+  "exports": {
+    ".": "./src/index.mjs",
+    "./guards/migration-collisions": "./src/guards/migration-collisions.mjs",
+    "./guards/definer-grants": "./src/guards/definer-grants.mjs",
+    "./guards/route-org-scoping": "./src/guards/route-org-scoping.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "examples",
+    "README.md",
+    "METHODOLOGY.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "selfcheck": "node bin/tenant-guard.mjs run"
+  },
+  "keywords": [
+    "multi-tenant",
+    "tenant-isolation",
+    "rls",
+    "row-level-security",
+    "idor",
+    "cross-tenant",
+    "security",
+    "ci",
+    "guard",
+    "guardrails",
+    "supabase",
+    "postgres",
+    "nextjs",
+    "saas",
+    "ai-generated-code",
+    "vibe-coding"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/FedericoTs/tenant-guard"
+  }
+}

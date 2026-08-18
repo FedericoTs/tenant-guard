@@ -3,6 +3,13 @@
 **Guard tests that fail your CI when multi-tenant code can leak across tenants.**
 
 <p align="center">
+  <a href="https://github.com/FedericoTs/tenant-guard/actions/workflows/test.yml"><img src="https://github.com/FedericoTs/tenant-guard/actions/workflows/test.yml/badge.svg" alt="CI status"></a>
+  <a href="https://www.npmjs.com/package/tenant-guard"><img src="https://img.shields.io/npm/v/tenant-guard.svg" alt="npm version"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/npm/l/tenant-guard.svg" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/dependencies-0-brightgreen.svg" alt="zero dependencies">
+</p>
+
+<p align="center">
   <img src="https://raw.githubusercontent.com/FedericoTs/tenant-guard/main/assets/demo.gif" alt="tenant-guard failing CI on two cross-tenant leaks: a SECURITY DEFINER function callable by anon, and an API route that filters by bare id with no tenant scope" width="760">
 </p>
 

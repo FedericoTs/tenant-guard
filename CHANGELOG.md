@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.2
+
+Docs only — no code changes since 0.1.1.
+
+- README: animated demo GIF, CI / npm / license / zero-dependency badges, and a
+  "How it fits your project" section clarifying that tenant-guard runs **in your
+  repo** against files on disk (plus an optional test-database connection for the
+  runtime proof) — it is not a scanner you point at a URL.
+- Corrected the CVE-2025-48757 reference to the primary-sourced figure: 303
+  endpoints across 170 Lovable projects, readable by unauthenticated requests via
+  the public anon key.
+
 ## 0.1.1
 
 Everything here came out of trying to *prove* the flexibility claims rather than

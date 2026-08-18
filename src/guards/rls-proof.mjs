@@ -44,8 +44,9 @@ export const DEFAULTS = {
   // SQL run (as `role`) to assume a tenant's identity. `$1` is the tenant id.
   // The default targets the canonical Postgres pattern:
   //   ... USING (tenant_col = current_setting('app.current_tenant'))
-  // For Supabase JWT-claim policies, override with e.g.
-  //   ["select set_config('request.jwt.claims', json_build_object('sub',$1,'org_id',$1)::text, true)"]
+  // For Supabase JWT-claim policies, override with e.g. (note the $1::text cast —
+  // json_build_object gives Postgres no way to infer the placeholder's type):
+  //   ["select set_config('request.jwt.claims', json_build_object('org_id', $1::text)::text, true)"]
   becomeTenant: ["select set_config('app.current_tenant', $1, true)"],
   tables: null, // null = autodiscover; or [{ table, schema?, tenantColumn }]
   grandfather: [], // table names deliberately shared/unscoped (reference data)
@@ -263,6 +264,7 @@ export async function prove({ query, config = {} }) {
       scanned++;
 
       let noAccess = false;
+      let probeError = null;
       let ownVisible = 0;
       let crossVisible = 0;
       try {
@@ -279,7 +281,20 @@ export async function prove({ query, config = {} }) {
         crossVisible = Math.max(crossVisible, (await q(crossRev.text, crossRev.values))[0].n);
       } catch (err) {
         if (isPermissionDenied(err)) noAccess = true;
-        else throw err;
+        else probeError = err.message; // e.g. a becomeTenant config error — don't crash the whole proof
+      }
+
+      // A becomeTenant/role misconfiguration fails identically for every table,
+      // so surface it as a clear note (with the actionable hint) rather than a
+      // cryptic crash, and don't pretend the table was proven.
+      if (probeError) {
+        notes.push({
+          where: `${t.schema}.${t.table}`,
+          message:
+            `could not probe — check rlsProof.becomeTenant/role: ${probeError}` +
+            (/determine data type|42P18/i.test(probeError) ? ` (cast the placeholder, e.g. $1::text)` : ''),
+        });
+        continue;
       }
 
       const verdict = classifyTableResult({ rlsEnabled: t.rlsEnabled, ownVisible, crossVisible, tenantCount: t.tenants.length, noAccess });

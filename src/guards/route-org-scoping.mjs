@@ -28,8 +28,13 @@ export const DEFAULTS = {
   routeFilePattern: '(route|handler)\\.(ts|tsx|js|mjs)$',
   // A request is authenticated if any of these appear.
   authSignals: ['withApiAuth', 'requirePermission', 'getUser(', 'auth.getUser', 'getServerSession', 'requireAuth'],
-  // A bare-id filter looks like .eq('id'| .eq("document_id" | where: { id:
-  idFilterPattern: `\\.eq\\(\\s*['"\\\`](id|[a-z_]*_id)['"\\\`]|where:\\s*\\{\\s*id\\b`,
+  // A bare-id filter, across the common TS query layers:
+  //   Supabase:  .eq('id', …) / .eq("document_id", …)
+  //   Prisma:    where: { id: … }
+  //   Drizzle:   eq(invoices.id, …) / eq(t.vendor_id, …)
+  // Raw SQL (where id = …) is deliberately NOT in the default — too prone to
+  // false positives on self-loads; widen idFilterPattern in config if you use it.
+  idFilterPattern: `\\.eq\\(\\s*['"\\\`](id|[a-z_]*_id)['"\\\`]|where:\\s*\\{\\s*id\\b|\\beq\\(\\s*[\\w$]+\\.(id|[a-z_]*_id)\\b`,
   // A tenant-scoping mention (any of these makes the file safe).
   tenantSignals: ['organization_id', 'organizationId', 'tenant_id', 'tenantId', 'org_id', 'account_id', 'workspace_id'],
 };

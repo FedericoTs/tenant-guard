@@ -78,8 +78,9 @@ if (cmd === 'init') {
       urlEnv: 'TENANT_GUARD_DATABASE_URL',
       role: 'authenticated',
       // How a session assumes a tenant's identity ($1 = tenant id). Default =
-      // the canonical Postgres pattern. For Supabase JWT policies use e.g.
-      // ["select set_config('request.jwt.claims', json_build_object('org_id',$1)::text, true)"]
+      // the canonical Postgres pattern. For Supabase JWT policies use e.g. (note
+      // the $1::text cast — json_build_object can't infer the placeholder type):
+      // ["select set_config('request.jwt.claims', json_build_object('org_id', $1::text)::text, true)"]
       becomeTenant: ["select set_config('app.current_tenant', $1, true)"],
       grandfather: [],
     },

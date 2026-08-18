@@ -1,0 +1,28 @@
+# Changelog
+
+## 0.1.1
+
+Everything here came out of trying to *prove* the flexibility claims rather than
+assert them — see `test/flexibility.test.mjs`.
+
+- **fix(rls-proof):** a misconfigured `becomeTenant` now degrades to a clear,
+  actionable note (`could not probe — … cast the placeholder, e.g. $1::text`)
+  instead of crashing the entire proof with a cryptic driver stack.
+- **fix(docs):** the Supabase JWT-claim `becomeTenant` example now casts the
+  placeholder (`$1::text`). Without it Postgres can't infer the type inside
+  `json_build_object` and the proof errored (SQLSTATE 42P18).
+- **feat(route-org-scoping):** the default bare-id detector now also catches
+  **Drizzle** (`eq(table.id, …)`), alongside Supabase (`.eq('id')`) and Prisma
+  (`where: { id }`). Re-validated false-positive-free against a real
+  493k-line codebase. Raw SQL (`where id = …`) stays out of the default and is
+  configurable via `idFilterPattern`.
+- **test:** add `test/flexibility.test.mjs` — proofs for Supabase JWT-claim
+  policies, non-Supabase session-GUC apps, Prisma/Drizzle routes, custom tenant
+  columns, robustness, and the documented boundaries. 48 tests total; the test
+  suite now ships in the package.
+
+## 0.1.0
+
+Initial release: three zero-dependency static guards (`route-org-scoping`,
+`definer-grants`, `migration-collisions`) plus the runtime `rls-proof`, the CLI
+(`run` / `prove` / `init` / `list`), config, and runnable examples.

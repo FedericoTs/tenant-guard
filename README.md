@@ -176,7 +176,14 @@ Supabase JWT policies — see [`examples/rls-proof/`](examples/rls-proof/README.
 
 Defaults target Next.js App Router + Supabase/Postgres, but every signal
 (auth helpers, tenant column names, route glob) is configurable, so it works on
-any stack that has API routes and SQL migrations.
+any stack that has API routes and SQL migrations. The bare-id detector ships
+with patterns for **Supabase** (`.eq('id')`), **Prisma** (`where: { id }`), and
+**Drizzle** (`eq(table.id, …)`) out of the box; raw SQL (`where id = …`) is left
+out of the default to avoid false positives on self-loads — widen
+`idFilterPattern` in config if you want it. These claims are backed by tests in
+[`test/flexibility.test.mjs`](test/flexibility.test.mjs), which also prove
+`rls-proof` against Supabase JWT-claim policies and non-Supabase session-GUC
+apps.
 
 ## Honest limits
 

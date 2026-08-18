@@ -35,7 +35,7 @@ By default the proof assumes a tenant with the canonical Postgres pattern
   "rlsProof": {
     "role": "authenticated",
     "becomeTenant": [
-      "select set_config('request.jwt.claims', json_build_object('org_id', $1)::text, true)"
+      "select set_config('request.jwt.claims', json_build_object('org_id', $1::text)::text, true)"
     ],
     "tenantColumns": ["organization_id", "tenant_id"],
     "grandfather": ["shared_reference_table"]
@@ -43,9 +43,13 @@ By default the proof assumes a tenant with the canonical Postgres pattern
 }
 ```
 
-`$1` is bound to a tenant id the proof discovered in your data. If your RLS
-resolves the tenant from `auth.uid()` via a users table, set `sub` to a real
-user id of that tenant instead.
+`$1` is bound to a tenant id the proof discovered in your data. **Cast it
+(`$1::text`)** — `json_build_object` gives Postgres no way to infer the
+placeholder's type otherwise, and the proof will report a clear "could not
+probe — cast the placeholder, e.g. `$1::text`" note. If your RLS resolves the
+tenant from `auth.uid()` via a users table, set `sub` to a real user id of that
+tenant instead (the `becomeTenant` SQL can look it up: `... 'sub', (select id
+from users where organization_id = $1::text limit 1) ...`).
 
 ## What it reports
 

@@ -2,6 +2,10 @@
 
 **Guard tests that fail your CI when multi-tenant code can leak across tenants.**
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/FedericoTs/tenant-guard/main/assets/demo.gif" alt="tenant-guard failing CI on two cross-tenant leaks: a SECURITY DEFINER function callable by anon, and an API route that filters by bare id with no tenant scope" width="760">
+</p>
+
 Not a scanner you run and then ignore. These are checks that live in your repo,
 run in `npm test` and your CI, and **block the merge** — so the cross-tenant
 leak never ships. The static guards have **zero dependencies** and run in CI

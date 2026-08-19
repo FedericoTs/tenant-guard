@@ -6,7 +6,7 @@
  * itself?** A perfectly-written `USING (org_id = <identity>)` is worthless if the
  * caller controls `<identity>`.
  *
- * Four findings, deliberately at different confidence levels — because they are
+ * Five findings, deliberately at different confidence levels — because they are
  * knowable to different degrees from SQL alone:
  *
  *   1. **`user_metadata` used for authorization → FAIL.** In Supabase,
@@ -41,6 +41,16 @@
  *      The near-miss worth naming: `WITH CHECK (user_id = auth.uid())` pins WHO
  *      you are and leaves WHICH TENANT completely open.
  *
+ *   5. **A column that grants access is writable on your OWN row → FAIL.** Same
+ *      family as (4), but the write is an `UPDATE` of your own record and what
+ *      permits it is a **column privilege**, not a policy: `CREATE POLICY self ON
+ *      profiles FOR UPDATE USING (id = auth.uid()) WITH CHECK (id = auth.uid())`
+ *      is exactly right and still the bug, because **RLS is ROW-level and cannot
+ *      restrict columns**. It pins which rows you may touch and says nothing about
+ *      which fields, so you can set your own `role` to `'admin'`, or re-parent your
+ *      own `organization_id` into another tenant. Only a column-level GRANT stops
+ *      it, so that is what is read (`has_column_privilege`) and what the fix says.
+ *
  * Read-only: catalog reads plus, for the forgery proof, one rolled-back
  * transaction.
  */
@@ -60,7 +70,7 @@ import {
 export const meta = {
   id: 'identity-trust',
   title: 'What your policies trust for identity (forgeable-identity escalation)',
-  why: 'Asks the question every other check assumes away: can the caller forge the identity your policies authorize from? Flags user-writable JWT claims (user_metadata), callable SECURITY DEFINER functions that set the tenant GUC from an argument, and membership/junction tables that policies derive authority from but the caller can write — a self-grant into any tenant.',
+  why: 'Asks the question every other check assumes away: can the caller forge the identity your policies authorize from? Flags user-writable JWT claims (user_metadata), callable SECURITY DEFINER functions that set the tenant GUC from an argument, membership/junction tables that policies derive authority from but the caller can write (a self-grant into any tenant), and authorization columns writable on your own row (RLS is row-level and cannot restrict columns).',
 };
 
 export const DEFAULTS = {
@@ -70,6 +80,9 @@ export const DEFAULTS = {
   role: PROOF_DEFAULTS.role,
   becomeTenant: PROOF_DEFAULTS.becomeTenant,
   claim: null,
+  // Columns that decide what a caller may SEE. If the app role can UPDATE one of
+  // these on a table its own policies read, it escalates by editing its own row.
+  authorizationColumns: ['role', 'roles', 'user_role', 'is_admin', 'is_superadmin', 'is_staff', 'is_owner', 'admin', 'permissions', 'scopes', 'access_level', 'plan', 'tier'],
   allowlist: [], // "schema.policyname", "schema.table", or "schema.function"
 };
 
@@ -323,6 +336,62 @@ export function classifyAuthority({ schema, table, tenantColumn, rlsEnabled, can
   };
 }
 
+/**
+ * Columns on an authority table that decide what the caller may see, with whether
+ * the app role may UPDATE each ONE specifically.
+ *
+ * The reason this is a *column* question: **RLS is row-level and cannot restrict
+ * columns.** The textbook-correct self-update policy —
+ * `USING (id = auth.uid()) WITH CHECK (id = auth.uid())` — governs *which rows*
+ * you may touch and says nothing about *which fields*, so it happily lets you
+ * rewrite every column of your own row, `role` and `organization_id` included.
+ * The only thing that stops that is a column-level GRANT, which is why this is
+ * read from `has_column_privilege` rather than inferred from the policy text.
+ */
+export function escalationColumnsSql(qualifiedNames, columns, role) {
+  const text = `
+    select n.nspname as schema,
+           c.relname as table,
+           a.attname as column,
+           pg_catalog.has_column_privilege($3::text, c.oid, a.attnum, 'UPDATE') as can_update_col
+    from pg_catalog.pg_class c
+    join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+    join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
+    where (n.nspname || '.' || c.relname) = any($1)
+      and a.attname = any($2)
+    order by 1, 2, 3`;
+  return { text, values: [qualifiedNames, columns, role] };
+}
+
+/**
+ * Verdict for one authority table's self-escalation surface: can the caller
+ * UPDATE a column on their OWN row that other policies authorize from?
+ *
+ * A tenant column always counts — re-parenting your row into another tenant is
+ * escalation by definition. Any other column counts only when a policy that
+ * depends on this table actually reads it, which is what makes the write matter.
+ *
+ * @returns {{status:'leak'|'safe', message?:string, columns?:string[]}}
+ */
+export function classifySelfEscalation({ schema, table, columns = [], updatePolicies = [], referencedColumns = [], role = 'authenticated' }) {
+  // No UPDATE-applicable policy => the role cannot update any row here at all.
+  if (updatePolicies.length === 0) return { status: 'safe' };
+  const referenced = new Set(referencedColumns.map((c) => c.toLowerCase()));
+  const escalatable = columns.filter((c) => c.canUpdate && (c.isTenant || referenced.has(c.name.toLowerCase())));
+  if (escalatable.length === 0) return { status: 'safe' };
+  const names = escalatable.map((c) => c.name);
+  const why = escalatable
+    .map((c) => (c.isTenant ? `"${c.name}" re-parents the row into another tenant` : `"${c.name}" is read by a policy to decide access`))
+    .join('; ');
+  return {
+    status: 'leak',
+    columns: names,
+    message:
+      `"${role}" may UPDATE ${names.map((n) => `"${n}"`).join(', ')} on ${schema}.${table}, and a policy lets it update its OWN row — so a user escalates by rewriting their own record (${why}). ` +
+      `RLS is ROW-level: a correct-looking self-update policy like USING (id = auth.uid()) WITH CHECK (id = auth.uid()) controls WHICH ROWS you may touch and says nothing about WHICH COLUMNS, so it does not stop this`,
+  };
+}
+
 /** The forged-claim statement: the tenant key ONLY inside user_metadata. */
 export function forgeUserMetadataSql(claimKey) {
   if (!/^[A-Za-z0-9_]+$/.test(claimKey || '')) throw new Error(`unsafe claim key: ${JSON.stringify(claimKey)}`);
@@ -359,7 +428,8 @@ export async function check({ query, config = {} }) {
   const skip = new Set(cfg.allowlist);
 
   const pe = policyExprSql(cfg.schemas, cfg.tenantColumns);
-  const policies = (await q(pe.text, pe.values))
+  const rawPolicyText = await q(pe.text, pe.values);
+  const policies = rawPolicyText
     .map(classifyPolicyRow)
     .filter((p) => !skip.has(`${p.schema}.${p.policy}`) && !skip.has(p.id) && !skip.has(p.policy));
   if (policies.length === 0) {
@@ -406,6 +476,29 @@ export async function check({ query, config = {} }) {
     const details = await q(det.text, det.values);
     const wp = writePoliciesSql(depNames);
     const writePolicies = await q(wp.text, wp.values);
+    // Which escalation columns each authority table has and whether the role may
+    // UPDATE them, plus which of those column NAMES the dependent policies
+    // actually read — a writable column only escalates if something authorizes
+    // from it.
+    const ec = escalationColumnsSql(depNames, cfg.tenantColumns.concat(cfg.authorizationColumns), role);
+    const escalationCols = {};
+    for (const r of await q(ec.text, ec.values)) {
+      const k = `${r.schema}.${r.table}`;
+      (escalationCols[k] = escalationCols[k] || []).push(r);
+    }
+    const referencedByPolicy = {};
+    for (const dep of deps) {
+      const k = `${dep.dep_schema}.${dep.dep_table}`;
+      const raw = rawPolicyText
+        .filter((p) => p.schema === dep.schema && p.table === dep.policy_table && p.policy === dep.policy)
+        .map((p) => `${p.qual || ''} ${p.with_check || ''}`)
+        .join(' ');
+      const hits = (escalationCols[k] || [])
+        .map((c) => c.column)
+        .filter((n) => new RegExp(`\\b${n}\\b`, 'i').test(raw));
+      referencedByPolicy[k] = [...new Set((referencedByPolicy[k] || []).concat(hits))];
+    }
+
     for (const d of details) {
       const id = `${d.schema}.${d.table}`;
       const dependents = [...new Set(deps.filter((x) => `${x.dep_schema}.${x.dep_table}` === id).map((x) => `${x.schema}.${x.policy_table}`))];
@@ -434,6 +527,37 @@ export async function check({ query, config = {} }) {
         });
       } else if (verdict.status === 'unknown') {
         notes.push({ where: id, message: verdict.message });
+      }
+
+      // 3.8 — self-row escalation. Same "write your own authority" family as
+      // above, but the write is an UPDATE of your OWN row, and what permits it is
+      // a COLUMN privilege rather than a policy: RLS cannot restrict columns, so
+      // a correct self-update policy still lets you rewrite the field that grants
+      // your access. Reported separately from 2.10 because the fix is different —
+      // a column-level GRANT, not a policy change.
+      const esc = classifySelfEscalation({
+        schema: d.schema,
+        table: d.table,
+        columns: (escalationCols[id] || []).map((c) => ({
+          name: c.column,
+          canUpdate: c.can_update_col === true || c.can_update_col === 't',
+          isTenant: cfg.tenantColumns.includes(c.column),
+        })),
+        updatePolicies: writePolicies.filter((p) => `${p.schema}.${p.table}` === id && (p.cmd === 'UPDATE' || p.cmd === 'ALL')),
+        referencedColumns: referencedByPolicy[id] || [],
+        role,
+      });
+      if (esc.status === 'leak') {
+        violations.push({
+          where: id,
+          kind: 'self-escalation',
+          message: `${esc.message}. Policies that depend on it: ${dependents.join(', ')}`,
+          fix:
+            `RLS cannot fix this — use COLUMN-level privileges so the authorization fields simply aren't writable:\n` +
+            `        REVOKE UPDATE ON ${qualified(d.schema, d.table)} FROM ${role};\n` +
+            `        GRANT UPDATE (/* only the safe profile columns: display_name, avatar_url, … */) ON ${qualified(d.schema, d.table)} TO ${role};\n` +
+            `      Change ${esc.columns.map((c) => `"${c}"`).join(', ')} only through a SECURITY DEFINER flow that authorizes the change.`,
+        });
       }
     }
   }

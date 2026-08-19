@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.12.0
+
+Threat-model **3.8**, and it rhymes with 0.11.0: the policy is right, the thing it
+trusts is writable. This time the write is to your **own row**.
+
+- **feat(identity-trust): self-row escalation.** `CREATE POLICY self ON profiles
+  FOR UPDATE USING (id = auth.uid()) WITH CHECK (id = auth.uid())` is exactly
+  right, and exactly the bug — because **RLS is ROW-level and cannot restrict
+  columns.** It decides *which rows* you may touch and says nothing about *which
+  fields*, so it happily lets a user rewrite every column of their own row:
+  the `role` another policy reads to grant admin, or the `organization_id` that
+  decides which tenant they are in.
+  - Read from **`has_column_privilege` per column**, not inferred from the policy,
+    because a **column-level GRANT is the only thing that actually stops it** — and
+    that is what the fix says (`REVOKE UPDATE … ; GRANT UPDATE (safe_cols) …`),
+    not a policy change.
+  - Scoped so it doesn't cry wolf: a writable column counts only when a policy
+    that depends on the table actually **reads** it — plus tenant columns, which
+    always count, since re-parenting your own row is escalation by definition.
+- 210 tests (was 199).
+
 ## 0.11.0
 
 Threat-model **2.10**: the policy is flawless and still bypassable, because the

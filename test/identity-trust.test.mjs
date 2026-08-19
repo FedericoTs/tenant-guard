@@ -17,6 +17,8 @@ import {
   authorityDepsSql,
   effectiveCheck,
   classifyAuthority,
+  escalationColumnsSql,
+  classifySelfEscalation,
 } from '../src/guards/identity-trust.mjs';
 
 test('policyExprSql: scopes to tenant-column tables, parameterised', () => {
@@ -194,4 +196,65 @@ test('classifyAuthority: writable but no tenant column -> unknown (a note, never
   const v = classifyAuthority({ schema: 'public', table: 'admin_flags', tenantColumn: null, rlsEnabled: false, canInsert: true, dependents: ['public.invoices'] });
   assert.equal(v.status, 'unknown');
   assert.match(v.message, /no recognised tenant column/);
+});
+
+// ── self-row escalation (threat-model 3.8) ───────────────────────────
+
+test('escalationColumnsSql: asks has_column_privilege per COLUMN (RLS cannot restrict columns)', () => {
+  const { text, values } = escalationColumnsSql(['public.profiles'], ['role', 'organization_id'], 'authenticated');
+  assert.match(text, /has_column_privilege\(\$3::text, c\.oid, a\.attnum, 'UPDATE'\)/);
+  assert.deepEqual(values, [['public.profiles'], ['role', 'organization_id'], 'authenticated']);
+});
+
+test('classifySelfEscalation: writable authorization column a policy reads -> leak', () => {
+  const v = classifySelfEscalation({
+    schema: 'public', table: 'profiles',
+    columns: [{ name: 'role', canUpdate: true, isTenant: false }],
+    updatePolicies: [{ policy: 'self', cmd: 'UPDATE' }],
+    referencedColumns: ['role'],
+  });
+  assert.equal(v.status, 'leak');
+  assert.deepEqual(v.columns, ['role']);
+  assert.match(v.message, /RLS is ROW-level/);
+});
+
+test('classifySelfEscalation: a TENANT column always counts, even if no policy text mentions it', () => {
+  const v = classifySelfEscalation({
+    schema: 'public', table: 'profiles',
+    columns: [{ name: 'organization_id', canUpdate: true, isTenant: true }],
+    updatePolicies: [{ policy: 'self', cmd: 'UPDATE' }],
+    referencedColumns: [], // deliberately empty
+  });
+  assert.equal(v.status, 'leak');
+  assert.match(v.message, /re-parents the row into another tenant/);
+});
+
+test('classifySelfEscalation: column NOT writable (column-level GRANT) -> safe', () => {
+  const v = classifySelfEscalation({
+    schema: 'public', table: 'profiles',
+    columns: [{ name: 'role', canUpdate: false, isTenant: false }],
+    updatePolicies: [{ policy: 'self', cmd: 'UPDATE' }],
+    referencedColumns: ['role'],
+  });
+  assert.equal(v.status, 'safe');
+});
+
+test('classifySelfEscalation: writable column that no policy reads -> safe (not every column is authority)', () => {
+  const v = classifySelfEscalation({
+    schema: 'public', table: 'profiles',
+    columns: [{ name: 'plan', canUpdate: true, isTenant: false }],
+    updatePolicies: [{ policy: 'self', cmd: 'UPDATE' }],
+    referencedColumns: [],
+  });
+  assert.equal(v.status, 'safe');
+});
+
+test('classifySelfEscalation: no UPDATE-applicable policy -> safe (nothing can be updated at all)', () => {
+  const v = classifySelfEscalation({
+    schema: 'public', table: 'profiles',
+    columns: [{ name: 'role', canUpdate: true, isTenant: false }],
+    updatePolicies: [],
+    referencedColumns: ['role'],
+  });
+  assert.equal(v.status, 'safe');
 });

@@ -89,7 +89,7 @@ RLS is **per-command**, and `USING` (which rows you may touch) is separate from
 | 3.5 | `anon` can INSERT/UPDATE/DELETE (cache poisoning) | ✅ | `anon-writes` (hybrid catalog + probe) |
 | 3.6 | Tenant column has a `DEFAULT` but no `WITH CHECK` — the default is overridable | ✅ | 3.3 catches it (explicit foreign tenant on insert) |
 | 3.7 | **UPSERT** (`ON CONFLICT DO UPDATE`) — the conflict path needs the *UPDATE* policy; an INSERT-only policy set lets it update another tenant's row | 🔜 | probe an upsert colliding with tenant B's key |
-| 3.8 | Self-row `UPDATE` lets a user set their own `role`/`org_id` → escalation | 🔜 | probe updating an authorization column on your own row |
+| 3.8 | Self-row `UPDATE` lets a user set their own `role`/`org_id` → escalation | ✅ | `identity-trust`. **RLS is row-level and cannot restrict columns**, so the textbook-correct `USING (id = auth.uid()) WITH CHECK (id = auth.uid())` still lets you rewrite every field of your own row. Read from `has_column_privilege` per column — the only real control is a column-level GRANT, which is also the fix given. Scoped to columns a dependent policy actually reads, plus tenant columns (re-parenting) |
 | 3.9 | **`TRUNCATE` ignores RLS entirely** — gated only by table privilege (`GRANT ALL` includes it) | 🟡 | `rls-proof` reads the privilege from the catalog and reports one aggregated **note**. Deliberately **not probed**: `TRUNCATE` takes an `ACCESS EXCLUSIVE` lock and is the one statement you must not fire at a database by surprise. Latent (PostgREST exposes no TRUNCATE) rather than directly exploitable, so it is not a build failure |
 | 3.10 | `MERGE` (PG15+) per-arm policy gaps | 🔜 | exercise each arm |
 | 3.11 | Cross-tenant FK reference / cascade reaching another tenant's rows | 🔜 | insert a child pointing at tenant B's parent |
@@ -158,19 +158,20 @@ listed so nobody reads a green run as more than it is.
 ## What this means for the roadmap
 
 Ordered by (severity × prevalence in real AI-generated apps) ÷ build cost, the
-next builds are: **5.1 (storage object paths, which needs tenant-*expression*
-support rather than a tenant column)**; **3.8 (self-row UPDATE of an authorization
-column — `profiles.role = 'admin'`)**, which is the same "write your own authority"
-shape as 2.10 and should reuse its machinery; then **2.11 (existence oracles)**.
-**3.7 (the UPSERT conflict path)** stays low: the permissive-`UPDATE`-policy case it
-depends on is already caught by the existing write probes, so it buys less than its
-position suggests.
+next builds are: **5.1 (storage object paths — the one remaining item that needs
+a genuinely new capability, tenant-*expression* support rather than a tenant
+column)**; then **2.11 (existence oracles: a global `UNIQUE` key or single-column FK
+that answers "does this row exist in another tenant?")**. **3.7 (the UPSERT conflict
+path)** stays low: the permissive-`UPDATE`-policy case it depends on is already
+caught by the existing write probes, so it buys less than its position suggests.
 
 *Done: 4.1/4.2 views & materialized views (0.9.0); 2.9 user-writable claims, 2.8
 callable GUC-setting definer functions, 4.7 partitions, 3.9 TRUNCATE (0.10.0);
-2.10 user-writable policy authority (0.11.0). 4.7 is the one to learn from — it
-was a false NEGATIVE in the flagship guard, found by writing the failure surface
-down rather than by waiting for a bug report.*
+2.10 user-writable policy authority (0.11.0); 3.8 self-row escalation (0.12.0).
+4.7 is the one to learn from — it was a false NEGATIVE in the flagship guard,
+found by writing the failure surface down rather than by waiting for a bug report.
+2.10 and 3.8 are the pair to learn from: in both, the policy is correct and the
+thing it TRUSTS is writable, which no amount of per-policy review would surface.*
 
 If you know a failure mode that isn't in this table, that's the most useful bug
 report this project can get — open an issue.

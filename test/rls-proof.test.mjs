@@ -164,7 +164,7 @@ test('classify: WRITES the other tenant (reads clean) -> write leak (per-command
   assert.equal(v.status, 'leak');
   assert.equal(v.leaks.length, 1);
   assert.equal(v.leaks[0].kind, 'write');
-  assert.match(v.leaks[0].message, /WROTE to 2 row/);
+  assert.match(v.leaks[0].message, /cross-tenant WRITE affecting 2 row/);
   assert.match(v.leaks[0].fix, /FOR ALL|WITH CHECK/);
 });
 

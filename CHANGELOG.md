@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.0
+
+More from Reddit.
+
+- **feat(rls-proof): catch the tenant-HOP.** The write probe now also tries to set
+  the tenant column to the *other* tenant (`SET org = <B>`), moving a session's
+  OWN row INTO another tenant. A correct read policy passes it — the row is yours
+  on the way in — and with no `WITH CHECK` on the destination, nothing validates
+  where it lands (especially when the policy is scoped by `created_by`/owner
+  rather than the tenant column). This is a distinct cross-tenant write from the
+  steal/delete cases, and it was previously missed. A correct `FOR ALL … WITH
+  CHECK (tenant = current)` policy still passes cleanly (no false positive).
+- **feat(rls-proof): `claim` shortcut.** `rlsProof.claim: "org_id"` (or
+  `"team_id"` / `"account_id"`, or `{ key, role }`) builds the
+  `request.jwt.claims` `becomeTenant` for you and sets `role` to `authenticated`
+  — impersonation via `set_config`, so CI never needs the JWT secret. An explicit
+  `becomeTenant` still wins (use it as the SQL hook for membership-table apps).
+- 98 tests (was 96).
+
 ## 0.4.0
 
 New guard: **`anon-writes`** — the unauthenticated write surface.

@@ -28,7 +28,24 @@ npx tenant-guard prove
 
 By default the proof assumes a tenant with the canonical Postgres pattern
 (`current_setting('app.current_tenant')`). If your policies key off a JWT claim
-(Supabase), tell it how to assume an identity in `tenant-guard.config.json`:
+(Supabase), the shortest way to say so is `claim` — it builds the
+`request.jwt.claims` impersonation for you, so **CI never needs the JWT secret**:
+
+```json
+{
+  "rlsProof": {
+    "claim": "org_id",
+    "tenantColumns": ["organization_id", "tenant_id"],
+    "grandfather": ["shared_reference_table"]
+  }
+}
+```
+
+`claim: "org_id"` (or `"team_id"` / `"account_id"`, or `{ "key": "org_id", "role":
+"member" }`) expands to a `set_config('request.jwt.claims', …)` `becomeTenant` and
+sets `role` to `authenticated`. Prefer the explicit `becomeTenant` below when your
+policies resolve the tenant some other way (a `users`/memberships lookup) — an
+explicit `becomeTenant` always wins over `claim`:
 
 ```json
 {
@@ -95,10 +112,14 @@ INSERT for it), and a broken seed statement fails with the exact SQL error.
 - **read leak** — it *read* another tenant's rows. A policy is permissive
   (`USING (true)` / missing the tenant predicate) or **RLS is off entirely**.
   Fails the build. ✗
-- **write leak** — it could *UPDATE/DELETE* another tenant's rows even when reads
-  were correctly scoped. RLS is **per-command**: a right-looking `SELECT` policy
-  says nothing about `UPDATE`/`DELETE` (and `UPSERT` needs its own `UPDATE`
-  policy). Fails the build. ✗
+- **write leak** — it could *UPDATE/DELETE* another tenant's rows, **or reassign
+  its OWN rows into another tenant** (`SET organization_id = <other>` — a
+  tenant-hop the read policy passes because the row is yours on the way in, and no
+  `WITH CHECK` on the destination stops), even when reads were correctly scoped.
+  RLS is **per-command**: a right-looking `SELECT` policy says nothing about
+  `UPDATE`/`DELETE`, and `USING` says nothing about where an update *lands* — that
+  needs `WITH CHECK` (and `UPSERT` needs its own `UPDATE` policy). Fails the
+  build. ✗
 - **no policy** (a note) — RLS is enabled but the table has **no policy at all**.
   Postgres then denies every row, which looks *exactly* like isolation but means
   the table is unfinished — the moment someone adds a permissive policy it leaks.

@@ -60,6 +60,12 @@ export const DEFAULTS = {
   // json_build_object gives Postgres no way to infer the placeholder's type):
   //   ["select set_config('request.jwt.claims', json_build_object('org_id', $1::text)::text, true)"]
   becomeTenant: ["select set_config('app.current_tenant', $1, true)"],
+  // Shortcut for the common Supabase case: `claim: "org_id"` (or "team_id" /
+  // "account_id") builds the request.jwt.claims becomeTenant for you and sets
+  // role to `authenticated` — impersonation via set_config, no JWT secret in CI.
+  // An explicit `becomeTenant` overrides it. Use `becomeTenant` (an SQL hook) for
+  // apps that derive the tenant via a memberships table.
+  claim: null,
   tables: null, // null = autodiscover; or [{ table, schema?, tenantColumn }]
   grandfather: [], // table names deliberately shared/unscoped (reference data)
   sampleLimit: 3, // distinct tenant ids to sample per table
@@ -270,7 +276,7 @@ export function classifyTableResult({ rlsEnabled, policyCount, ownVisible, cross
   if (writeAffected > 0) {
     leaks.push({
       kind: 'write',
-      message: `tenant A's session WROTE to ${writeAffected} row(s) belonging to tenant B (UPDATE/DELETE) — RLS is per-command, so a correct SELECT policy does not protect writes`,
+      message: `tenant A's session made a cross-tenant WRITE affecting ${writeAffected} row(s) — it can UPDATE/DELETE another tenant's rows, or reassign its OWN rows INTO another tenant (a tenant-hop the read policy passes but no WITH CHECK on the destination stops). RLS is per-command; a correct SELECT policy protects none of this`,
       fix: `Add write coverage — a FOR ALL policy, or explicit UPDATE/DELETE policies, scoped by the tenant column:\n  CREATE POLICY tenant_all ON {tbl} FOR ALL\n    USING ({col} = current_setting('app.current_tenant'))\n    WITH CHECK ({col} = current_setting('app.current_tenant'));`,
     });
   }
@@ -298,6 +304,15 @@ const OK = (extra) => ({ id: meta.id, ok: true, violations: [], scanned: 0, note
  */
 export async function prove({ query, config = {} }) {
   const cfg = { ...DEFAULTS, ...config };
+  // `claim` shortcut: build the request.jwt.claims becomeTenant (unless one was
+  // given explicitly). Impersonate by set_config — no JWT secret needed in CI.
+  if (cfg.claim && config.becomeTenant === undefined) {
+    const key = typeof cfg.claim === 'string' ? cfg.claim : cfg.claim.key;
+    if (!/^[A-Za-z0-9_]+$/.test(key || '')) throw new Error(`unsafe claim key: ${JSON.stringify(key)}`);
+    cfg.becomeTenant = [`select set_config('request.jwt.claims', json_build_object('${key}', $1::text)::text, true)`];
+    if (typeof cfg.claim === 'object' && cfg.claim.role) cfg.role = cfg.claim.role;
+    else if (config.role === undefined) cfg.role = 'authenticated';
+  }
   const role = safeRole(cfg.role);
   const violations = [];
   const notes = [];
@@ -494,12 +509,17 @@ export async function prove({ query, config = {} }) {
         ownVisible = (await q(ownA.text, ownA.values))[0].n;
         crossVisible = (await q(crossB.text, crossB.values))[0].n;
         if (probedWrites) {
-          // as tenant A: reassign / delete the whole table; anything beyond A's
-          // own rows means A can write another tenant's rows.
-          const uA = updateProbeSql(t.schema, t.table, t.tenantColumn, tenantA);
+          // As tenant A: (1) claim-into-self / delete — anything beyond A's own
+          // rows means A touched another tenant's rows; and (2) the tenant-HOP —
+          // set the tenant column to B, moving A's OWN rows INTO tenant B. A
+          // correct read policy passes it (the row is A's on the way in); with no
+          // WITH CHECK on the destination, nothing validates where it lands.
+          const uA = updateProbeSql(t.schema, t.table, t.tenantColumn, tenantA); // set = self
           const dA = deleteProbeSql(t.schema, t.table);
-          const affA = Math.max(await probeWrite(uA.text, uA.values), await probeWrite(dA.text, dA.values));
-          writeAffected = Math.max(writeAffected, affA - t.ownA);
+          const mA = updateProbeSql(t.schema, t.table, t.tenantColumn, tenantB); // set = other (hop)
+          const claimA = Math.max(await probeWrite(uA.text, uA.values), await probeWrite(dA.text, dA.values));
+          const moveA = await probeWrite(mA.text, mA.values);
+          writeAffected = Math.max(writeAffected, claimA - t.ownA, moveA);
         }
 
         // reverse direction: become tenant B, check reading/writing A's rows
@@ -507,10 +527,12 @@ export async function prove({ query, config = {} }) {
         const crossA = tenantRowCountSql(t.schema, t.table, t.tenantColumn, tenantA);
         crossVisible = Math.max(crossVisible, (await q(crossA.text, crossA.values))[0].n);
         if (probedWrites) {
-          const uB = updateProbeSql(t.schema, t.table, t.tenantColumn, tenantB);
+          const uB = updateProbeSql(t.schema, t.table, t.tenantColumn, tenantB); // set = self
           const dB = deleteProbeSql(t.schema, t.table);
-          const affB = Math.max(await probeWrite(uB.text, uB.values), await probeWrite(dB.text, dB.values));
-          writeAffected = Math.max(writeAffected, affB - t.ownB);
+          const mB = updateProbeSql(t.schema, t.table, t.tenantColumn, tenantA); // set = other (hop)
+          const claimB = Math.max(await probeWrite(uB.text, uB.values), await probeWrite(dB.text, dB.values));
+          const moveB = await probeWrite(mB.text, mB.values);
+          writeAffected = Math.max(writeAffected, claimB - t.ownB, moveB);
         }
       } catch (err) {
         if (isPermissionDenied(err)) noAccess = true;

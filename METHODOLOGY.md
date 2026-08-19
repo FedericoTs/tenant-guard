@@ -103,9 +103,16 @@ isolation tests miss the leaks that actually bite — `UPDATE`. Building it
 surfaced a subtlety worth writing down: a `WHERE tenant = 'other'` probe is
 *masked* by a correct `SELECT` policy — you can't target rows you can't see — so
 the probe rewrites the whole table with no `WHERE` and compares the affected-row
-count to the tenant's own. That is the meta-pattern of this whole project: the
-strongest guard is the one a real failure — or a sharp reviewer — taught you to
-write. The mechanism, the config, and a zero-infrastructure demo are in
+count to the tenant's own. A later reviewer named a third shape the probe was
+missing: a user updates their **own** row and moves it *into* another tenant
+(`SET organization_id = <other>`). The `USING` clause passes — the row is theirs
+on the way in — and with no `WITH CHECK` on the destination, nothing validates
+where it lands (worst when the policy is scoped by `created_by`/owner rather than
+the tenant column). So the write probe now also tries setting the tenant column to
+the *other* tenant, not just stealing/deleting the other tenant's rows. That is
+the meta-pattern of this whole project: the strongest guard is the one a real
+failure — or a sharp reviewer — taught you to write. The mechanism, the config,
+and a zero-infrastructure demo are in
 [`examples/rls-proof/`](examples/rls-proof/README.md).
 
 The same discipline runs one level deeper. Another reviewer pointed out that a

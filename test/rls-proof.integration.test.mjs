@@ -149,10 +149,40 @@ if (PGlite) {
     assert.equal(res.ok, false, JSON.stringify(res, null, 2));
     const writeLeak = res.violations.find((v) => v.kind === 'write');
     assert.ok(writeLeak, 'expected a write-kind violation: ' + JSON.stringify(res.violations));
-    assert.match(writeLeak.message, /WROTE to \d+ row/);
+    assert.match(writeLeak.message, /cross-tenant WRITE affecting \d+ row/);
     assert.match(writeLeak.fix, /FOR ALL|WITH CHECK/);
     // the READ path is clean — this is a write-only leak a SELECT-only test misses
     assert.equal(res.violations.some((v) => v.kind === 'read'), false);
+  });
+
+  test('CATCHES a tenant-HOP: reads are scoped, but a user can move its own row INTO another tenant', async () => {
+    const { query } = await freshDb(`
+      create table docs (id serial primary key, organization_id text not null, body text);
+      grant select, update, delete on docs to authenticated;
+      insert into docs (organization_id, body) values ('org_A','x'), ('org_A','x2'), ('org_B','y');
+      alter table docs enable row level security;
+      create policy sel on docs for select ${TENANT_POLICY};                     -- reads correctly scoped
+      create policy upd on docs for update ${TENANT_POLICY} with check (true);    -- BUG: destination unchecked
+    `);
+    const res = await prove({ query });
+    assert.equal(res.ok, false, JSON.stringify(res, null, 2));
+    const w = res.violations.find((v) => v.kind === 'write');
+    assert.ok(w, JSON.stringify(res.violations));
+    assert.match(w.message, /reassign its OWN rows INTO another tenant|tenant-hop/);
+    assert.equal(res.violations.some((v) => v.kind === 'read'), false); // reads are clean — this is write-only
+  });
+
+  test('CLAIM SHORTCUT: claim:"org_id" builds the request.jwt.claims becomeTenant (no JWT secret)', async () => {
+    const { query } = await freshDb(`
+      create table invoices (id serial primary key, organization_id text not null);
+      grant select on invoices to authenticated;
+      insert into invoices (organization_id) values ('org_A'), ('org_B');
+      alter table invoices enable row level security;
+      create policy p on invoices using (organization_id = (current_setting('request.jwt.claims', true)::json ->> 'org_id'));
+    `);
+    const res = await prove({ query, config: { claim: 'org_id' } });
+    assert.equal(res.ok, true, JSON.stringify(res, null, 2));
+    assert.match(res.summary, /proven isolated/);
   });
 
   test('PROVES write isolation: a FOR ALL tenant policy blocks cross-tenant writes', async () => {

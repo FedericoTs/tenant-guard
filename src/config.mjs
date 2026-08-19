@@ -80,7 +80,7 @@ export function resolveGuardConfigs(config) {
 export function resolveProveConfig(config) {
   const p = config.rlsProof ?? {};
   const out = {};
-  for (const k of ['url', 'urlEnv', 'schemas', 'tenantColumns', 'role', 'becomeTenant', 'tables', 'grandfather', 'sampleLimit', 'probeWrites', 'seed']) {
+  for (const k of ['url', 'urlEnv', 'schemas', 'tenantColumns', 'role', 'becomeTenant', 'claim', 'tables', 'grandfather', 'sampleLimit', 'probeWrites', 'seed']) {
     if (p[k] !== undefined) out[k] = p[k];
   }
   return out;

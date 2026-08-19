@@ -221,6 +221,23 @@ so it stays skipped until you opt in. `becomeTenant` (how a session assumes a
 tenant identity) defaults to the canonical Postgres GUC pattern; override it for
 Supabase JWT policies — see [`examples/rls-proof/`](examples/rls-proof/README.md).
 
+**Per-user apps** (the tenant is a *user*, not an org). The defaults key off
+`organization_id`/`tenant_id` and deliberately **don't** treat `user_id` as a
+tenant column — in a B2B app `user_id` is often just the creator, and treating it
+as the tenant boundary would hide real org leaks. If *your* isolation boundary is
+the user, add it to both signals:
+
+```json
+{
+  "routeOrgScoping": { "tenantSignals": ["user_id", "organization_id"] },
+  "rlsProof":        { "tenantColumns": ["user_id", "organization_id"] }
+}
+```
+
+Then **allowlist genuinely shared tables/routes** — a Google-Places cache, a
+public reference table — with a one-line reason, rather than scoping data that is
+supposed to be global.
+
 Defaults target Next.js App Router + Supabase/Postgres, but every signal
 (auth helpers, tenant column names, route glob) is configurable, so it works on
 any stack that has API routes and SQL migrations. The bare-id detector ships

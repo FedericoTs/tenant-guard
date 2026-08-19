@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.4
+
+Docs only. Validated end-to-end against two real, independently-built Supabase
+codebases (a ~500k-line org-multi-tenant app and a ~per-user travel app); the
+guards behaved correctly on both, so no code changed.
+
+- **docs: per-user apps.** The run surfaced a common adoption case worth naming:
+  when the tenant is a *user*, add `user_id` to `routeOrgScoping.tenantSignals`
+  and `rlsProof.tenantColumns`. It's intentionally **not** a default — in a B2B
+  app `user_id` is often just the creator, and treating it as the boundary would
+  hide real org leaks. Also: allowlist genuinely shared tables/routes (a
+  places-cache, a reference table) with a reason instead of scoping global data.
+
 ## 0.1.3
 
 The runtime proof (`rls-proof`) now tests the **write path**, not just reads —

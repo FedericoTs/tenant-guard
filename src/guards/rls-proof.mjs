@@ -20,6 +20,12 @@
  * unprotected, or RLS is on with no policy at all (deny-all that only *looks*
  * isolated) — this guard names it and fails your build, on every commit.
  *
+ * Before trusting any pass it runs a negative control: a deny-all RLS table that
+ * the app role MUST NOT be able to read. If the role can read it, RLS isn't being
+ * enforced for this session (a superuser, a BYPASSRLS role, a table owner, or a
+ * SET ROLE that didn't take effect) — so every "isolated" result would be a
+ * vacuous pass, and the guard fails instead of reporting one.
+ *
  * Non-destructive by construction: the whole run is one transaction that is
  * ROLLED BACK, and each write probe is additionally wrapped in its own SAVEPOINT
  * that is rolled back, so nothing is ever committed. (If you have triggers with
@@ -258,7 +264,7 @@ export function classifyTableResult({ rlsEnabled, policyCount, ownVisible, cross
   if (leaks.length) return { status: 'leak', leaks };
 
   if (ownVisible === 0) {
-    return { status: 'over-restrictive', message: `the tenant session sees none of its own rows either — likely the role/becomeTenant config doesn't match your policies (not a leak, but this table wasn't actually proven)` };
+    return { status: 'over-restrictive', message: `the tenant session sees none of its own rows either — this table wasn't actually proven (not a leak). Usually the role/becomeTenant config doesn't match your policies; if your policies read a MEMBERSHIP table (org_id IN (select … where user_id = auth.uid())), the impersonated identity also needs a seeded membership row, not just a claim.` };
   }
   return {
     status: 'isolated',
@@ -327,8 +333,49 @@ export async function prove({ query, config = {} }) {
       }
     }
 
+    // ── negative control: prove the identity switch actually enforces RLS ──
+    // Before trusting any pass, confirm this session is genuinely subject to RLS.
+    // Create a deny-all table (RLS on + FORCE, no policy) as the privileged role;
+    // after dropping to the app role it MUST return zero rows. If it returns any,
+    // RLS is not being enforced for this role (a superuser, a BYPASSRLS role, the
+    // table owner, or a SET ROLE that didn't take effect) — so every isolation
+    // result would be a vacuous pass, and we refuse to report one.
+    let canaryReady = false;
+    try {
+      await query('create temp table tg_identity_canary (x int)', []);
+      await query('insert into tg_identity_canary values (1), (2)', []);
+      await query('alter table tg_identity_canary enable row level security', []);
+      await query('alter table tg_identity_canary force row level security', []);
+      await query(`grant select on tg_identity_canary to ${role}`, []);
+      canaryReady = true;
+    } catch (err) {
+      notes.push({ where: '(identity self-check)', message: `could not set up the RLS self-check canary (${err.message}); proceeding, but a vacuous pass can't be fully ruled out` });
+    }
+
     // Pass 2 — RESTRICTED: assume the app role and prove isolation per table.
     await query(`set local role ${role}`, []);
+
+    if (canaryReady) {
+      let seen = null;
+      try { seen = (await q('select count(*)::int as n from tg_identity_canary', []))[0].n; } catch { /* permission denied => grants/RLS deny => enforced */ }
+      if (seen !== null && seen > 0) {
+        try { await query('rollback', []); } catch { /* ignore */ }
+        return {
+          id: meta.id,
+          ok: false,
+          notes,
+          scanned: 0,
+          violations: [
+            {
+              where: `role "${role}"`,
+              message: `identity self-check FAILED — a deny-all RLS table returned ${seen} row(s) as this role, so RLS is NOT being enforced for it. Every "isolated" result would be a vacuous pass.`,
+              fix: `Set rlsProof.role to your non-superuser app role (e.g. "authenticated") — not a superuser, a BYPASSRLS role, or a table-owner role. If the role name is right, make sure SET ROLE takes effect on your connection (some poolers reset it).`,
+            },
+          ],
+          summary: 'identity switch is not enforcing RLS — refusing to report a vacuous pass',
+        };
+      }
+    }
     const probedWrites = cfg.probeWrites !== false;
 
     // Run one mutating statement inside a savepoint, read the affected-row count,

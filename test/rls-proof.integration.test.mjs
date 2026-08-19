@@ -200,6 +200,31 @@ if (PGlite) {
     assert.deepEqual(after, before); // ...yet every UPDATE/DELETE probe was rolled back — rows and sums identical
   });
 
+  // ── negative control: don't trust a pass from a session RLS doesn't bind ──
+  test('SELF-CHECK: a BYPASSRLS role is caught as vacuous, not reported isolated', async () => {
+    const db = new PGlite();
+    await db.exec(`
+      create role app_bypass bypassrls nologin;
+      create table invoices (id serial primary key, organization_id text not null);
+      grant select, update, delete on invoices to app_bypass;
+      insert into invoices (organization_id) values ('org_A'),('org_B');
+      alter table invoices enable row level security;
+      create policy tenant_iso on invoices using (organization_id = current_setting('app.current_tenant', true));
+    `);
+    const query = (t, v) => db.query(t, Array.isArray(v) && v.length ? v : undefined);
+    const res = await prove({ query, config: { role: 'app_bypass' } });
+    assert.equal(res.ok, false, JSON.stringify(res, null, 2));
+    assert.ok(res.violations.some((v) => /identity self-check FAILED/.test(v.message)), JSON.stringify(res.violations));
+    assert.match(res.summary, /vacuous pass/);
+  });
+
+  test('SELF-CHECK: a normal app role passes the canary and proves as usual', async () => {
+    const { query } = await freshDb(GOOD);
+    const res = await prove({ query }); // role: authenticated (default)
+    assert.equal(res.ok, true, JSON.stringify(res, null, 2));
+    assert.ok(!res.notes.some((n) => /self-check/.test(n.where || '')), 'canary should set up cleanly, no note');
+  });
+
   test('non-destructive: after the proof the connection is rolled back to full visibility', async () => {
     const { db, query } = await freshDb(GOOD);
     await prove({ query });

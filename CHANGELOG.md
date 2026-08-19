@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.1
+
+Two improvements to `rls-proof`, both from sharp reviewer feedback.
+
+- **feat(rls-proof): a built-in negative control.** Before trusting any pass, the
+  proof drops to your app role and asserts it **cannot** read a deliberately
+  deny-all RLS table (RLS on + `FORCE`, no policy). If it can, RLS isn't being
+  enforced for that role — a superuser, a `BYPASSRLS` role, a table owner, or a
+  `SET ROLE` that didn't take effect — so every "isolated" result would be a
+  *vacuous pass*. The guard now fails with a clear message instead of reporting
+  one. (Runs inside the same rolled-back transaction; the canary is a temp table.)
+- **docs: membership-table policies.** Policies that read a membership/junction
+  table (`org_id IN (SELECT … WHERE user_id = auth.uid())`) need a *seeded
+  membership row* for the impersonated identity, not just a claim — otherwise the
+  table reports as "not proven." Documented in the rls-proof example, and the
+  over-restrictive note now points at it. 79 tests (was 77).
+
 ## 0.2.0
 
 New guard: **`rls-drift`** — prove your RLS is in version control.

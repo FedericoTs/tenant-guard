@@ -108,6 +108,14 @@ strongest guard is the one a real failure — or a sharp reviewer — taught you
 write. The mechanism, the config, and a zero-infrastructure demo are in
 [`examples/rls-proof/`](examples/rls-proof/README.md).
 
+The same discipline runs one level deeper. Another reviewer pointed out that a
+prover you can't falsify is worthless: if the identity switch silently fails and
+the session still bypasses RLS, every isolation test can go green for the wrong
+reason. So before trusting a pass, the prover now checks its own negative
+control — it drops to the app role and asserts it *cannot* read a deliberately
+deny-all table. A guard that can't detect a deliberately-broken case can't be
+trusted on a passing one; make it prove it isn't vacuous.
+
 ## The guard the review taught us to write
 
 We ran the tool against a real Supabase app and reviewed the two routes it

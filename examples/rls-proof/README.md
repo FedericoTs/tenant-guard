@@ -51,6 +51,16 @@ tenant from `auth.uid()` via a users table, set `sub` to a real user id of that
 tenant instead (the `becomeTenant` SQL can look it up: `... 'sub', (select id
 from users where organization_id = $1::text limit 1) ...`).
 
+**Membership-table policies.** The thing that varies most between apps isn't the
+claim shape — it's policies that read a **membership/junction table** rather than
+a claim, e.g. `organization_id IN (SELECT organization_id FROM memberships WHERE
+user_id = auth.uid())`. For those, setting a claim isn't enough: the impersonated
+identity needs a **seeded membership row** linking that user to the tenant, or the
+session resolves to "no orgs," sees nothing, and the table reports as *not proven*
+(over-restrictive) rather than isolated. Impersonate a user who is already a
+member of the discovered tenant, and make sure your test database has the
+membership rows.
+
 ## What it reports
 
 - **isolated** — the session could neither read nor write the other tenant's
@@ -69,6 +79,11 @@ from users where organization_id = $1::text limit 1) ...`).
 - **not proven** (a note) — only one tenant's data, no read access, or the
   `becomeTenant`/`role` config doesn't match your policies. Seed a second tenant,
   or fix the config.
+- **identity self-check failed** — before trusting any pass, the proof drops to
+  your app role and checks it *cannot* read a deliberately deny-all RLS table. If
+  it can, RLS isn't being enforced for that role (a superuser, a `BYPASSRLS` role,
+  a table owner, or a `SET ROLE` that didn't take effect) — so a green result
+  would be meaningless. The proof fails instead of reporting a vacuous pass. ✗
 
 Everything runs inside a transaction that is rolled back, and each `UPDATE`/`DELETE`
 write probe is additionally wrapped in its own `SAVEPOINT` that is rolled back —

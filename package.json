@@ -1,7 +1,7 @@
 {
   "name": "tenant-guard",
-  "version": "0.9.0",
-  "description": "Guard tests that fail your CI when multi-tenant code can leak across tenants. Static guards run zero-dependency in CI; the runtime RLS proof spins up two tenants and proves one can't read OR write the other — SELECT, UPDATE/DELETE, tenant-hop, and INSERT. Not a scanner you run and ignore — checks that live in your repo and block the merge.",
+  "version": "0.10.0",
+  "description": "Guard tests that fail your CI when multi-tenant code can leak across tenants. Static guards run zero-dependency in CI; runtime guards prove one tenant can't read OR write another — reads, writes, tenant-hop, INSERT, views, materialized views, partitions, the anon surface, and whether the identity your policies trust can be forged. Checks that live in your repo and block the merge.",
   "type": "module",
   "license": "MIT",
   "author": "Federico Sciuca",
@@ -17,7 +17,8 @@
     "./guards/rls-drift": "./src/guards/rls-drift.mjs",
     "./guards/anon-writes": "./src/guards/anon-writes.mjs",
     "./guards/anon-reads": "./src/guards/anon-reads.mjs",
-    "./guards/view-isolation": "./src/guards/view-isolation.mjs"
+    "./guards/view-isolation": "./src/guards/view-isolation.mjs",
+    "./guards/identity-trust": "./src/guards/identity-trust.mjs"
   },
   "files": [
     "bin",

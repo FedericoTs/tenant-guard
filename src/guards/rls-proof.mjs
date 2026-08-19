@@ -116,7 +116,7 @@ export function safeRole(role) {
  * with whether RLS is enabled/forced. Uses pg_catalog so it also reports RLS
  * status (information_schema can't). Returns { text, values }.
  */
-export function introspectionSql(schemas, tenantColumns) {
+export function introspectionSql(schemas, tenantColumns, role = 'authenticated') {
   const text = `
     select n.nspname            as schema,
            c.relname            as table,
@@ -124,15 +124,26 @@ export function introspectionSql(schemas, tenantColumns) {
            c.relrowsecurity     as rls_enabled,
            c.relforcerowsecurity as rls_forced,
            c.relowner::regrole::text as owner_role,
+           c.relispartition     as is_partition,
+           (c.relkind = 'p')    as is_partitioned_parent,
+           -- TRUNCATE ignores RLS entirely: it is gated only by the table
+           -- privilege, and GRANT ALL includes it. Read from the catalog, never
+           -- probed: a TRUNCATE probe takes an ACCESS EXCLUSIVE lock and is the
+           -- one statement you must not fire at a database by surprise.
+           pg_catalog.has_table_privilege($3::text, c.oid, 'TRUNCATE') as can_truncate,
            (select count(*) from pg_catalog.pg_policy pol where pol.polrelid = c.oid)::int as policy_count
     from pg_catalog.pg_class c
     join pg_catalog.pg_namespace n on n.oid = c.relnamespace
     join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
-    where c.relkind = 'r'
+    -- 'p' = partitioned parent. Excluding it (as this did) meant a partitioned
+    -- tenant table was NEVER scanned, while its partitions — which each hold a
+    -- single tenant — reported "only 1 tenant, cannot prove" and the whole thing
+    -- came back green. See planTables/prove for the foreign-tenant probe.
+    where c.relkind in ('r', 'p')
       and n.nspname = any($1)
       and a.attname = any($2)
     order by n.nspname, c.relname`;
-  return { text, values: [schemas, tenantColumns] };
+  return { text, values: [schemas, tenantColumns, role] };
 }
 
 /**
@@ -157,6 +168,9 @@ export function planTables(rows, tenantColumns, grandfather = []) {
         rlsEnabled: r.rls_enabled === true || r.rls_enabled === 't',
         rlsForced: r.rls_forced === true || r.rls_forced === 't',
         ownerRole: r.owner_role ?? null,
+        isPartition: r.is_partition === true || r.is_partition === 't',
+        canTruncate: r.can_truncate === true || r.can_truncate === 't',
+        isPartitionedParent: r.is_partitioned_parent === true || r.is_partitioned_parent === 't',
         policyCount: r.policy_count == null ? null : Number(r.policy_count),
         prio,
       });
@@ -411,7 +425,7 @@ export async function prove({ query, config = {} }) {
       .filter((t) => !cfg.grandfather.includes(t.table))
       .map((t) => ({ schema: t.schema ?? cfg.schemas[0] ?? 'public', table: t.table, tenantColumn: t.tenantColumn, rlsEnabled: undefined }));
   } else {
-    const introspect = introspectionSql(cfg.schemas, cfg.tenantColumns);
+    const introspect = introspectionSql(cfg.schemas, cfg.tenantColumns, role);
     const rows = await q(introspect.text, introspect.values);
     plan = planTables(rows, cfg.tenantColumns, cfg.grandfather);
   }
@@ -538,6 +552,11 @@ export async function prove({ query, config = {} }) {
     }
     const probedWrites = cfg.probeWrites !== false;
 
+    // Every tenant id seen anywhere in the scan. A table holding a single tenant
+    // can still be proven by impersonating one of these — see the foreign-tenant
+    // probe below. Without this, per-tenant partitions are unprovable by design.
+    const allTenants = [...new Set(plan.flatMap((t) => t.tenants || []))];
+
     // Run one mutating statement inside a savepoint, read the affected-row count,
     // then ROLLBACK TO SAVEPOINT + RELEASE so nothing changes even within this
     // (already rolled-back) transaction — and so later probes see intact data.
@@ -645,7 +664,50 @@ export async function prove({ query, config = {} }) {
       }
       if (t.tenants.length < 2) {
         scanned++;
-        notes.push({ where: `${t.schema}.${t.table}`, message: classifyTableResult({ rlsEnabled: t.rlsEnabled, policyCount: t.policyCount, tenantCount: t.tenants.length, ownVisible: 0, crossVisible: 0 }).message });
+        // A table holding ONE tenant used to be written off as "cannot prove".
+        // It can be proven — from the other side: impersonate a tenant that
+        // exists ELSEWHERE in the database and see whether this table's rows are
+        // visible to them. Anything visible is a cross-tenant read regardless of
+        // how many tenants live in this table.
+        //
+        // This is what makes PARTITIONS provable at all: list-partitioning by
+        // tenant means every partition holds exactly one tenant BY CONSTRUCTION,
+        // so the two-tenant probe could never fire — and a partitioned table
+        // whose partitions are directly readable came back green.
+        const mine = t.tenants[0];
+        const foreign = allTenants.find((x) => x !== mine);
+        if (mine === undefined || foreign === undefined) {
+          notes.push({ where: `${t.schema}.${t.table}`, message: classifyTableResult({ rlsEnabled: t.rlsEnabled, policyCount: t.policyCount, tenantCount: t.tenants.length, ownVisible: 0, crossVisible: 0 }).message });
+          continue;
+        }
+        let seen = 0;
+        let failed = null;
+        try {
+          for (const s of buildBecomeTenant(cfg.becomeTenant, foreign)) await query(s.text, s.values);
+          const c = tenantRowCountSql(t.schema, t.table, t.tenantColumn, mine);
+          seen = (await q(c.text, c.values))[0].n;
+        } catch (err) {
+          if (!isPermissionDenied(err)) failed = err.message;
+        }
+        if (failed) {
+          notes.push({ where: `${t.schema}.${t.table}`, message: `could not probe — check rlsProof.becomeTenant/role: ${failed}` });
+        } else if (seen > 0) {
+          const what = t.isPartition
+            ? `this PARTITION holds only tenant "${mine}", and a session acting as a DIFFERENT tenant read ${seen} of its row(s) DIRECTLY. RLS on the partitioned parent does NOT govern a partition queried by its own name — the partition needs its own RLS (and PostgREST exposes each partition as its own endpoint)`
+            : `a session acting as a different tenant read ${seen} row(s) belonging to tenant "${mine}"`;
+          violations.push({
+            where: `${t.schema}.${t.table} (${t.tenantColumn})`,
+            kind: 'read',
+            message: `${what} — a cross-tenant READ`,
+            fix: t.isPartition
+              ? `Enable and scope RLS on the partition itself (or revoke direct access to it):\n  ALTER TABLE ${qualified(t.schema, t.table)} ENABLE ROW LEVEL SECURITY;\n  ALTER TABLE ${qualified(t.schema, t.table)} FORCE ROW LEVEL SECURITY;\n  CREATE POLICY tenant_isolation ON ${qualified(t.schema, t.table)} USING (${quoteIdent(t.tenantColumn)} = current_setting('app.current_tenant'));\n      Then re-check every existing partition — and make sure new ones get the same treatment when attached.`
+              : `Scope the read policy by the tenant column, e.g. USING (${quoteIdent(t.tenantColumn)} = current_setting('app.current_tenant')).`,
+            crossVisible: seen,
+            rlsEnabled: t.rlsEnabled,
+          });
+        } else {
+          provenCount++;
+        }
         continue;
       }
       // Seeding mode: a table the seed didn't populate for both tenants can't be
@@ -769,7 +831,28 @@ export async function prove({ query, config = {} }) {
     try { await query('rollback', []); } catch { /* ignore */ }
   }
 
+  // TRUNCATE bypasses RLS completely — it is gated only by the table privilege,
+  // and GRANT ALL (Supabase's default for anon/authenticated) includes it. So any
+  // logged-in user could wipe every tenant's rows and no policy would stop them.
+  // Reported as ONE aggregated note rather than a per-table failure: on a stock
+  // Supabase project this is true of every table, and it is only reachable
+  // through a SQL channel (PostgREST exposes no TRUNCATE), so failing the build
+  // on it would be noise. Latent, worth knowing, not an emergency.
+  const truncatable = plan.filter((t) => t.canTruncate).map((t) => `${t.schema}.${t.table}`);
+  if (truncatable.length > 0) {
+    notes.push({
+      where: `role "${role}"`,
+      message:
+        `"${role}" holds TRUNCATE on ${truncatable.length} tenant table(s) (${truncatable.slice(0, 3).join(', ')}${truncatable.length > 3 ? `, +${truncatable.length - 3} more` : ''}). ` +
+        `TRUNCATE ignores RLS entirely — no policy can stop it — so anyone who reaches a SQL channel as this role can wipe EVERY tenant's rows. Usually inherited from GRANT ALL. ` +
+        `Not reachable through PostgREST, so this is latent rather than directly exploitable; to close it: REVOKE TRUNCATE ON ALL TABLES IN SCHEMA public FROM ${role};`,
+    });
+  }
+
   const proven = provenCount;
+  // Count TABLES we could not prove — not notes. Advisory notes (TRUNCATE, the
+  // identity self-check) are not tables, and counting them here overstated it.
+  const notProven = Math.max(scanned - proven - new Set(violations.map((v) => v.where)).size, 0);
   return {
     id: meta.id,
     ok: violations.length === 0,
@@ -778,7 +861,7 @@ export async function prove({ query, config = {} }) {
     scanned,
     summary:
       violations.length === 0
-        ? `${Math.max(proven, 0)}/${scanned} tenant table(s) proven isolated (read + write)` + (notes.length ? `; ${notes.length} not proven (see notes)` : '')
+        ? `${Math.max(proven, 0)}/${scanned} tenant table(s) proven isolated (read + write)` + (notProven > 0 ? `; ${notProven} not proven (see notes)` : '')
         : `${violations.length} cross-tenant leak(s) across ${new Set(violations.map((v) => v.where)).size} table(s)`,
   };
 }

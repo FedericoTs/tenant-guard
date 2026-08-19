@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.10.0
+
+Built down the [threat model](THREAT-MODEL.md), not down a bug queue — and the
+most important thing in this release is a **false negative it found in the
+flagship guard**.
+
+- **fix(rls-proof): partitioned tables reported GREEN while leaking.** Two
+  compounding causes. A partitioned parent is `relkind = 'p'` and the
+  introspection only looked at `'r'`, so the parent was never scanned. And
+  list-partitioning by tenant means every partition holds exactly ONE tenant *by
+  construction*, so the two-tenant probe could never fire — each partition was
+  written off as "only 1 tenant, cannot prove". Net effect: `ok: true` on a
+  database where any authenticated user reads every other tenant by naming the
+  partition directly (PostgREST exposes each partition as its own endpoint).
+  Fixed by scanning parents **and** adding a **foreign-tenant probe**: impersonate
+  a tenant that exists elsewhere and check whether this table's rows are visible
+  to them. That also upgrades ordinary **single-tenant tables** from "cannot
+  prove" to a real verdict.
+- **feat: new guard `identity-trust`** (`tenant-guard identity`). Asks the question
+  every other guard assumes away: can the caller **forge the identity** your
+  policies authorize from?
+  - **`user_metadata` used for authorization → FAIL.** It is writable by the user
+    (`supabase.auth.updateUser({ data })`) while `app_metadata` is not. Detected
+    in the policy text (conclusive on its own) and then *proven* by forging that
+    exact claim and re-reading the victim's rows — with a **control arm** forging a
+    nonexistent tenant, so a table that is simply open to everyone is never
+    misattributed to the claim.
+  - **A callable `SECURITY DEFINER` function that sets your tenant GUC from an
+    ARGUMENT → FAIL.** That is a "become any tenant" primitive. A function that
+    derives the tenant from the verified session instead is only a note.
+  - **Bare dependence on a client-settable GUC → NOTE, never a build failure.**
+    Whether that is exploitable depends on architecture SQL cannot see (and it is
+    how this tool itself impersonates). Failing on it would be exactly the
+    unfalsifiable finding this project exists to avoid.
+- **feat(rls-proof): `TRUNCATE` capability surfaced.** `TRUNCATE` ignores RLS
+  completely — no policy can stop it — and `GRANT ALL` includes it. Read from the
+  catalog and reported as **one aggregated note**, deliberately **never probed**: a
+  `TRUNCATE` probe takes an `ACCESS EXCLUSIVE` lock and is the one statement you
+  must not fire at a database by surprise.
+- **fix(rls-proof): "not proven" count was counting notes, not tables** — advisory
+  notes inflated it.
+- 184 tests (was 155).
+
 ## 0.9.0
 
 Closes the highest-severity item on the [threat model](THREAT-MODEL.md): the

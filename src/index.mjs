@@ -13,19 +13,21 @@ import * as rlsDrift from './guards/rls-drift.mjs';
 import * as anonWrites from './guards/anon-writes.mjs';
 import * as anonReads from './guards/anon-reads.mjs';
 import * as viewIsolation from './guards/view-isolation.mjs';
-import { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig } from './config.mjs';
+import * as identityTrust from './guards/identity-trust.mjs';
+import { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig } from './config.mjs';
 
 // The static guards: synchronous, zero-dependency, no database. These are what
 // `tenant-guard run` executes and what a project's vitest/jest suite imports.
 export const GUARDS = [migrationCollisions, definerGrants, routeOrgScoping];
 
-export { migrationCollisions, definerGrants, routeOrgScoping, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation };
+export { migrationCollisions, definerGrants, routeOrgScoping, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust };
 export { prove } from './guards/rls-proof.mjs';
 export { drift } from './guards/rls-drift.mjs';
 export { check as checkAnonWrites } from './guards/anon-writes.mjs';
 export { check as checkAnonReads } from './guards/anon-reads.mjs';
 export { check as checkViews } from './guards/view-isolation.mjs';
-export { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig } from './config.mjs';
+export { check as checkIdentity } from './guards/identity-trust.mjs';
+export { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig } from './config.mjs';
 
 /** Run every static guard against a resolved per-guard config map. Returns results[]. */
 export function runAll(cwd = process.cwd()) {
@@ -83,4 +85,15 @@ export async function runAnonReads(cwd = process.cwd()) {
 export async function runViews(cwd = process.cwd()) {
   const config = loadConfig(cwd);
   return viewIsolation.run(resolveViewIsolationConfig(config));
+}
+
+/**
+ * Run the identity-trust check (async; needs a database URL + `pg`). Asks whether
+ * the caller can FORGE the identity your policies authorize from — user-writable
+ * JWT claims, or a callable definer function that sets the tenant GUC from an
+ * argument. Returns a single guard result.
+ */
+export async function runIdentity(cwd = process.cwd()) {
+  const config = loadConfig(cwd);
+  return identityTrust.run(resolveIdentityTrustConfig(config));
 }

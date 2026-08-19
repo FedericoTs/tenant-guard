@@ -152,7 +152,7 @@ export async function check({ query, config = {} }) {
   // materialized views. A matview of every tenant, auto-granted to anon and
   // auto-exposed by PostgREST, is this CVE class at its worst — and it is
   // invisible to a base-table-only scan.
-  const intro = introspectionSql(cfg.schemas, cfg.tenantColumns);
+  const intro = introspectionSql(cfg.schemas, cfg.tenantColumns, role);
   const tablePlan = planTables(await q(intro.text, intro.values), cfg.tenantColumns, cfg.grandfather)
     .map((t) => ({ ...t, kind: 'table', name: t.table }));
   const vintro = viewIntrospectionSql(cfg.schemas, cfg.tenantColumns);

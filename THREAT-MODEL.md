@@ -68,8 +68,8 @@ These are checked *before* any isolation claim.
 | 2.5 | Safe idiom `TO public USING (auth.uid() = …)` **false-flagged** | ✅ | probed, not guessed → proven safe (0 rows as anon). A catalog-only linter cries wolf here |
 | 2.6 | RLS enabled early, **disabled/policy dropped later** | ✅ | runtime reflects live state; `rls-drift` also flags catalog-vs-migrations divergence |
 | 2.7 | A second **permissive** policy widens access (policies OR together) | ✅ | behavioural — the leak shows up in the probe regardless of which policy caused it |
-| 2.8 | Policy trusts a **client-settable GUC** (`current_setting('app.tenant')`) — the client just sets it | 🔜 | probe: as tenant A, `SET` the GUC to tenant B and re-read. High value, small build |
-| 2.9 | Policy trusts a **user-writable JWT claim** (`user_metadata`) rather than `app_metadata` | 🔜 | probe: forge the claim in `becomeTenant`, re-read |
+| 2.8 | Policy trusts a **client-settable GUC** (`current_setting('app.tenant')`) — the client just sets it | 🟡 | `identity-trust`. The *concrete* form is a hard failure: a callable `SECURITY DEFINER` function that sets that GUC from an **argument** (a "become any tenant" primitive). Bare dependence on a settable GUC is a **note, never a build failure** — whether it is exploitable depends on architecture SQL cannot see, and it is also how this tool impersonates |
+| 2.9 | Policy trusts a **user-writable JWT claim** (`user_metadata`) rather than `app_metadata` | ✅ | `identity-trust` detects it in the policy text (conclusive on its own) and then **proves** it: forge `user_metadata.<key>` as the victim and re-read. A control arm forging a nonexistent tenant keeps an already-open table from being blamed on the claim |
 | 2.10 | Policy subquery reads a **user-writable membership table** → self-grant into another tenant | 🔜 | two-step probe: insert own membership row for tenant B, then re-read B |
 | 2.11 | Existence oracles: global `UNIQUE` key, single-column FK, `ON CONFLICT DO NOTHING` reveal another tenant's hidden rows | 🔜 | probe returns `23505`/FK error where a row is invisible → enumeration leak |
 | 2.12 | `pg_stat_activity` exposes other tenants' live query text (all users share one DB role) | 🔜 | read it as the app role |
@@ -90,7 +90,7 @@ RLS is **per-command**, and `USING` (which rows you may touch) is separate from
 | 3.6 | Tenant column has a `DEFAULT` but no `WITH CHECK` — the default is overridable | ✅ | 3.3 catches it (explicit foreign tenant on insert) |
 | 3.7 | **UPSERT** (`ON CONFLICT DO UPDATE`) — the conflict path needs the *UPDATE* policy; an INSERT-only policy set lets it update another tenant's row | 🔜 | probe an upsert colliding with tenant B's key |
 | 3.8 | Self-row `UPDATE` lets a user set their own `role`/`org_id` → escalation | 🔜 | probe updating an authorization column on your own row |
-| 3.9 | **`TRUNCATE` ignores RLS entirely** — gated only by table privilege (`GRANT ALL` includes it) | 🔜 | probe `TRUNCATE` in a savepoint; success = cross-tenant destruction capability |
+| 3.9 | **`TRUNCATE` ignores RLS entirely** — gated only by table privilege (`GRANT ALL` includes it) | 🟡 | `rls-proof` reads the privilege from the catalog and reports one aggregated **note**. Deliberately **not probed**: `TRUNCATE` takes an `ACCESS EXCLUSIVE` lock and is the one statement you must not fire at a database by surprise. Latent (PostgREST exposes no TRUNCATE) rather than directly exploitable, so it is not a build failure |
 | 3.10 | `MERGE` (PG15+) per-arm policy gaps | 🔜 | exercise each arm |
 | 3.11 | Cross-tenant FK reference / cascade reaching another tenant's rows | 🔜 | insert a child pointing at tenant B's parent |
 | 3.12 | `anon` INSERT-only surface under RLS | 🟡 | `anon-writes` probes UPDATE/DELETE; pure-INSERT anon surfaces not probed yet |
@@ -107,7 +107,7 @@ The highest-severity blind spot of any table-only scanner.
 | 4.4 | Definer function with **mutable `search_path`** → object-shadowing escalation | 🔜 | catalog: `prosecdef` + no pinned `search_path`, plus `CREATE` on `public` |
 | 4.5 | Definer **helper used inside a policy** (the recursion-avoidance idiom) inherits any flaw | 🔜 | shows up behaviourally once 4.1/4.3 probes exist |
 | 4.6 | View/function over `auth.users` exposing every tenant's email | 🟡 | a *view* over `auth.users` is covered by 4.1 **if it exposes a tenant column**; one keyed only by user id isn't yet |
-| 4.7 | **Partitions**: RLS on the parent, but a partition queried directly uses *its own* (often unset) RLS; newly attached partitions miss `ENABLE`/`FORCE` | 🔜 | enumerate `pg_inherits`, probe each partition directly |
+| 4.7 | **Partitions**: RLS on the parent, but a partition queried directly uses *its own* (often unset) RLS; newly attached partitions miss `ENABLE`/`FORCE` | ✅ | `rls-proof`. This was a **false negative in the flagship guard**: partitioned parents are `relkind='p'` (previously skipped entirely) and every partition holds exactly one tenant by construction, so the two-tenant probe never fired and a leaking database reported green. Fixed by scanning parents and adding a **foreign-tenant probe** |
 | 4.8 | Legacy `INHERITS` children don't inherit parent policies | 🔜 | same enumeration |
 | 4.9 | Triggers/rules writing tenant rows into an un-RLS'd audit/outbox table | 🟡 | the audit table is itself scanned *if* it has a tenant column; without one it's invisible → 🔜 |
 
@@ -158,13 +158,16 @@ listed so nobody reads a green run as more than it is.
 ## What this means for the roadmap
 
 Ordered by (severity × prevalence in real AI-generated apps) ÷ build cost, the
-next builds are: **2.8/2.9 (forgeable identity — a policy trusting a client-settable
-GUC or a user-writable `user_metadata` claim)**; **3.7/3.9 (upsert conflict path,
-`TRUNCATE`)**; then **4.7 (partitions queried directly)** and **5.1 (storage object
-paths)**.
+next builds are: **2.10 (a policy whose authority comes from a user-writable
+membership table — self-grant into another tenant)**; **5.1 (storage object paths,
+which needs tenant-*expression* support rather than a tenant column)**; then **3.7
+(the UPSERT conflict path)**, whose permissive-`UPDATE`-policy case the existing
+write probes already cover, so it buys less than its position suggests.
 
-*Done: 4.1/4.2 (views & materialized views) shipped in 0.9.0 — they were the
-highest-severity open item and invisible to every table-only checker.*
+*Done: 4.1/4.2 views & materialized views (0.9.0); 2.9 user-writable claims,
+2.8 callable GUC-setting definer functions, 4.7 partitions, and 3.9 TRUNCATE
+(0.10.0). 4.7 is the one to learn from — it was a false NEGATIVE in the flagship
+guard, found by writing the failure surface down rather than by a bug report.*
 
 If you know a failure mode that isn't in this table, that's the most useful bug
 report this project can get — open an issue.

@@ -8,6 +8,7 @@
  *   tenant-guard anon-writes  exit 1 if the anon role can write any table
  *   tenant-guard anon-reads   exit 1 if the anon role can read any tenant table
  *   tenant-guard views   exit 1 if a view/matview leaks across tenants
+ *   tenant-guard identity exit 1 if the identity your policies trust is forgeable
  *   tenant-guard init    write a tenant-guard.config.json, seeded from this repo
  *   tenant-guard list    list the available guards and what each prevents
  *
@@ -18,8 +19,8 @@
  */
 import { writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { GUARDS, runAll, runProof, runDrift, runAnonWrites, runAnonReads, runViews } from '../src/index.mjs';
-import { rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation } from '../src/index.mjs';
+import { GUARDS, runAll, runProof, runDrift, runAnonWrites, runAnonReads, runViews, runIdentity } from '../src/index.mjs';
+import { rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust } from '../src/index.mjs';
 import { CONFIG_FILENAME, autodetect } from '../src/config.mjs';
 import { report, bold, dim, green, yellow } from '../src/runner.mjs';
 
@@ -91,9 +92,19 @@ if (cmd === 'views') {
   process.exit(code);
 }
 
+if (cmd === 'identity') {
+  // Can the caller FORGE the identity the policies authorize from? Async — needs a DB.
+  const result = await runIdentity(cwd);
+  const code = report([result], { emptyHint: false });
+  if (result.skipped) {
+    console.log(dim('  (A skip is not a pass. Point it at a seeded test/staging database:\n   export TENANT_GUARD_DATABASE_URL=postgres://…  &&  npm i -D pg  &&  tenant-guard identity)\n'));
+  }
+  process.exit(code);
+}
+
 if (cmd === 'list') {
   console.log(bold('\ntenant-guard guards\n'));
-  for (const g of [...GUARDS, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation]) {
+  for (const g of [...GUARDS, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust]) {
     console.log(`  ${bold(g.meta.id)}`);
     console.log(dim(`    ${g.meta.title}`));
     console.log(dim(`    ${g.meta.why}\n`));
@@ -159,6 +170,14 @@ if (cmd === 'init') {
       schemas: ['public'],
       allowlist: [], // "schema.table" intentionally readable by anon (published/reference data)
     },
+    identityTrust: {
+      // Asks whether the caller can FORGE the identity your policies authorize
+      // from: user-writable JWT claims (user_metadata), or a callable SECURITY
+      // DEFINER function that sets the tenant GUC from an argument. Identity
+      // config is inherited from rlsProof unless set here.
+      schemas: ['public'],
+      allowlist: [], // "schema.policyname" / "schema.table" / "schema.function"
+    },
     viewIsolation: {
       // Proves VIEWS and MATERIALIZED VIEWS don't leak across tenants. A view
       // runs with its OWNER's rights unless security_invoker is set, and RLS
@@ -183,5 +202,5 @@ if (cmd === 'init') {
   process.exit(0);
 }
 
-console.error(`Unknown command: ${cmd}\nUsage: tenant-guard [run|prove|drift|anon-writes|anon-reads|views|init|list]`);
+console.error(`Unknown command: ${cmd}\nUsage: tenant-guard [run|prove|drift|anon-writes|anon-reads|views|identity|init|list]`);
 process.exit(2);

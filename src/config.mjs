@@ -139,6 +139,21 @@ export function resolveViewIsolationConfig(config) {
   return out;
 }
 
+/** Resolve the identity-trust config from the user's `identityTrust` block. */
+export function resolveIdentityTrustConfig(config) {
+  const i = config.identityTrust ?? {};
+  const out = {};
+  for (const k of ['url', 'urlEnv', 'schemas', 'tenantColumns', 'role', 'becomeTenant', 'claim', 'allowlist']) {
+    if (i[k] !== undefined) out[k] = i[k];
+  }
+  // Identity is inherited from rlsProof so it is configured once.
+  const p = config.rlsProof ?? {};
+  for (const k of ['role', 'becomeTenant', 'claim', 'tenantColumns', 'schemas']) {
+    if (out[k] === undefined && p[k] !== undefined) out[k] = p[k];
+  }
+  return out;
+}
+
 export function autodetect(cwd = process.cwd()) {
   return {
     migrationsDir: firstExisting(cwd, CANDIDATE_MIGRATION_DIRS),

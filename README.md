@@ -26,6 +26,7 @@ npx tenant-guard drift    # exit 1 if the DB has RLS/policies no migration decla
 npx tenant-guard anon-writes  # exit 1 if the anonymous role can write any table
 npx tenant-guard anon-reads   # exit 1 if the anonymous role can read any tenant table
 npx tenant-guard views        # exit 1 if a view/materialized view leaks across tenants
+npx tenant-guard identity     # exit 1 if the identity your policies trust is forgeable
 ```
 
 ---
@@ -82,6 +83,7 @@ tenant-guard  — guard tests for multi-tenant isolation
 | `rls-drift` *(runtime)* | the database has RLS enabled or a policy that **no migration declares** | catches security posture applied by hand in the dashboard/psql — invisible to code review, absent from CI, changeable with no diff or history |
 | `anon-writes` *(runtime)* | the **anonymous** role can INSERT/UPDATE/DELETE a table | a table with no tenant column, writable by `anon`, is neither a tenant leak nor drift — it's the cache-poisoning class; it proves the real `USING`/`WITH CHECK` by probing, so it doesn't false-flag `TO public USING (auth.uid()…)` policies |
 | `anon-reads` *(runtime)* | the **anonymous** role can SELECT a **tenant** table, view, or materialized view | the CVE-2025-48757 class — the public anon key reads every tenant's data with no login; scoped to objects with a tenant column so public content isn't flagged, and it *probes* as `anon` so it evaluates the real policy, not just the grant |
+| `identity-trust` *(runtime)* | the caller can **forge the identity** your policies authorize from | every other guard asks "given a correct identity, is the data scoped?" — this asks whether the identity itself is controllable: a policy reading `user_metadata` (which the *user* can rewrite) is defeated by forging that claim, and a callable `SECURITY DEFINER` function that sets your tenant GUC from an argument is a "become any tenant" primitive |
 | `view-isolation` *(runtime)* | a **view** or **materialized view** leaks across tenants | a view runs with its **owner's** rights unless `security_invoker` is set, and RLS **never applies to a materialized view at all** — so a perfectly-RLS'd table can still be handed out wholesale by the view beside it, and every table-only checker (including `rls-proof`) sees nothing wrong |
 
 `npx tenant-guard list` describes each.

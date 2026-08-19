@@ -45,12 +45,27 @@ test('safeRole: accepts identifiers, rejects injection', () => {
 });
 
 // ── SQL builders carry params, never interpolate values ──────────────
-test('introspectionSql: parameterises schemas + columns, asks for RLS status', () => {
-  const { text, values } = introspectionSql(['public'], ['organization_id']);
-  assert.deepEqual(values, [['public'], ['organization_id']]);
+test('introspectionSql: parameterises schemas + columns + role, asks for RLS status', () => {
+  const { text, values } = introspectionSql(['public'], ['organization_id'], 'authenticated');
+  assert.deepEqual(values, [['public'], ['organization_id'], 'authenticated']);
   assert.match(text, /relrowsecurity/);
   assert.match(text, /\$1/);
   assert.match(text, /\$2/);
+  assert.match(text, /\$3/);
+});
+
+test('introspectionSql: includes partitioned PARENTS (relkind p), not just plain tables', () => {
+  // Excluding 'p' meant a partitioned tenant table was never scanned at all,
+  // while each of its single-tenant partitions reported "cannot prove" — so a
+  // leaking database came back green.
+  const { text } = introspectionSql(['public'], ['organization_id']);
+  assert.match(text, /relkind in \('r', 'p'\)/);
+  assert.match(text, /relispartition/);
+});
+
+test('introspectionSql: reads TRUNCATE privilege from the catalog (never probed)', () => {
+  const { text } = introspectionSql(['public'], ['organization_id']);
+  assert.match(text, /has_table_privilege\(\$3::text, c\.oid, 'TRUNCATE'\)/);
 });
 
 test('distinctTenantsSql / tenantRowCountSql: quote idents, bind values, cast to text', () => {

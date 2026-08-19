@@ -24,6 +24,7 @@ npx tenant-guard run      # static guards — exit 1 if anything can leak
 npx tenant-guard prove    # runtime proof — exit 1 if a tenant can read/write another tenant
 npx tenant-guard drift    # exit 1 if the DB has RLS/policies no migration declares
 npx tenant-guard anon-writes  # exit 1 if the anonymous role can write any table
+npx tenant-guard anon-reads   # exit 1 if the anonymous role can read any tenant table
 ```
 
 ---
@@ -41,7 +42,8 @@ and over:
 
 These aren't exotic. Under [CVE-2025-48757](https://nvd.nist.gov/vuln/detail/CVE-2025-48757),
 303 endpoints across 170 Lovable projects had Supabase tables readable by
-**unauthenticated** requests using the public anon key. [Wiz found an auth
+**unauthenticated** requests using the public anon key — the exact class
+`tenant-guard anon-reads` proves against. [Wiz found an auth
 bypass in Base44](https://www.wiz.io/blog/critical-vulnerability-base44) that
 reached into private enterprise apps. [Veracode's 2025 study](https://www.veracode.com/resources/analyst-reports/2025-genai-code-security-report/)
 found 45% of LLM-generated code introduces an OWASP Top 10 flaw — and larger,
@@ -78,6 +80,7 @@ tenant-guard  — guard tests for multi-tenant isolation
 | `rls-proof` *(runtime)* | a tenant's session can actually read **or write** another tenant's rows | it isn't reading source at all — it runs real queries as your app role (SELECT, plus `UPDATE`/`DELETE`/tenant-hop/`INSERT` probes) and measures the leak; nothing static can prove isolation *holds*, and RLS is per-command so reads passing says nothing about writes |
 | `rls-drift` *(runtime)* | the database has RLS enabled or a policy that **no migration declares** | catches security posture applied by hand in the dashboard/psql — invisible to code review, absent from CI, changeable with no diff or history |
 | `anon-writes` *(runtime)* | the **anonymous** role can INSERT/UPDATE/DELETE a table | a table with no tenant column, writable by `anon`, is neither a tenant leak nor drift — it's the cache-poisoning class; it proves the real `USING`/`WITH CHECK` by probing, so it doesn't false-flag `TO public USING (auth.uid()…)` policies |
+| `anon-reads` *(runtime)* | the **anonymous** role can SELECT a **tenant** table | the CVE-2025-48757 class — the public anon key reads every tenant's data with no login; scoped to tables with a tenant column so public content isn't flagged, and it *probes* as `anon` so it evaluates the real policy, not just the grant |
 
 `npx tenant-guard list` describes each.
 
@@ -310,6 +313,11 @@ conservative — they catch a bug *shape*, not every instance. The real defence
 for tenant isolation is **row-level security enforced in the database**, which is
 exactly why `rls-proof` exists: it doesn't guess from source, it runs a query as
 your app role and measures whether the isolation actually holds.
+
+**The full map is [`THREAT-MODEL.md`](THREAT-MODEL.md)** — every way tenant
+isolation is known to break, each tagged covered / partial / planned / out-of-scope
+(with *why*). It's the coverage target this project builds against, and the honest
+statement of what a green run does and doesn't prove.
 
 `rls-proof` has honest limits of its own. It proves isolation for the tables it
 can reach with the tenant identity you configure; it can only test tables that

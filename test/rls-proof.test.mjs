@@ -77,6 +77,17 @@ test('planTables: carries the policy count through', () => {
   assert.equal(plan[0].policyCount, 0);
 });
 
+test('planTables: carries the owner role (for the owner-bypass check)', () => {
+  const rows = [{ schema: 'public', table: 't', column: 'organization_id', rls_enabled: true, rls_forced: false, owner_role: 'authenticated', policy_count: 1 }];
+  const plan = planTables(rows, ['organization_id']);
+  assert.equal(plan[0].ownerRole, 'authenticated');
+});
+
+test('introspectionSql: also selects the table owner (regrole -> text)', () => {
+  const { text } = introspectionSql(['public'], ['organization_id']);
+  assert.match(text, /relowner::regrole::text as owner_role/);
+});
+
 test('write probes: whole-table UPDATE/DELETE with NO WHERE (to dodge SELECT masking)', () => {
   const u = updateProbeSql('public', 'invoices', 'organization_id', 'org_A');
   assert.match(u.text, /^update "public"\."invoices" set "organization_id" = \$1$/);

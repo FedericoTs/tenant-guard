@@ -123,6 +123,7 @@ export function introspectionSql(schemas, tenantColumns) {
            a.attname            as column,
            c.relrowsecurity     as rls_enabled,
            c.relforcerowsecurity as rls_forced,
+           c.relowner::regrole::text as owner_role,
            (select count(*) from pg_catalog.pg_policy pol where pol.polrelid = c.oid)::int as policy_count
     from pg_catalog.pg_class c
     join pg_catalog.pg_namespace n on n.oid = c.relnamespace
@@ -155,6 +156,7 @@ export function planTables(rows, tenantColumns, grandfather = []) {
         tenantColumn: r.column,
         rlsEnabled: r.rls_enabled === true || r.rls_enabled === 't',
         rlsForced: r.rls_forced === true || r.rls_forced === 't',
+        ownerRole: r.owner_role ?? null,
         policyCount: r.policy_count == null ? null : Number(r.policy_count),
         prio,
       });
@@ -618,6 +620,17 @@ export async function prove({ query, config = {} }) {
     for (const t of plan) {
       if (t.introspectError) {
         notes.push({ where: `${t.schema}.${t.table}`, message: `could not sample tenants: ${t.introspectError}` });
+        continue;
+      }
+      // Owner-bypass trap: a table's OWNER is exempt from its own RLS unless FORCE
+      // ROW LEVEL SECURITY is set. If the probe role owns this table with FORCE
+      // off, RLS is silently inert here — the probe can't be trusted (it would
+      // "see" every tenant and then blame the SELECT policy, sending you to fix
+      // the wrong thing), and the deny-all canary can't catch it because the
+      // canary isn't owned by the probe role. Diagnose it precisely instead.
+      if (t.rlsEnabled && !t.rlsForced && t.ownerRole && t.ownerRole === role) {
+        scanned++;
+        notes.push({ where: `${t.schema}.${t.table}`, message: `NOT proven — the probe role "${role}" OWNS this table and FORCE ROW LEVEL SECURITY is off, so the owner bypasses RLS here and the probe is untrustworthy. If your app really connects as this role, this is a real leak: run \`ALTER TABLE ${qualified(t.schema, t.table)} FORCE ROW LEVEL SECURITY;\` — otherwise set rlsProof.role to your actual non-owner app role.` });
         continue;
       }
       if (t.tenants.length < 2) {

@@ -284,6 +284,38 @@ if (PGlite) {
     assert.equal(res.violations.length, 0); // NULL insert fails WITH CHECK (NULL = current is not true) — no orphan
   });
 
+  test('OWNER-BYPASS: a table the probe role OWNS without FORCE is not trusted (precise note, no misattributed leak)', async () => {
+    const { query } = await freshDb(`
+      create table invoices (id serial primary key, organization_id text not null);
+      grant select, update, delete on invoices to authenticated;
+      insert into invoices (organization_id) values ('org_A'),('org_B');
+      alter table invoices owner to authenticated;      -- the probe role OWNS it...
+      alter table invoices enable row level security;   -- ...RLS on, but FORCE is OFF -> owner bypasses
+      create policy tenant on invoices ${TENANT_POLICY};
+    `);
+    const res = await prove({ query });
+    // No misattributed "leak" and no vacuous "isolated" — a precise owner-bypass note instead.
+    assert.equal(res.violations.length, 0, JSON.stringify(res.violations, null, 2));
+    assert.ok(res.notes.some((n) => /OWNS this table and FORCE ROW LEVEL SECURITY is off/i.test(n.message)), JSON.stringify(res.notes, null, 2));
+    assert.match(res.summary, /0\/1 tenant table\(s\) proven isolated/); // counted as NOT proven, not as a pass
+    assert.match(res.summary, /1 not proven/);
+  });
+
+  test('OWNER-BYPASS resolved: the same table with FORCE ROW LEVEL SECURITY proves cleanly', async () => {
+    const { query } = await freshDb(`
+      create table invoices (id serial primary key, organization_id text not null);
+      grant select, update, delete on invoices to authenticated;
+      insert into invoices (organization_id) values ('org_A'),('org_B');
+      alter table invoices owner to authenticated;
+      alter table invoices enable row level security;
+      alter table invoices force row level security;    -- now the owner is subject to RLS too
+      create policy tenant on invoices ${TENANT_POLICY} with check (organization_id = current_setting('app.current_tenant', true));
+    `);
+    const res = await prove({ query });
+    assert.equal(res.ok, true, JSON.stringify(res, null, 2));
+    assert.match(res.summary, /proven isolated/);
+  });
+
   // ── the RLS-on-no-policy trap (Reddit point 2) ─────────────────────
   test('NAMES the RLS-on-no-policy trap: deny-all that only *looks* isolated', async () => {
     const { query } = await freshDb(`

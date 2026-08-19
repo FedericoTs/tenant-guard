@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.8.0
+
+Stop growing one reported bug at a time. This release derives the **whole failure
+surface** up front, publishes it, and closes the biggest gaps it exposed.
+
+- **docs: [`THREAT-MODEL.md`](THREAT-MODEL.md).** An enumeration of how
+  multi-tenant isolation breaks in Postgres/Supabase — identity/probe integrity,
+  read path, write path, non-table objects (views, matviews, definer functions,
+  partitions), Supabase surfaces, pooling, privileges — each tagged **covered /
+  partial / planned / out-of-scope**, with *why* for the out-of-scope ones. A
+  security tool that hides its blind spots is worse than one that names them, so
+  the app-layer IDOR, leaked-service-key, public-bucket-CDN and pooler-bleed
+  classes are listed explicitly as **not** provable by this method.
+- **feat: new guard `anon-reads`.** Proves the anonymous role cannot `SELECT`
+  tenant tables — the CVE-2025-48757 class (303 endpoints across 170 Lovable
+  projects readable with the public anon key) that this README has cited from day
+  one while nothing actually checked it by default. Scoped to tables **with a
+  tenant column**, so public content isn't flagged. Hybrid: RLS-off + grant is
+  structural (true even when the table is empty); RLS-on is **probed as `anon`**,
+  which proves the safe `TO public USING (auth.uid() = …)` idiom is safe instead
+  of crying wolf the way a catalog-only linter does. Empty table → *not proven*,
+  never a silent pass. New `anon-reads` command + `anonReads` config/init/exports.
+- **fix(rls-proof): the owner-bypass false pass.** A table's **owner** is exempt
+  from its own RLS unless `FORCE ROW LEVEL SECURITY` is set. If the probe role
+  owns the table, RLS is silently inert there — and the deny-all canary could not
+  catch it, because the canary isn't owned by the probe role. Such tables are now
+  reported as **not proven**, naming the exact `ALTER TABLE … FORCE ROW LEVEL
+  SECURITY` fix, instead of producing a vacuous pass or blaming the wrong policy.
+- 128 tests (was 109).
+
 ## 0.7.0
 
 Another sharp one from the same reviewer: alongside the wrong-tenant INSERT, probe

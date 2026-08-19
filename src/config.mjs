@@ -112,6 +112,16 @@ export function resolveAnonWritesConfig(config) {
   return out;
 }
 
+/** Resolve the anon-read-surface config from the user's `anonReads` block. */
+export function resolveAnonReadsConfig(config) {
+  const a = config.anonReads ?? {};
+  const out = {};
+  for (const k of ['url', 'urlEnv', 'schemas', 'tenantColumns', 'role', 'grandfather', 'allowlist']) {
+    if (a[k] !== undefined) out[k] = a[k];
+  }
+  return out;
+}
+
 export function autodetect(cwd = process.cwd()) {
   return {
     migrationsDir: firstExisting(cwd, CANDIDATE_MIGRATION_DIRS),

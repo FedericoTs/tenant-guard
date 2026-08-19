@@ -86,6 +86,22 @@ export function resolveProveConfig(config) {
   return out;
 }
 
+/**
+ * Resolve the RLS-drift config: the (autodetected) migrations dir plus the
+ * user's `rlsDrift` block. Absent block => defaults; the guard skips unless a
+ * database URL is present in the environment.
+ */
+export function resolveDriftConfig(config) {
+  const cwd = config.cwd ?? process.cwd();
+  const migrationsRel = config.migrations?.dir ?? firstExisting(cwd, CANDIDATE_MIGRATION_DIRS) ?? null;
+  const out = { migrationsDir: migrationsRel ? join(cwd, migrationsRel) : null };
+  const d = config.rlsDrift ?? {};
+  for (const k of ['url', 'urlEnv', 'schemas', 'allowlist']) {
+    if (d[k] !== undefined) out[k] = d[k];
+  }
+  return out;
+}
+
 export function autodetect(cwd = process.cwd()) {
   return {
     migrationsDir: firstExisting(cwd, CANDIDATE_MIGRATION_DIRS),

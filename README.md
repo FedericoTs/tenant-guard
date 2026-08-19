@@ -21,7 +21,8 @@ without `npm ci`; the runtime proof adds a real Postgres check when you opt in.
 ```bash
 npx tenant-guard init     # detects your migrations + API routes, writes a config
 npx tenant-guard run      # static guards — exit 1 if anything can leak
-npx tenant-guard prove    # runtime proof — exit 1 if a tenant can read another tenant
+npx tenant-guard prove    # runtime proof — exit 1 if a tenant can read/write another tenant
+npx tenant-guard drift    # exit 1 if the DB has RLS/policies no migration declares
 ```
 
 ---
@@ -74,6 +75,7 @@ tenant-guard  — guard tests for multi-tenant isolation
 | `definer-grants` | a new mutating `SECURITY DEFINER` function isn't revoked from `PUBLIC`/`anon` | requires knowing Postgres default grants + PostgREST exposure interact — *revoking from `anon` alone is a no-op* |
 | `migration-collisions` | two migrations share a numeric prefix | a project-specific CI invariant (your numbering scheme), not a code smell |
 | `rls-proof` *(runtime)* | a tenant's session can actually read **or write** another tenant's rows | it isn't reading source at all — it runs real queries as your app role (SELECT + UPDATE/DELETE probes) and measures the leak; nothing static can prove isolation *holds*, and RLS is per-command so reads passing says nothing about writes |
+| `rls-drift` *(runtime)* | the database has RLS enabled or a policy that **no migration declares** | catches security posture applied by hand in the dashboard/psql — invisible to code review, absent from CI, changeable with no diff or history |
 
 `npx tenant-guard list` describes each.
 
@@ -148,6 +150,29 @@ skip (no database, or `pg` not installed) is **not** a pass, and the CLI says so
 Full setup — including the Supabase JWT-claim config — is in
 [`examples/rls-proof/`](examples/rls-proof/README.md).
 
+## Prove your RLS is in version control
+
+RLS can be turned on and given policies **by hand in the Supabase dashboard** (or
+a psql one-off) and never captured in a migration. When that happens, the table's
+real security posture is invisible to code review, absent from every fresh / CI
+database, and editable in the UI with no diff and no history. A permissive policy
+that lets `anon` write a shared table can live in production for months and never
+appear in a single pull request. (That's not hypothetical — it's how a real
+cache-poisoning bug hid in a Supabase app we ran this against.)
+
+```bash
+export TENANT_GUARD_DATABASE_URL="postgres://…/your_test_db"
+npx tenant-guard drift
+```
+
+`drift` reads every `ENABLE ROW LEVEL SECURITY` and `CREATE POLICY` in your
+migrations (net of `DROP`/`DISABLE`) and compares it to what the database actually
+has (`pg_policies` + `pg_class.relrowsecurity`). Anything present in the database
+but declared in **no** migration fails the build — so a hand-edited policy can't
+stay invisible. It's read-only (two catalog queries, no transaction needed), and
+it skips cleanly with no database. Allowlist anything you intentionally manage
+outside migrations (e.g. Supabase-managed policies) in `rlsDrift.allowlist`.
+
 ## Why not just a SAST scanner?
 
 There is a good static scanner for this space —
@@ -212,7 +237,8 @@ that doesn't apply to your stack **skips**, it never fails you.
   "migrations":     { "dir": "supabase/migrations", "grandfather": ["031", "101"] },
   "definerGrants":  { "baseline": 189, "allowlist": ["validate_public_token"] },
   "routeOrgScoping":{ "routesDir": "src/app/api", "allowlist": [] },
-  "rlsProof":       { "role": "authenticated", "tenantColumns": ["organization_id"], "grandfather": ["shared_lookup"] }
+  "rlsProof":       { "role": "authenticated", "tenantColumns": ["organization_id"], "grandfather": ["shared_lookup"] },
+  "rlsDrift":       { "schemas": ["public"], "allowlist": ["public.some_supabase_managed_table"] }
 }
 ```
 

@@ -108,13 +108,30 @@ strongest guard is the one a real failure — or a sharp reviewer — taught you
 write. The mechanism, the config, and a zero-infrastructure demo are in
 [`examples/rls-proof/`](examples/rls-proof/README.md).
 
+## The guard the review taught us to write
+
+We ran the tool against a real Supabase app and reviewed the two routes it
+flagged. The routes were fine (shared cache) — but the review found a permissive
+policy that let `anon` write that shared table, and the deeper finding was *why it
+had hidden*: **the policy existed only in production**, applied by hand and never
+captured in a migration. Its whole security posture was invisible to code review.
+
+So there's now a fifth guard — `rls-drift`. It reads every `ENABLE ROW LEVEL
+SECURITY` and `CREATE POLICY` your migrations declare (net of `DROP`/`DISABLE`)
+and diffs it against the live catalog (`pg_policies`). Anything in the database
+that no migration declares fails the build. That turns "our RLS is in git" from a
+hope into a checked fact — and it's the honest version of the mistake we almost
+shipped in the review: *don't trust the declared state; exercise the real one.*
+(The diff is name-and-flag presence, not policy-expression parsing — reliable by
+design, no false drift.)
+
 ## Roadmap: what's next
 
 The proof tests the tables that already carry two tenants' data. The natural next
-step is a **seeding** mode that manufactures two synthetic tenants for tables
-that don't, so coverage doesn't depend on fixture data; an `INSERT` probe to round
-out the write path; and a Supabase preset that discovers the app role and JWT
-shape automatically. Those are conveniences on top of a mechanism that holds.
+steps: a **seeding** mode that manufactures two synthetic tenants for tables that
+don't, so coverage doesn't depend on fixture data; an `INSERT` probe and an
+`anon`-write-surface check to round out "who can write what"; and a Supabase
+preset that discovers the app role and JWT shape automatically.
 
 ---
 

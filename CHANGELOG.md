@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.0
+
+New guard: **`rls-drift`** — prove your RLS is in version control.
+
+Motivated by a real review: running the tool against a Supabase app surfaced a
+permissive policy that let `anon` write a shared table — and the reason it had
+hidden was that the policy existed **only in production**, applied by hand and
+never captured in a migration. Its security posture was invisible to code review.
+
+- **feat(rls-drift):** `tenant-guard drift` reads every `ENABLE ROW LEVEL
+  SECURITY` / `CREATE POLICY` in your migrations (net of `DROP`/`DISABLE`) and
+  diffs it against the live catalog (`pg_policies` + `pg_class.relrowsecurity`).
+  Anything present in the database but declared in **no** migration fails the
+  build; declared-but-absent is a note (migrations may be unapplied). The diff is
+  name/flag-presence, not policy-expression parsing — reliable, no false drift.
+  Read-only (two catalog queries, no transaction). Skips cleanly with no DB;
+  `rlsDrift.allowlist` for policies intentionally managed outside migrations.
+- New CLI command `drift`; `rlsDrift` config block + init stub; `drift`/`runDrift`
+  exported; `./guards/rls-drift` subpath. 77 tests (was 61).
+
 ## 0.1.4
 
 Docs only. Validated end-to-end against two real, independently-built Supabase

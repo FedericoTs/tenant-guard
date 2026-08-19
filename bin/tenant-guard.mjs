@@ -4,17 +4,18 @@
  *
  *   tenant-guard run     run every static guard; exit 1 on any violation
  *   tenant-guard prove   runtime RLS proof against a database; exit 1 on a leak
+ *   tenant-guard drift   compare migrations vs the database's RLS; exit 1 on drift
  *   tenant-guard init    write a tenant-guard.config.json, seeded from this repo
  *   tenant-guard list    list the available guards and what each prevents
  *
  * `run`, `init`, `list` are zero-dependency and run in CI without `npm ci`.
- * `prove` additionally needs a database URL and the `pg` driver; without them it
- * skips (a skip is not a pass — it says so).
+ * `prove` and `drift` additionally need a database URL and the `pg` driver;
+ * without them they skip (a skip is not a pass — it says so).
  */
 import { writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { GUARDS, runAll, runProof } from '../src/index.mjs';
-import { rlsProof } from '../src/index.mjs';
+import { GUARDS, runAll, runProof, runDrift } from '../src/index.mjs';
+import { rlsProof, rlsDrift } from '../src/index.mjs';
 import { CONFIG_FILENAME, autodetect } from '../src/config.mjs';
 import { report, bold, dim, green, yellow } from '../src/runner.mjs';
 
@@ -41,9 +42,24 @@ if (cmd === 'prove') {
   process.exit(code);
 }
 
+if (cmd === 'drift') {
+  // Compare migration-declared RLS against the live catalog. Async — needs a DB.
+  const result = await runDrift(cwd);
+  const code = report([result], { emptyHint: false });
+  if (result.skipped) {
+    console.log(
+      dim(
+        '  (A skip is not a pass. Point it at a migrated test/staging database:\n' +
+          `   export TENANT_GUARD_DATABASE_URL=postgres://…  &&  npm i -D pg  &&  tenant-guard drift)\n`,
+      ),
+    );
+  }
+  process.exit(code);
+}
+
 if (cmd === 'list') {
   console.log(bold('\ntenant-guard guards\n'));
-  for (const g of [...GUARDS, rlsProof]) {
+  for (const g of [...GUARDS, rlsProof, rlsDrift]) {
     console.log(`  ${bold(g.meta.id)}`);
     console.log(dim(`    ${g.meta.title}`));
     console.log(dim(`    ${g.meta.why}\n`));
@@ -84,6 +100,13 @@ if (cmd === 'init') {
       becomeTenant: ["select set_config('app.current_tenant', $1, true)"],
       grandfather: [],
     },
+    rlsDrift: {
+      // Compares migration-declared RLS against the live catalog (same DB URL as
+      // rlsProof). Flags policies / RLS that exist in the database but no
+      // migration declares — hand-edits that never got committed.
+      schemas: ['public'],
+      allowlist: [], // "schema.table" or "schema.table::policy_name" managed outside migrations
+    },
   };
   writeFileSync(path, JSON.stringify(config, null, 2) + '\n');
   console.log(green(`✓ wrote ${CONFIG_FILENAME}`));
@@ -99,5 +122,5 @@ if (cmd === 'init') {
   process.exit(0);
 }
 
-console.error(`Unknown command: ${cmd}\nUsage: tenant-guard [run|prove|init|list]`);
+console.error(`Unknown command: ${cmd}\nUsage: tenant-guard [run|prove|drift|init|list]`);
 process.exit(2);

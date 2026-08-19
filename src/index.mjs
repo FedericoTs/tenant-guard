@@ -10,16 +10,18 @@ import * as definerGrants from './guards/definer-grants.mjs';
 import * as routeOrgScoping from './guards/route-org-scoping.mjs';
 import * as rlsProof from './guards/rls-proof.mjs';
 import * as rlsDrift from './guards/rls-drift.mjs';
-import { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig } from './config.mjs';
+import * as anonWrites from './guards/anon-writes.mjs';
+import { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig } from './config.mjs';
 
 // The static guards: synchronous, zero-dependency, no database. These are what
 // `tenant-guard run` executes and what a project's vitest/jest suite imports.
 export const GUARDS = [migrationCollisions, definerGrants, routeOrgScoping];
 
-export { migrationCollisions, definerGrants, routeOrgScoping, rlsProof, rlsDrift };
+export { migrationCollisions, definerGrants, routeOrgScoping, rlsProof, rlsDrift, anonWrites };
 export { prove } from './guards/rls-proof.mjs';
 export { drift } from './guards/rls-drift.mjs';
-export { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig } from './config.mjs';
+export { check as checkAnonWrites } from './guards/anon-writes.mjs';
+export { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig } from './config.mjs';
 
 /** Run every static guard against a resolved per-guard config map. Returns results[]. */
 export function runAll(cwd = process.cwd()) {
@@ -47,4 +49,13 @@ export async function runProof(cwd = process.cwd()) {
 export async function runDrift(cwd = process.cwd()) {
   const config = loadConfig(cwd);
   return rlsDrift.run(resolveDriftConfig(config));
+}
+
+/**
+ * Run the anon-write-surface check (async; needs a database URL + `pg`). Flags
+ * tables the unauthenticated role can write. Returns a single guard result.
+ */
+export async function runAnonWrites(cwd = process.cwd()) {
+  const config = loadConfig(cwd);
+  return anonWrites.run(resolveAnonWritesConfig(config));
 }

@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.0
+
+New guard: **`anon-writes`** — the unauthenticated write surface.
+
+This closes the one class a real review found in the wild that no guard caught:
+a table with no tenant column that the `anon` role can write. It's how a shared
+cache gets poisoned — the public key ships in every browser bundle, so if `anon`
+can write the table, anyone can rewrite what every user reads.
+
+- **feat(anon-writes):** `tenant-guard anon-writes` flags tables the anonymous
+  role can INSERT/UPDATE/DELETE. Reliability was the hard part: well-secured
+  Supabase apps write policies `TO public USING (auth.uid() = …)`, which a
+  catalog-only check can't evaluate and would false-positive on. So it's a
+  hybrid — the unambiguous **RLS-off + grant** case from the catalog, and for
+  **RLS-on** tables it drops to `anon` and actually attempts UPDATE/DELETE (each
+  in a rolled-back savepoint), which evaluates the real `USING`/`WITH CHECK`. Same
+  identity negative-control as `rls-proof` (aborts if `anon` bypasses RLS).
+  Allowlist for intentionally-public tables. Honest limit: pure INSERT-only anon
+  surfaces under RLS aren't probed yet (roadmap).
+- New `anon-writes` command + `anonWrites` config/init/exports/subpath. 96 tests
+  (was 85).
+
 ## 0.3.0
 
 Both items in this release came straight from Reddit feedback.

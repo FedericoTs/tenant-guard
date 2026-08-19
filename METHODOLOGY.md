@@ -135,12 +135,18 @@ design, no false drift.)
 
 ## Roadmap: what's next
 
-Seeding mode now manufactures two synthetic tenants for databases that don't
-already have them (`rlsProof.seed`), so coverage no longer depends on fixture
-data — and it's what makes membership-table policies provable. The remaining
-steps: an `INSERT` probe and an `anon`-write-surface check to round out "who can
-write what"; and a Supabase preset that discovers the app role and JWT shape
-automatically.
+Two of those roadmap items shipped, both taught by real use. Seeding mode
+(`rlsProof.seed`) manufactures two synthetic tenants for databases that don't
+already have them, so coverage no longer depends on fixture data — and it's what
+makes membership-table policies provable. And a review of a real app found a
+class every tenant guard missed: a table with no tenant column that `anon` could
+write (that's how a shared cache gets poisoned). `anon-writes` closes it — and
+the interesting part is *how*: a catalog-only check would false-flag the
+well-secured `TO public USING (auth.uid() = …)` policies real apps use, so it
+proves the write path by actually attempting it as `anon` and reading the real
+result. Same lesson, again: don't infer what you can exercise. The remaining
+steps: an `INSERT` probe under RLS, and a Supabase preset that discovers the app
+role and JWT shape automatically.
 
 ---
 

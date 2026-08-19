@@ -102,6 +102,16 @@ export function resolveDriftConfig(config) {
   return out;
 }
 
+/** Resolve the anon-write-surface config from the user's `anonWrites` block. */
+export function resolveAnonWritesConfig(config) {
+  const a = config.anonWrites ?? {};
+  const out = {};
+  for (const k of ['url', 'urlEnv', 'schemas', 'role', 'allowlist']) {
+    if (a[k] !== undefined) out[k] = a[k];
+  }
+  return out;
+}
+
 export function autodetect(cwd = process.cwd()) {
   return {
     migrationsDir: firstExisting(cwd, CANDIDATE_MIGRATION_DIRS),

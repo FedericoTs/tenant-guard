@@ -23,6 +23,7 @@ npx tenant-guard init     # detects your migrations + API routes, writes a confi
 npx tenant-guard run      # static guards — exit 1 if anything can leak
 npx tenant-guard prove    # runtime proof — exit 1 if a tenant can read/write another tenant
 npx tenant-guard drift    # exit 1 if the DB has RLS/policies no migration declares
+npx tenant-guard anon-writes  # exit 1 if the anonymous role can write any table
 ```
 
 ---
@@ -76,6 +77,7 @@ tenant-guard  — guard tests for multi-tenant isolation
 | `migration-collisions` | two migrations share a numeric prefix | a project-specific CI invariant (your numbering scheme), not a code smell |
 | `rls-proof` *(runtime)* | a tenant's session can actually read **or write** another tenant's rows | it isn't reading source at all — it runs real queries as your app role (SELECT + UPDATE/DELETE probes) and measures the leak; nothing static can prove isolation *holds*, and RLS is per-command so reads passing says nothing about writes |
 | `rls-drift` *(runtime)* | the database has RLS enabled or a policy that **no migration declares** | catches security posture applied by hand in the dashboard/psql — invisible to code review, absent from CI, changeable with no diff or history |
+| `anon-writes` *(runtime)* | the **anonymous** role can INSERT/UPDATE/DELETE a table | a table with no tenant column, writable by `anon`, is neither a tenant leak nor drift — it's the cache-poisoning class; it proves the real `USING`/`WITH CHECK` by probing, so it doesn't false-flag `TO public USING (auth.uid()…)` policies |
 
 `npx tenant-guard list` describes each.
 
@@ -172,6 +174,28 @@ but declared in **no** migration fails the build — so a hand-edited policy can
 stay invisible. It's read-only (two catalog queries, no transaction needed), and
 it skips cleanly with no database. Allowlist anything you intentionally manage
 outside migrations (e.g. Supabase-managed policies) in `rlsDrift.allowlist`.
+
+## Catch the unauthenticated write surface
+
+The tenant guards ask "can tenant A touch tenant B?" — but a table with **no
+tenant column**, writable by `anon`, is neither a tenant leak nor drift. It's how
+a shared cache gets poisoned: the public anon key ships in every browser bundle,
+so if `anon` can write the table, anyone can rewrite what every user reads. Almost
+no table should accept unauthenticated writes.
+
+```bash
+export TENANT_GUARD_DATABASE_URL="postgres://…/your_test_db"
+npx tenant-guard anon-writes
+```
+
+The reliability is the point. Well-secured Supabase apps write policies
+`TO public USING (auth.uid() = …)`, which a catalog-only check can't evaluate and
+would false-flag. So `anon-writes` is a hybrid: the unambiguous **RLS-off + grant**
+case from the catalog, and for **RLS-on** tables it drops to `anon` and *actually
+attempts* `UPDATE`/`DELETE` (each in a rolled-back savepoint) — evaluating the real
+`USING`/`WITH CHECK`, no guessing. It shares `rls-proof`'s negative control
+(aborts if `anon` bypasses RLS), and `anonWrites.allowlist` covers tables that are
+public-write by design.
 
 ## Why not just a SAST scanner?
 

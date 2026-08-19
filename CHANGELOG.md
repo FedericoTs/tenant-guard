@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.0
+
+Both items in this release came straight from Reddit feedback.
+
+- **feat(rls-proof): seeding mode.** `rlsProof.seed` makes the proof
+  **manufacture two synthetic tenants** inside the rolled-back transaction
+  instead of requiring two tenants to already have data. This closes two gaps:
+  it works on an **empty / CI database**, and it handles **membership-table
+  policies** (`org_id IN (SELECT … WHERE user_id = auth.uid())`) — your
+  `seed.setup` creates the membership rows the impersonated identity needs, which
+  a bare claim can't. Tenant ids default to two UUIDs (pass `seed.tenants` for
+  other types); a broken seed statement fails with a clear message. Nothing
+  persists.
+- **fix(definer-grants): judge the FINAL state of history, not each file.** A
+  function that ships unsafe and is fixed by a `REVOKE` (or by dropping
+  `SECURITY DEFINER`) in a *later* repair migration is no longer flagged — it
+  used to be, because the guard only looked for a same-file revoke. Now it takes
+  the latest definition of each function across all migrations and whether it's
+  ever revoked, matching an ArchUnit-style "assert on the final definition" test.
+  Genuinely-unsafe functions introduced late are still caught.
+- 85 tests (was 79).
+
 ## 0.2.1
 
 Two improvements to `rls-proof`, both from sharp reviewer feedback.

@@ -135,11 +135,12 @@ design, no false drift.)
 
 ## Roadmap: what's next
 
-The proof tests the tables that already carry two tenants' data. The natural next
-steps: a **seeding** mode that manufactures two synthetic tenants for tables that
-don't, so coverage doesn't depend on fixture data; an `INSERT` probe and an
-`anon`-write-surface check to round out "who can write what"; and a Supabase
-preset that discovers the app role and JWT shape automatically.
+Seeding mode now manufactures two synthetic tenants for databases that don't
+already have them (`rlsProof.seed`), so coverage no longer depends on fixture
+data — and it's what makes membership-table policies provable. The remaining
+steps: an `INSERT` probe and an `anon`-write-surface check to round out "who can
+write what"; and a Supabase preset that discovers the app role and JWT shape
+automatically.
 
 ---
 

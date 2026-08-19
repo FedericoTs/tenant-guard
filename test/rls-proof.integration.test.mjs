@@ -200,6 +200,67 @@ if (PGlite) {
     assert.deepEqual(after, before); // ...yet every UPDATE/DELETE probe was rolled back — rows and sums identical
   });
 
+  // ── seeding mode: prove even when the DB has no starting data ─────────
+  test('SEEDING: proves an empty table (no rows at all) by manufacturing two tenants', async () => {
+    const { query } = await freshDb(`
+      create table invoices (id serial primary key, organization_id text not null, amount int);
+      grant select, update, delete on invoices to authenticated;
+      alter table invoices enable row level security;
+      create policy tenant_iso on invoices using (organization_id = current_setting('app.current_tenant', true));
+    `); // deliberately NO inserts — nothing to sample
+    const res = await prove({
+      query,
+      config: { seed: { setup: ["insert into invoices (organization_id, amount) values ($1::text, 100)"] } },
+    });
+    assert.equal(res.ok, true, JSON.stringify(res, null, 2));
+    assert.match(res.summary, /1\/1 tenant table\(s\) proven isolated/);
+  });
+
+  test('SEEDING: proves a MEMBERSHIP-policy table (needs a seeded membership row, not just a claim)', async () => {
+    const db = new PGlite();
+    await db.exec(`
+      create role authenticated nologin;
+      create table memberships (user_id uuid, organization_id text);
+      create table docs (id serial primary key, organization_id text not null, body text);
+      grant select on memberships to authenticated;
+      grant select, update, delete on docs to authenticated;
+      alter table docs enable row level security;
+      create policy member_only on docs using (
+        organization_id in (select organization_id from memberships where user_id = (current_setting('app.uid', true))::uuid)
+      );
+    `);
+    const query = (t, v) => db.query(t, Array.isArray(v) && v.length ? v : undefined);
+    const res = await prove({
+      query,
+      config: {
+        grandfather: ['memberships'], // the junction table itself isn't the thing under test
+        becomeTenant: ["select set_config('app.uid', (select user_id from memberships where organization_id = $1::text limit 1)::text, true)"],
+        seed: {
+          setup: [
+            "insert into memberships (user_id, organization_id) values (gen_random_uuid(), $1::text)",
+            "insert into docs (organization_id, body) values ($1::text, 'hi')",
+          ],
+        },
+      },
+    });
+    assert.equal(res.ok, true, JSON.stringify(res, null, 2));
+    assert.match(res.summary, /proven isolated/);
+  });
+
+  test('SEEDING: a broken seed statement fails with a clear message, not a crash', async () => {
+    const { query } = await freshDb(`
+      create table invoices (id serial primary key, organization_id text not null);
+      alter table invoices enable row level security;
+      create policy p on invoices using (organization_id = current_setting('app.current_tenant', true));
+    `);
+    const res = await prove({
+      query,
+      config: { seed: { setup: ["insert into invoices (organization_id, nope) values ($1::text, 1)"] } },
+    });
+    assert.equal(res.ok, false);
+    assert.ok(res.violations.some((v) => /seeding failed/.test(v.message)), JSON.stringify(res.violations));
+  });
+
   // ── negative control: don't trust a pass from a session RLS doesn't bind ──
   test('SELF-CHECK: a BYPASSRLS role is caught as vacuous, not reported isolated', async () => {
     const db = new PGlite();

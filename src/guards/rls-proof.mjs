@@ -67,6 +67,19 @@ export const DEFAULTS = {
   // each inside a rolled-back savepoint. RLS is per-command, so a correct SELECT
   // policy can still leave UPDATE/DELETE open. Set false to test reads only.
   probeWrites: true,
+  // Seeding mode. When set, the proof MANUFACTURES two synthetic tenants inside
+  // the rolled-back transaction instead of relying on two tenants already having
+  // data — so it works on an empty/CI database, and on policies that read a
+  // membership table (your seed creates the membership rows). Shape:
+  //   seed: {
+  //     tenants: ["<id-A>", "<id-B>"],   // optional; default = two generated UUIDs
+  //     setup: [                          // run PRIVILEGED once per tenant, $1 = tenant id
+  //       "insert into organizations (id) values ($1)",
+  //       "insert into memberships (user_id, organization_id) values (gen_random_uuid(), $1)",
+  //       "insert into invoices (organization_id, amount) values ($1, 100)"
+  //     ]
+  //   }
+  seed: null,
 };
 
 // ── pure helpers (unit-tested, no I/O) ───────────────────────────────
@@ -313,14 +326,63 @@ export async function prove({ query, config = {} }) {
     });
   }
 
+  // Seeding mode: manufacture two synthetic tenants inside the rolled-back
+  // transaction, so the proof works on an empty database and on membership-based
+  // policies (the seed creates the membership rows). Ids default to two UUIDs;
+  // pass seed.tenants for non-UUID tenant columns.
+  let seededTenants = null;
+  if (cfg.seed) {
+    if (!Array.isArray(cfg.seed.setup) || cfg.seed.setup.length === 0) {
+      return OK({ skipped: true, reason: 'rlsProof.seed is set but seed.setup is empty', summary: 'skipped — empty seed' });
+    }
+    if (Array.isArray(cfg.seed.tenants) && cfg.seed.tenants.length >= 2) {
+      seededTenants = cfg.seed.tenants.slice(0, 2).map(String);
+    } else {
+      const { randomUUID } = await import('node:crypto');
+      seededTenants = [randomUUID(), randomUUID()];
+    }
+  }
+
   await query('begin', []);
   try {
-    // Pass 1 — PRIVILEGED: sample the tenant ids present in each table, plus the
-    // per-tenant row counts a write probe needs to tell own rows from others'.
+    // Seed the two synthetic tenants (privileged) before anything else. Each
+    // statement runs once per tenant with $1 = the tenant id; nothing persists.
+    if (seededTenants) {
+      for (const tid of seededTenants) {
+        for (const stmt of cfg.seed.setup) {
+          try {
+            await query(stmt, [tid]);
+          } catch (err) {
+            try { await query('rollback', []); } catch { /* ignore */ }
+            return {
+              id: meta.id,
+              ok: false,
+              notes,
+              scanned: 0,
+              violations: [
+                {
+                  where: '(seed)',
+                  message: `seeding failed for tenant "${tid}": ${err.message}`,
+                  fix: `Fix rlsProof.seed.setup — each statement runs once per synthetic tenant ($1 = the tenant id), privileged, inside a rolled-back transaction. Order statements so foreign keys resolve (parents before children).`,
+                },
+              ],
+              summary: 'seeding failed — could not manufacture tenants',
+            };
+          }
+        }
+      }
+    }
+
+    // Pass 1 — PRIVILEGED: get the tenant pair (seeded, or sampled from existing
+    // data) plus the per-tenant row counts a write probe needs.
     for (const t of plan) {
       try {
-        const d = distinctTenantsSql(t.schema, t.table, t.tenantColumn, cfg.sampleLimit);
-        t.tenants = (await q(d.text, d.values)).map((r) => r.t);
+        if (seededTenants) {
+          t.tenants = seededTenants;
+        } else {
+          const d = distinctTenantsSql(t.schema, t.table, t.tenantColumn, cfg.sampleLimit);
+          t.tenants = (await q(d.text, d.values)).map((r) => r.t);
+        }
         if (t.tenants.length >= 2) {
           const cnt = tenantCountsSql(t.schema, t.table, t.tenantColumn, t.tenants[0], t.tenants[1]);
           const row = (await q(cnt.text, cnt.values))[0];
@@ -407,6 +469,13 @@ export async function prove({ query, config = {} }) {
       if (t.tenants.length < 2) {
         scanned++;
         notes.push({ where: `${t.schema}.${t.table}`, message: classifyTableResult({ rlsEnabled: t.rlsEnabled, policyCount: t.policyCount, tenantCount: t.tenants.length, ownVisible: 0, crossVisible: 0 }).message });
+        continue;
+      }
+      // Seeding mode: a table the seed didn't populate for both tenants can't be
+      // proven — say so, rather than mis-reading it as over-restrictive.
+      if (seededTenants && (t.ownA === 0 || t.ownB === 0)) {
+        scanned++;
+        notes.push({ where: `${t.schema}.${t.table}`, message: `seed created no rows here for both tenants — add an INSERT for this table to rlsProof.seed.setup to prove it` });
         continue;
       }
       const [tenantA, tenantB] = t.tenants;

@@ -27,11 +27,12 @@ export function migrationNumber(filename) {
 }
 
 /**
- * Parse a migration's SQL into the SECURITY DEFINER functions it defines.
- * Heuristic (no full SQL parser): split on each CREATE [OR REPLACE] FUNCTION
- * and inspect the segment up to the next one. Returns [{ name, returnsTrigger, mutates }].
+ * Parse a migration's SQL into EVERY function it defines, with the properties
+ * that decide safety. Heuristic (no full SQL parser): split on each
+ * CREATE [OR REPLACE] FUNCTION and inspect the segment up to the next one.
+ * Returns [{ name, isDefiner, returnsTrigger, mutates }].
  */
-export function extractDefinerFunctions(sql) {
+export function extractFunctionDefs(sql) {
   const out = [];
   const re = /create\s+(?:or\s+replace\s+)?function\s+([a-z0-9_."]+)\s*\(/gi;
   const starts = [];
@@ -40,18 +41,24 @@ export function extractDefinerFunctions(sql) {
   for (let i = 0; i < starts.length; i++) {
     const start = starts[i].index;
     const end = i + 1 < starts.length ? starts[i + 1].index : sql.length;
-    const segment = sql.slice(start, end);
-    const lower = segment.toLowerCase();
-    if (!/security\s+definer/.test(lower)) continue;
+    const lower = sql.slice(start, end).toLowerCase();
     const rawName = starts[i].name.replace(/"/g, '');
     const name = rawName.includes('.') ? rawName.split('.').pop() : rawName;
     out.push({
       name,
+      isDefiner: /security\s+definer/.test(lower),
       returnsTrigger: /returns\s+trigger/.test(lower),
       mutates: /\b(insert|update|delete)\b/.test(lower),
     });
   }
   return out;
+}
+
+/** The SECURITY DEFINER functions in `sql` (a filtered view of extractFunctionDefs). */
+export function extractDefinerFunctions(sql) {
+  return extractFunctionDefs(sql)
+    .filter((f) => f.isDefiner)
+    .map(({ isDefiner, ...f }) => f); // eslint-disable-line no-unused-vars
 }
 
 /** Does `sql` revoke EXECUTE on function `name` from PUBLIC or anon? */
@@ -65,21 +72,44 @@ export function revokesAnonExecute(sql, name) {
 }
 
 /**
- * Find convention violations across the given migrations.
+ * Find convention violations across the given migrations, judged on the FINAL
+ * state of history — not per file. A function that ships unsafe and is fixed by
+ * a REVOKE (or by dropping SECURITY DEFINER) in a *later* repair migration is
+ * not a live leak, so it isn't flagged. This mirrors an ArchUnit-style check
+ * that only asserts on a function's final definition.
  * @param {{name:string, sql:string}[]} files
  * @param {{ baseline?: number, allowlist?: string[] }} opts
  */
 export function findDefinerGrantViolations(files, { baseline = 0, allowlist = [] } = {}) {
   const allow = new Set(allowlist);
-  const violations = [];
-  for (const { name: filename, sql } of files) {
+  const sorted = [...files].sort((a, b) => (migrationNumber(a.name) ?? 0) - (migrationNumber(b.name) ?? 0));
+
+  // The latest definition of each function name across all history.
+  const latest = new Map(); // name -> { isDefiner, returnsTrigger, mutates, file, num }
+  for (const { name: filename, sql } of sorted) {
     const num = migrationNumber(filename);
-    if (num === null || num <= baseline) continue;
-    for (const fn of extractDefinerFunctions(sql)) {
-      if (fn.returnsTrigger || !fn.mutates) continue; // not RPC-exploitable
-      if (allow.has(fn.name)) continue; // intentional anon surface
-      if (!revokesAnonExecute(sql, fn.name)) violations.push({ file: filename, fn: fn.name });
+    for (const fn of extractFunctionDefs(sql)) {
+      latest.set(fn.name, { ...fn, file: filename, num });
     }
+  }
+
+  // Is EXECUTE ever revoked from PUBLIC/anon for a name, anywhere in history?
+  // CREATE OR REPLACE preserves grants, so a revoke that appears at all keeps it
+  // revoked — the "fixed later in a repair migration" case.
+  const revoked = new Set();
+  for (const name of latest.keys()) {
+    if (sorted.some(({ sql }) => revokesAnonExecute(sql, name))) revoked.add(name);
+  }
+
+  // Violation only when the FINAL definition is a mutating, non-trigger
+  // SECURITY DEFINER function above the baseline, never revoked, not allowlisted.
+  const violations = [];
+  for (const [name, def] of latest) {
+    if (!def.isDefiner || def.returnsTrigger || !def.mutates) continue;
+    if ((def.num ?? 0) <= baseline) continue;
+    if (allow.has(name)) continue;
+    if (revoked.has(name)) continue;
+    violations.push({ file: def.file, fn: name });
   }
   return violations;
 }

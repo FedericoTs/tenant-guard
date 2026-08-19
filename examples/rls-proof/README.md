@@ -59,7 +59,34 @@ identity needs a **seeded membership row** linking that user to the tenant, or t
 session resolves to "no orgs," sees nothing, and the table reports as *not proven*
 (over-restrictive) rather than isolated. Impersonate a user who is already a
 member of the discovered tenant, and make sure your test database has the
-membership rows.
+membership rows — or use **seeding mode** (below), which creates them for you.
+
+## Seeding mode — prove on an empty database
+
+By default the proof samples two tenants that already have data. On a fresh / CI
+database, or for policies that read a membership table, there's nothing to
+sample. `seed` fixes that: it **manufactures two synthetic tenants inside the
+rolled-back transaction**, so nothing is ever committed.
+
+```json
+{
+  "rlsProof": {
+    "becomeTenant": ["select set_config('app.uid', (select user_id from memberships where organization_id = $1::text limit 1)::text, true)"],
+    "seed": {
+      "setup": [
+        "insert into memberships (user_id, organization_id) values (gen_random_uuid(), $1::text)",
+        "insert into invoices (organization_id, amount) values ($1::text, 100)"
+      ]
+    }
+  }
+}
+```
+
+Each `setup` statement runs once per synthetic tenant with `$1` = the tenant id,
+**privileged**, in dependency order (parents before children). Tenant ids default
+to two generated UUIDs; pass `"tenants": ["…", "…"]` if your tenant column isn't a
+UUID. A table your seed doesn't populate is reported as "not proven" (add an
+INSERT for it), and a broken seed statement fails with the exact SQL error.
 
 ## What it reports
 

@@ -103,6 +103,33 @@ test('definer: allowlisted function is not flagged', () => {
   assert.deepEqual(v, []);
 });
 
+test('definer: unsafe in one migration, REVOKED in a LATER migration -> clean (final state, not per-file)', () => {
+  const files = [
+    { name: '200_add.sql', sql: UNSAFE_FN },
+    { name: '205_repair.sql', sql: `REVOKE EXECUTE ON FUNCTION public.wipe_org(uuid) FROM PUBLIC, anon;` },
+  ];
+  assert.deepEqual(findDefinerGrantViolations(files, { baseline: 100 }), []);
+});
+
+test('definer: unsafe DEFINER later replaced WITHOUT security definer -> clean (final definition wins)', () => {
+  const files = [
+    { name: '200_add.sql', sql: UNSAFE_FN },
+    { name: '210_fix.sql', sql: `CREATE OR REPLACE FUNCTION public.wipe_org(p_org uuid) RETURNS void LANGUAGE sql AS $$ DELETE FROM invoices WHERE organization_id = p_org; $$;` },
+  ];
+  assert.deepEqual(findDefinerGrantViolations(files, { baseline: 100 }), []);
+});
+
+test('definer: unsafe in a later migration is STILL flagged (net-state, not just first file)', () => {
+  const files = [
+    { name: '100_unrelated.sql', sql: `CREATE FUNCTION public.noop() RETURNS void LANGUAGE sql AS $$ select 1 $$;` },
+    { name: '300_add.sql', sql: UNSAFE_FN }, // introduced late, never revoked
+  ];
+  const v = findDefinerGrantViolations(files, { baseline: 100 });
+  assert.equal(v.length, 1);
+  assert.equal(v[0].fn, 'wipe_org');
+  assert.equal(v[0].file, '300_add.sql');
+});
+
 test('definer: migrationNumber parses prefixes', () => {
   assert.equal(migrationNumber('208_role.sql'), 208);
   assert.equal(migrationNumber('no-number.sql'), null);

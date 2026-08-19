@@ -14,6 +14,9 @@ import {
   definerSetsTrustedGuc,
   forgeUserMetadataSql,
   deriveClaimKey,
+  authorityDepsSql,
+  effectiveCheck,
+  classifyAuthority,
 } from '../src/guards/identity-trust.mjs';
 
 test('policyExprSql: scopes to tenant-column tables, parameterised', () => {
@@ -129,4 +132,66 @@ test('deriveClaimKey: prefers the explicit claim, then the becomeTenant template
     'org_id',
   );
   assert.equal(deriveClaimKey({ becomeTenant: [`select set_config('app.current_tenant', $1, true)`] }, 'organization_id'), 'organization_id');
+});
+
+// ── authority tables (threat-model 2.10) ─────────────────────────────
+
+test('authorityDepsSql: reads policy dependencies from pg_depend and excludes the policy\'s own table', () => {
+  const { text, values } = authorityDepsSql(['public']);
+  assert.match(text, /pg_depend/);
+  assert.match(text, /pg_policy/);
+  assert.match(text, /dc\.oid <> p\.polrelid/); // self-dependency excluded
+  assert.deepEqual(values, [['public']]);
+});
+
+test('effectiveCheck: FOR ALL with no WITH CHECK falls back to USING; FOR INSERT does not', () => {
+  assert.equal(effectiveCheck({ cmd: 'ALL', qual: 'q', with_check: null }), 'q');
+  assert.equal(effectiveCheck({ cmd: 'ALL', qual: 'q', with_check: 'wc' }), 'wc');
+  assert.equal(effectiveCheck({ cmd: 'INSERT', qual: null, with_check: 'wc' }), 'wc');
+  assert.equal(effectiveCheck({ cmd: 'UPDATE', qual: 'q', with_check: null }), null);
+});
+
+test('classifyAuthority: RLS off + write grant -> leak (structural, conclusive)', () => {
+  const v = classifyAuthority({ schema: 'public', table: 'memberships', tenantColumn: 'organization_id', rlsEnabled: false, canInsert: true, dependents: ['public.invoices'] });
+  assert.equal(v.status, 'leak');
+  assert.match(v.message, /RLS is OFF/);
+});
+
+test('classifyAuthority: a check that omits the tenant column -> leak (the user_id = auth.uid() near-miss)', () => {
+  const v = classifyAuthority({
+    schema: 'public', table: 'memberships', tenantColumn: 'organization_id',
+    rlsEnabled: true, canInsert: true,
+    writePolicies: [{ policy: 'self', cmd: 'INSERT', with_check: '(user_id = auth.uid())' }],
+  });
+  assert.equal(v.status, 'leak');
+  assert.match(v.message, /never constrains "organization_id"/);
+});
+
+test('classifyAuthority: a check that DOES constrain the tenant column -> safe', () => {
+  const v = classifyAuthority({
+    schema: 'public', table: 'memberships', tenantColumn: 'organization_id',
+    rlsEnabled: true, canInsert: true,
+    writePolicies: [{ policy: 'scoped', cmd: 'INSERT', with_check: `(user_id = auth.uid() AND organization_id = current_setting('app.tenant'))` }],
+  });
+  assert.equal(v.status, 'safe');
+});
+
+test('classifyAuthority: RLS on with no write policy -> safe (writes are denied outright)', () => {
+  const v = classifyAuthority({
+    schema: 'public', table: 'memberships', tenantColumn: 'organization_id',
+    rlsEnabled: true, canInsert: true,
+    writePolicies: [{ policy: 'read_own', cmd: 'SELECT', qual: 'x' }],
+  });
+  assert.equal(v.status, 'safe');
+});
+
+test('classifyAuthority: no write grant -> safe whatever the policies say', () => {
+  const v = classifyAuthority({ schema: 'public', table: 'memberships', tenantColumn: 'organization_id', rlsEnabled: false, canInsert: false, canUpdate: false });
+  assert.equal(v.status, 'safe');
+});
+
+test('classifyAuthority: writable but no tenant column -> unknown (a note, never a silent pass)', () => {
+  const v = classifyAuthority({ schema: 'public', table: 'admin_flags', tenantColumn: null, rlsEnabled: false, canInsert: true, dependents: ['public.invoices'] });
+  assert.equal(v.status, 'unknown');
+  assert.match(v.message, /no recognised tenant column/);
 });

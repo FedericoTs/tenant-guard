@@ -70,7 +70,7 @@ These are checked *before* any isolation claim.
 | 2.7 | A second **permissive** policy widens access (policies OR together) | ✅ | behavioural — the leak shows up in the probe regardless of which policy caused it |
 | 2.8 | Policy trusts a **client-settable GUC** (`current_setting('app.tenant')`) — the client just sets it | 🟡 | `identity-trust`. The *concrete* form is a hard failure: a callable `SECURITY DEFINER` function that sets that GUC from an **argument** (a "become any tenant" primitive). Bare dependence on a settable GUC is a **note, never a build failure** — whether it is exploitable depends on architecture SQL cannot see, and it is also how this tool impersonates |
 | 2.9 | Policy trusts a **user-writable JWT claim** (`user_metadata`) rather than `app_metadata` | ✅ | `identity-trust` detects it in the policy text (conclusive on its own) and then **proves** it: forge `user_metadata.<key>` as the victim and re-read. A control arm forging a nonexistent tenant keeps an already-open table from being blamed on the claim |
-| 2.10 | Policy subquery reads a **user-writable membership table** → self-grant into another tenant | 🔜 | two-step probe: insert own membership row for tenant B, then re-read B |
+| 2.10 | Policy subquery reads a **user-writable membership table** → self-grant into another tenant | ✅ | `identity-trust`. Dependencies come from `pg_depend` (exact, not a regex over policy text). Fails when the authority table has RLS off with a write grant, or an INSERT/UPDATE policy whose check never constrains its **tenant column** — the `WITH CHECK (user_id = auth.uid())` near-miss that pins WHO you are and leaves WHICH TENANT open. No tenant column on the authority table → a note, never a silent pass |
 | 2.11 | Existence oracles: global `UNIQUE` key, single-column FK, `ON CONFLICT DO NOTHING` reveal another tenant's hidden rows | 🔜 | probe returns `23505`/FK error where a row is invisible → enumeration leak |
 | 2.12 | `pg_stat_activity` exposes other tenants' live query text (all users share one DB role) | 🔜 | read it as the app role |
 | 2.13 | Planner/statistics side channels (`pg_stats`, non-`LEAKPROOF` functions) | ⛔ | needs adversarial query construction; low yield, high noise |
@@ -158,16 +158,19 @@ listed so nobody reads a green run as more than it is.
 ## What this means for the roadmap
 
 Ordered by (severity × prevalence in real AI-generated apps) ÷ build cost, the
-next builds are: **2.10 (a policy whose authority comes from a user-writable
-membership table — self-grant into another tenant)**; **5.1 (storage object paths,
-which needs tenant-*expression* support rather than a tenant column)**; then **3.7
-(the UPSERT conflict path)**, whose permissive-`UPDATE`-policy case the existing
-write probes already cover, so it buys less than its position suggests.
+next builds are: **5.1 (storage object paths, which needs tenant-*expression*
+support rather than a tenant column)**; **3.8 (self-row UPDATE of an authorization
+column — `profiles.role = 'admin'`)**, which is the same "write your own authority"
+shape as 2.10 and should reuse its machinery; then **2.11 (existence oracles)**.
+**3.7 (the UPSERT conflict path)** stays low: the permissive-`UPDATE`-policy case it
+depends on is already caught by the existing write probes, so it buys less than its
+position suggests.
 
-*Done: 4.1/4.2 views & materialized views (0.9.0); 2.9 user-writable claims,
-2.8 callable GUC-setting definer functions, 4.7 partitions, and 3.9 TRUNCATE
-(0.10.0). 4.7 is the one to learn from — it was a false NEGATIVE in the flagship
-guard, found by writing the failure surface down rather than by a bug report.*
+*Done: 4.1/4.2 views & materialized views (0.9.0); 2.9 user-writable claims, 2.8
+callable GUC-setting definer functions, 4.7 partitions, 3.9 TRUNCATE (0.10.0);
+2.10 user-writable policy authority (0.11.0). 4.7 is the one to learn from — it
+was a false NEGATIVE in the flagship guard, found by writing the failure surface
+down rather than by waiting for a bug report.*
 
 If you know a failure mode that isn't in this table, that's the most useful bug
 report this project can get — open an issue.

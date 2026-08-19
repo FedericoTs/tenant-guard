@@ -6,7 +6,7 @@
  * itself?** A perfectly-written `USING (org_id = <identity>)` is worthless if the
  * caller controls `<identity>`.
  *
- * Three findings, deliberately at different confidence levels — because they are
+ * Four findings, deliberately at different confidence levels — because they are
  * knowable to different degrees from SQL alone:
  *
  *   1. **`user_metadata` used for authorization → FAIL.** In Supabase,
@@ -31,10 +31,22 @@
  *      and what to check, and we do not fail the build on it. Claiming otherwise
  *      would be the kind of unfalsifiable finding this project exists to avoid.
  *
+ *   4. **The policy's AUTHORITY is user-writable → FAIL.** The textbook policy
+ *      `USING (org_id IN (SELECT org_id FROM memberships WHERE user_id = auth.uid()))`
+ *      is flawless — and completely bypassable if the caller can write
+ *      `memberships`: insert yourself a row for someone else's org and every
+ *      policy trusting that table now returns their data, legitimately. The soft
+ *      thing is one table away, which is why per-table checking never finds it.
+ *      Dependencies come from `pg_depend` (exact), not from parsing policy text.
+ *      The near-miss worth naming: `WITH CHECK (user_id = auth.uid())` pins WHO
+ *      you are and leaves WHICH TENANT completely open.
+ *
  * Read-only: catalog reads plus, for the forgery proof, one rolled-back
  * transaction.
  */
 import {
+  quoteIdent,
+  qualified,
   safeRole,
   isPermissionDenied,
   distinctTenantsSql,
@@ -48,7 +60,7 @@ import {
 export const meta = {
   id: 'identity-trust',
   title: 'What your policies trust for identity (forgeable-identity escalation)',
-  why: 'Asks the question every other check assumes away: can the caller forge the identity your policies authorize from? Flags user-writable JWT claims (user_metadata) used for authorization, and callable SECURITY DEFINER functions that set the tenant GUC from an argument — a "become any tenant" primitive.',
+  why: 'Asks the question every other check assumes away: can the caller forge the identity your policies authorize from? Flags user-writable JWT claims (user_metadata), callable SECURITY DEFINER functions that set the tenant GUC from an argument, and membership/junction tables that policies derive authority from but the caller can write — a self-grant into any tenant.',
 };
 
 export const DEFAULTS = {
@@ -196,6 +208,121 @@ export function definerSetsTrustedGuc(body, args, gucs) {
   return null;
 }
 
+/**
+ * Which OTHER tables each tenant policy depends on — its "authority tables".
+ * Read from `pg_depend` rather than by parsing the policy expression: creating a
+ * policy records a real dependency on every relation its subqueries touch, so
+ * this is exact where a regex over `pg_policies.qual` would be a guess.
+ * The policy's own table is excluded (it always self-depends).
+ */
+export function authorityDepsSql(schemas) {
+  const text = `
+    select distinct
+           n.nspname  as schema,
+           pc.relname as policy_table,
+           p.polname  as policy,
+           dn.nspname as dep_schema,
+           dc.relname as dep_table
+    from pg_catalog.pg_depend d
+    join pg_catalog.pg_policy p on p.oid = d.objid and d.classid = 'pg_policy'::regclass
+    join pg_catalog.pg_class pc on pc.oid = p.polrelid
+    join pg_catalog.pg_namespace n on n.oid = pc.relnamespace
+    join pg_catalog.pg_class dc on dc.oid = d.refobjid and d.refclassid = 'pg_class'::regclass
+    join pg_catalog.pg_namespace dn on dn.oid = dc.relnamespace
+    where n.nspname = any($1)
+      and dc.oid <> p.polrelid
+      and dc.relkind in ('r', 'p', 'v', 'm')
+    order by 1, 2, 3, 4, 5`;
+  return { text, values: [schemas] };
+}
+
+/** RLS status, tenant column, and write grants for each authority table. */
+export function authorityDetailSql(qualifiedNames, tenantColumns, role) {
+  const text = `
+    select n.nspname as schema,
+           c.relname as table,
+           c.relrowsecurity as rls_enabled,
+           (select a.attname
+              from pg_catalog.pg_attribute a
+             where a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
+               and a.attname = any($2)
+             order by array_position($2, a.attname)
+             limit 1) as tenant_column,
+           pg_catalog.has_table_privilege($3::text, c.oid, 'INSERT') as can_insert,
+           pg_catalog.has_table_privilege($3::text, c.oid, 'UPDATE') as can_update
+    from pg_catalog.pg_class c
+    join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+    where (n.nspname || '.' || c.relname) = any($1)`;
+  return { text, values: [qualifiedNames, tenantColumns, role] };
+}
+
+/** The INSERT/UPDATE-applicable policies on the authority tables. */
+export function writePoliciesSql(qualifiedNames) {
+  const text = `
+    select p.schemaname as schema,
+           p.tablename  as table,
+           p.policyname as policy,
+           p.cmd        as cmd,
+           p.qual       as qual,
+           p.with_check as with_check
+    from pg_catalog.pg_policies p
+    where (p.schemaname || '.' || p.tablename) = any($1)
+      and p.cmd in ('ALL', 'INSERT', 'UPDATE')`;
+  return { text, values: [qualifiedNames] };
+}
+
+/**
+ * The expression that actually gates a NEW row for a policy. `FOR INSERT` always
+ * carries WITH CHECK; a `FOR ALL` policy with no explicit WITH CHECK reuses its
+ * USING expression as the check.
+ */
+export function effectiveCheck(policy) {
+  return policy.with_check ?? (policy.cmd === 'ALL' ? policy.qual : null);
+}
+
+/**
+ * Verdict for one authority table: can the caller write themselves into another
+ * tenant's data by writing the table that DECIDES their access?
+ *
+ * The severity is that this is not a leak in the protected table's policy at all
+ * — that policy can be flawless. The authority is what's soft.
+ *
+ * @returns {{status:'leak'|'safe'|'unknown', message?:string}}
+ */
+export function classifyAuthority({ schema, table, tenantColumn, rlsEnabled, canInsert, canUpdate, writePolicies = [], dependents = [], role = 'authenticated' }) {
+  if (!canInsert && !canUpdate) return { status: 'safe' };
+  if (!tenantColumn) {
+    return { status: 'unknown', message: `policies on ${dependents.join(', ')} derive their authority from ${schema}.${table}, which "${role}" can write — but it has no recognised tenant column, so this check can't reason about whether a self-grant is possible. Confirm by hand that a user cannot insert or update a row here that widens their own access.` };
+  }
+  const writable = [];
+  if (!rlsEnabled) {
+    return {
+      status: 'leak',
+      message: `RLS is OFF on ${schema}.${table} and "${role}" holds a write grant on it — so a user can simply INSERT a row granting themselves membership of ANY tenant, and then read that tenant's data through a policy that is otherwise written correctly`,
+    };
+  }
+  for (const cmd of ['INSERT', 'UPDATE']) {
+    if (cmd === 'INSERT' && !canInsert) continue;
+    if (cmd === 'UPDATE' && !canUpdate) continue;
+    const applicable = writePolicies.filter((p) => p.cmd === cmd || p.cmd === 'ALL');
+    if (applicable.length === 0) continue; // RLS on with no covering policy => denied
+    // Any policy whose check never mentions the tenant column lets the caller
+    // choose the tenant. `user_id = auth.uid()` is the classic near-miss: it pins
+    // WHO you are and leaves WHICH ORG entirely open.
+    const unconstrained = applicable.filter((p) => {
+      const expr = effectiveCheck(p);
+      return !expr || !new RegExp(`\\b${tenantColumn}\\b`, 'i').test(expr);
+    });
+    if (unconstrained.length > 0) writable.push({ cmd, policies: unconstrained.map((p) => p.policy) });
+  }
+  if (writable.length === 0) return { status: 'safe' };
+  const parts = writable.map((w) => `${w.cmd} (policy ${w.policies.map((n) => `"${n}"`).join(', ')})`);
+  return {
+    status: 'leak',
+    message: `"${role}" can ${parts.join(' and ')} on ${schema}.${table} under a policy that never constrains "${tenantColumn}" — so a user can write themselves a row for ANY tenant and then legitimately read that tenant's data through the policies that trust this table. A check like user_id = auth.uid() pins WHO you are but leaves WHICH TENANT wide open`,
+  };
+}
+
 /** The forged-claim statement: the tenant key ONLY inside user_metadata. */
 export function forgeUserMetadataSql(claimKey) {
   if (!/^[A-Za-z0-9_]+$/.test(claimKey || '')) throw new Error(`unsafe claim key: ${JSON.stringify(claimKey)}`);
@@ -266,6 +393,47 @@ export async function check({ query, config = {} }) {
         });
       } else {
         notes.push({ where: fqn, message: `SECURITY DEFINER function sets '${hit.guc}' (a GUC your policies authorize from) but not from a caller argument — looks intentional; confirm the value derives from the verified session.` });
+      }
+    }
+  }
+
+  // ── 4. authority tables: can you WRITE the table that decides your access? ──
+  const ad = authorityDepsSql(cfg.schemas);
+  const deps = await q(ad.text, ad.values);
+  const depNames = [...new Set(deps.map((d) => `${d.dep_schema}.${d.dep_table}`))].filter((n) => !skip.has(n));
+  if (depNames.length > 0) {
+    const det = authorityDetailSql(depNames, cfg.tenantColumns, role);
+    const details = await q(det.text, det.values);
+    const wp = writePoliciesSql(depNames);
+    const writePolicies = await q(wp.text, wp.values);
+    for (const d of details) {
+      const id = `${d.schema}.${d.table}`;
+      const dependents = [...new Set(deps.filter((x) => `${x.dep_schema}.${x.dep_table}` === id).map((x) => `${x.schema}.${x.policy_table}`))];
+      const verdict = classifyAuthority({
+        schema: d.schema,
+        table: d.table,
+        tenantColumn: d.tenant_column,
+        rlsEnabled: d.rls_enabled === true || d.rls_enabled === 't',
+        canInsert: d.can_insert === true || d.can_insert === 't',
+        canUpdate: d.can_update === true || d.can_update === 't',
+        writePolicies: writePolicies.filter((p) => `${p.schema}.${p.table}` === id),
+        dependents,
+        role,
+      });
+      if (verdict.status === 'leak') {
+        violations.push({
+          where: id,
+          kind: 'writable-authority',
+          message: `${verdict.message}. Policies that depend on it: ${dependents.join(', ')}`,
+          fix:
+            `Lock down the table your policies derive authority from — it is as security-critical as the policies themselves:\n` +
+            `        ALTER TABLE ${qualified(d.schema, d.table)} ENABLE ROW LEVEL SECURITY;\n` +
+            `        CREATE POLICY no_self_grant ON ${qualified(d.schema, d.table)} FOR INSERT\n` +
+            `          WITH CHECK (${quoteIdent(d.tenant_column || 'organization_id')} IN (/* tenants the caller ALREADY belongs to */));\n` +
+            `      Memberships are usually best written only by a SECURITY DEFINER invite/accept flow, never directly by ${role}.`,
+        });
+      } else if (verdict.status === 'unknown') {
+        notes.push({ where: id, message: verdict.message });
       }
     }
   }

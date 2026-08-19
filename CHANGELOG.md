@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.11.0
+
+Threat-model **2.10**: the policy is flawless and still bypassable, because the
+thing it *derives authority from* is soft.
+
+- **feat(identity-trust): user-writable policy authority.** The textbook
+  multi-tenant policy —
+  `USING (org_id IN (SELECT org_id FROM memberships WHERE user_id = auth.uid()))`
+  — is completely bypassable if the caller can write `memberships`: insert
+  yourself a row for someone else's org and every policy that trusts that table
+  now returns their data, **legitimately**. Nothing is "leaking"; the authority was
+  soft. Per-table checking can never find this, because the flaw is one table away
+  from the table you're checking.
+  - Dependencies are read from **`pg_depend`**, which records every relation a
+    policy's subqueries touch — exact, where a regex over `pg_policies.qual` would
+    be a guess.
+  - Fails when the authority table has **RLS off with a write grant**, or an
+    INSERT/UPDATE policy whose check **never constrains its tenant column**. That
+    second case is the one worth naming: `WITH CHECK (user_id = auth.uid())` looks
+    careful and is the most common real-world shape — it pins WHO you are and
+    leaves WHICH TENANT wide open.
+  - Covers the UPDATE shape too (re-point your own membership row at another
+    tenant), and reports **unknown → a note** when the authority table has no
+    recognisable tenant column, rather than guessing either way.
+- 199 tests (was 184).
+
 ## 0.10.0
 
 Built down the [threat model](THREAT-MODEL.md), not down a bug queue — and the

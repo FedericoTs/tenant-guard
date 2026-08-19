@@ -75,7 +75,7 @@ tenant-guard  — guard tests for multi-tenant isolation
 | `route-org-scoping` | an authenticated route filters by a bare `id` and never mentions a tenant column | catches the *shape* of the IDOR (auth + bare-id + no-tenant), and it lives in your CI so it blocks the merge instead of adding one more report |
 | `definer-grants` | a mutating `SECURITY DEFINER` function's **final** definition isn't revoked from `PUBLIC`/`anon` | requires knowing Postgres default grants + PostgREST exposure interact — *revoking from `anon` alone is a no-op*; judged on the net state of history, so a fix in a later repair migration counts |
 | `migration-collisions` | two migrations share a numeric prefix | a project-specific CI invariant (your numbering scheme), not a code smell |
-| `rls-proof` *(runtime)* | a tenant's session can actually read **or write** another tenant's rows | it isn't reading source at all — it runs real queries as your app role (SELECT + UPDATE/DELETE probes) and measures the leak; nothing static can prove isolation *holds*, and RLS is per-command so reads passing says nothing about writes |
+| `rls-proof` *(runtime)* | a tenant's session can actually read **or write** another tenant's rows | it isn't reading source at all — it runs real queries as your app role (SELECT, plus `UPDATE`/`DELETE`/tenant-hop/`INSERT` probes) and measures the leak; nothing static can prove isolation *holds*, and RLS is per-command so reads passing says nothing about writes |
 | `rls-drift` *(runtime)* | the database has RLS enabled or a policy that **no migration declares** | catches security posture applied by hand in the dashboard/psql — invisible to code review, absent from CI, changeable with no diff or history |
 | `anon-writes` *(runtime)* | the **anonymous** role can INSERT/UPDATE/DELETE a table | a table with no tenant column, writable by `anon`, is neither a tenant leak nor drift — it's the cache-poisoning class; it proves the real `USING`/`WITH CHECK` by probing, so it doesn't false-flag `TO public USING (auth.uid()…)` policies |
 
@@ -122,12 +122,14 @@ seeded test database it:
    picks two real tenant ids that already have data;
 3. drops to your **non-superuser app role** (e.g. `authenticated`), assumes
    tenant A's identity, and asserts A's session can neither **read nor write**
-   tenant B's rows — SELECT, plus `UPDATE`/`DELETE` probes — then checks the
-   other direction.
+   tenant B's rows — SELECT, plus the full write path: `UPDATE`/`DELETE` of B's
+   rows, a **tenant-hop** (reassigning A's own row *into* B), and an **`INSERT`**
+   that creates a row in B — then checks the other direction.
 
 If RLS is off, a policy is `USING (true)`, a policy forgot the tenant predicate,
 **the write path is unprotected** (RLS is per-command — a correct `SELECT` policy
-does not cover `UPDATE`/`DELETE`), or **RLS is on with no policy at all** (a
+does not cover `UPDATE`/`DELETE`, and `USING` does not cover `INSERT` or where an
+update *lands*; those need `WITH CHECK`), or **RLS is on with no policy at all** (a
 deny-all that only *looks* isolated), the proof names it and **fails your build**.
 
 See it catch a real leak with zero infrastructure:
@@ -312,8 +314,11 @@ can reach with the tenant identity you configure; it can only test tables that
 already hold two tenants' data (it reports the rest as *not proven*, never as
 passing); and it's only as good as the `becomeTenant` config matching how your
 app assumes a tenant — a mismatch shows up as "sees none of its own rows either",
-not a false pass. It is a strong proof on every commit, not a substitute for a
-pen test.
+not a false pass. It reads and writes on a **tenant column** (SELECT + UPDATE /
+DELETE / tenant-hop / INSERT), so tables whose tenancy lives somewhere other than
+a column — notably Supabase's `storage.objects`, keyed by object path or `owner`
+— aren't covered by default yet (on the roadmap). It is a strong proof on every
+commit, not a substitute for a pen test.
 
 ## Background
 

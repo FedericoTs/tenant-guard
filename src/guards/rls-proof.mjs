@@ -218,6 +218,25 @@ export function deleteProbeSql(schema, table) {
   return { text: `delete from ${qualified(schema, table)}`, values: [] };
 }
 
+/**
+ * Write probe — INSERT a row that BELONGS TO ANOTHER TENANT (tenant column = the
+ * other tenant's id). INSERT is the one write path UPDATE/DELETE probes miss, and
+ * it's governed only by a WITH CHECK clause — a table can scope SELECT/UPDATE
+ * correctly yet let any session create rows in any tenant. Deliberately NO
+ * `RETURNING`: RETURNING re-applies the SELECT policy, and a row that WITH CHECK
+ * accepted but SELECT hides then raises the very same "violates row-level security
+ * policy" error a WITH CHECK *block* raises — masking the leak. Instead the caller
+ * inserts plainly and reads where the row LANDED from the acting tenant's own-row
+ * count (see probeInsert). Sets only the tenant column and relies on defaults for
+ * the rest — so a table with other NOT NULL columns without defaults yields an
+ * INCONCLUSIVE result (a data error, not an RLS block), reported honestly rather
+ * than as a pass. Runs in a rolled-back savepoint; nothing persists.
+ */
+export function insertProbeSql(schema, table, column, otherTenantId) {
+  const c = quoteIdent(column);
+  return { text: `insert into ${qualified(schema, table)} (${c}) values ($1)`, values: [otherTenantId] };
+}
+
 /** Expand the becomeTenant templates into { text, values } for a tenant id. */
 export function buildBecomeTenant(templates, tenantId) {
   return templates.map((text) => ({ text, values: [tenantId] }));
@@ -235,13 +254,26 @@ export function isPermissionDenied(err) {
 }
 
 /**
+ * Specifically: did an INSERT/UPDATE get rejected by a WITH CHECK clause (RLS
+ * enforcing the destination tenant)? This is the SAFE, CONCLUSIVE block for the
+ * insert probe — distinct from a NOT NULL / foreign-key / check-constraint error,
+ * which only means we couldn't build a valid row and proves nothing (inconclusive).
+ * Both can share SQLSTATE 42501, so match the specific message. NOTE: also matches
+ * the "(USING expression)" variant as a substring — callers that care about the
+ * difference must test isRlsUsingViolation FIRST (see probeInsert).
+ */
+export function isRlsCheckViolation(err) {
+  return !!err && /new row violates row-level security policy/i.test(err.message || '');
+}
+
+/**
  * Turn one table's measurements into a verdict. A table can leak on the READ
  * path (SELECT) and/or the WRITE path (UPDATE/DELETE) independently, because
  * Postgres RLS is per-command — so a 'leak' verdict carries a `leaks[]` array,
  * one entry per kind, and the caller emits a violation for each.
  * @returns {{ status:'isolated'|'leak'|'no-policy'|'insufficient-data'|'over-restrictive'|'no-access', message?:string, leaks?:Array<{kind:'read'|'write',message:string,fix:string}> }}
  */
-export function classifyTableResult({ rlsEnabled, policyCount, ownVisible, crossVisible, writeAffected = 0, tenantCount, noAccess, probedWrites = false }) {
+export function classifyTableResult({ rlsEnabled, policyCount, ownVisible, crossVisible, writeAffected = 0, insertLeaked = false, tenantCount, noAccess, probedWrites = false }) {
   if (noAccess) {
     return { status: 'no-access', message: `role cannot read this table at all (no SELECT grant) — nothing to prove` };
   }
@@ -278,6 +310,13 @@ export function classifyTableResult({ rlsEnabled, policyCount, ownVisible, cross
       kind: 'write',
       message: `tenant A's session made a cross-tenant WRITE affecting ${writeAffected} row(s) — it can UPDATE/DELETE another tenant's rows, or reassign its OWN rows INTO another tenant (a tenant-hop the read policy passes but no WITH CHECK on the destination stops). RLS is per-command; a correct SELECT policy protects none of this`,
       fix: `Add write coverage — a FOR ALL policy, or explicit UPDATE/DELETE policies, scoped by the tenant column:\n  CREATE POLICY tenant_all ON {tbl} FOR ALL\n    USING ({col} = current_setting('app.current_tenant'))\n    WITH CHECK ({col} = current_setting('app.current_tenant'));`,
+    });
+  }
+  if (insertLeaked) {
+    leaks.push({
+      kind: 'write',
+      message: `tenant A's session INSERTed a row belonging to tenant B — it can CREATE rows in another tenant. INSERT is governed only by a WITH CHECK clause; SELECT/UPDATE/DELETE policies don't cover it, so a table can scope reads correctly yet let any session write into any tenant`,
+      fix: `Add a WITH CHECK on INSERT — a FOR ALL policy covers it — scoped by the tenant column:\n  CREATE POLICY tenant_all ON {tbl} FOR ALL\n    USING ({col} = current_setting('app.current_tenant'))\n    WITH CHECK ({col} = current_setting('app.current_tenant'));`,
     });
   }
   if (leaks.length) return { status: 'leak', leaks };
@@ -476,6 +515,43 @@ export async function prove({ query, config = {} }) {
       }
     };
 
+    // INSERT probe — tri-state. Unlike UPDATE/DELETE, an INSERT the WITH CHECK
+    // ACCEPTS succeeds silently (affects 1 row), and one it REJECTS raises. We must
+    // not use RETURNING to see where the row landed (RETURNING re-applies the
+    // SELECT policy and its error is indistinguishable from a WITH CHECK block).
+    // So: insert plainly, then read the acting tenant's OWN-visible row count. If
+    // the insert succeeded and the acting tenant's own count did NOT grow, the row
+    // landed in the OTHER tenant => 'leak'. If it grew, a trigger rewrote the
+    // tenant to the acting one => 'blocked'. A WITH CHECK / no-grant rejection =>
+    // 'blocked'; a NOT NULL / FK / CHECK / sequence error => 'inconclusive' (we
+    // couldn't build a valid row, so we prove nothing — reported as a note).
+    const probeInsert = async (insSql, insValues, ownCountSql, ownCountValues) => {
+      await query('savepoint tg_i', []);
+      try {
+        const before = (await q(ownCountSql, ownCountValues))[0].n;
+        const res = await query(insSql, insValues);
+        const affected = res.rowCount ?? res.affectedRows ?? 0;
+        if (affected < 1) {
+          await query('rollback to savepoint tg_i', []); await query('release savepoint tg_i', []);
+          return { outcome: 'blocked' }; // nothing inserted
+        }
+        const after = (await q(ownCountSql, ownCountValues))[0].n;
+        await query('rollback to savepoint tg_i', []); await query('release savepoint tg_i', []);
+        // Own count grew => the new row is visible to the acting tenant, i.e. it
+        // landed in the acting tenant (a trigger forced the column). Not a leak.
+        return after > before ? { outcome: 'blocked' } : { outcome: 'leak' };
+      } catch (err) {
+        try { await query('rollback to savepoint tg_i', []); await query('release savepoint tg_i', []); } catch { /* ignore */ }
+        if (isRlsCheckViolation(err)) return { outcome: 'blocked' }; // WITH CHECK rejected the destination — good
+        // No INSERT privilege on the TARGET itself => this role genuinely can't
+        // create rows here; safe and quiet. (A *sequence*/default-value denial is
+        // different — the role can insert but couldn't get a value — so it falls
+        // through to inconclusive below, not here.)
+        if (/permission denied for (table|relation|view)/i.test(err.message || '')) return { outcome: 'blocked' };
+        return { outcome: 'inconclusive', reason: err.message };     // NOT NULL / FK / CHECK / unique / sequence usage — couldn't complete a valid insert
+      }
+    };
+
     for (const t of plan) {
       if (t.introspectError) {
         notes.push({ where: `${t.schema}.${t.table}`, message: `could not sample tenants: ${t.introspectError}` });
@@ -501,6 +577,7 @@ export async function prove({ query, config = {} }) {
       let ownVisible = 0;
       let crossVisible = 0;
       let writeAffected = 0;
+      const insertOutcomes = [];
       try {
         // become tenant A: read own + the other tenant's rows, then try to write theirs
         for (const s of buildBecomeTenant(cfg.becomeTenant, tenantA)) await query(s.text, s.values);
@@ -520,6 +597,11 @@ export async function prove({ query, config = {} }) {
           const claimA = Math.max(await probeWrite(uA.text, uA.values), await probeWrite(dA.text, dA.values));
           const moveA = await probeWrite(mA.text, mA.values);
           writeAffected = Math.max(writeAffected, claimA - t.ownA, moveA);
+          // (3) INSERT a row belonging to tenant B — the one write path the above
+          // miss. Landing is read from tenant A's OWN row count (see probeInsert).
+          const iA = insertProbeSql(t.schema, t.table, t.tenantColumn, tenantB);
+          const ownCntA = tenantRowCountSql(t.schema, t.table, t.tenantColumn, tenantA);
+          insertOutcomes.push(await probeInsert(iA.text, iA.values, ownCntA.text, ownCntA.values));
         }
 
         // reverse direction: become tenant B, check reading/writing A's rows
@@ -533,6 +615,9 @@ export async function prove({ query, config = {} }) {
           const claimB = Math.max(await probeWrite(uB.text, uB.values), await probeWrite(dB.text, dB.values));
           const moveB = await probeWrite(mB.text, mB.values);
           writeAffected = Math.max(writeAffected, claimB - t.ownB, moveB);
+          const iB = insertProbeSql(t.schema, t.table, t.tenantColumn, tenantA);
+          const ownCntB = tenantRowCountSql(t.schema, t.table, t.tenantColumn, tenantB);
+          insertOutcomes.push(await probeInsert(iB.text, iB.values, ownCntB.text, ownCntB.values));
         }
       } catch (err) {
         if (isPermissionDenied(err)) noAccess = true;
@@ -552,8 +637,18 @@ export async function prove({ query, config = {} }) {
         continue;
       }
 
-      const verdict = classifyTableResult({ rlsEnabled: t.rlsEnabled, policyCount: t.policyCount, ownVisible, crossVisible, writeAffected, tenantCount: t.tenants.length, noAccess, probedWrites });
+      // Fold the two-direction insert probes into one verdict: any leak wins;
+      // otherwise, if we couldn't build a valid row in either direction, the
+      // insert path is INCONCLUSIVE (a note — never silently counted as proven).
+      const insertLeaked = insertOutcomes.some((o) => o.outcome === 'leak');
+      const insertInconclusive = !insertLeaked && insertOutcomes.find((o) => o.outcome === 'inconclusive');
+      const verdict = classifyTableResult({ rlsEnabled: t.rlsEnabled, policyCount: t.policyCount, ownVisible, crossVisible, writeAffected, insertLeaked, tenantCount: t.tenants.length, noAccess, probedWrites });
       const tbl = qualified(t.schema, t.table);
+      // An otherwise-clean table whose insert path we couldn't exercise: say so,
+      // so a green result never overclaims "no write can cross tenants".
+      if (verdict.status !== 'leak' && insertInconclusive) {
+        notes.push({ where: `${t.schema}.${t.table}`, message: `read/UPDATE/DELETE isolation proven, but the INSERT probe was inconclusive — a minimal row hit: ${insertInconclusive.reason}. Give the app role what the insert needs (e.g. grant usage on the table's sequence, or default/seed the missing NOT NULL columns) to prove INSERT isolation too` });
+      }
       if (verdict.status === 'leak') {
         for (const leak of verdict.leaks) {
           violations.push({

@@ -18,8 +18,10 @@ import {
   tenantCountsSql,
   updateProbeSql,
   deleteProbeSql,
+  insertProbeSql,
   buildBecomeTenant,
   isPermissionDenied,
+  isRlsCheckViolation,
   classifyTableResult,
   run,
   DEFAULTS,
@@ -83,6 +85,19 @@ test('write probes: whole-table UPDATE/DELETE with NO WHERE (to dodge SELECT mas
   assert.match(d.text, /^delete from "public"\."invoices"$/);
   assert.deepEqual(d.values, []);
   assert.doesNotMatch(d.text, /where/i);
+});
+
+test('insertProbeSql: inserts a row for the OTHER tenant, NO returning (RETURNING masks the leak)', () => {
+  const i = insertProbeSql('public', 'invoices', 'organization_id', 'org_B');
+  assert.match(i.text, /^insert into "public"\."invoices" \("organization_id"\) values \(\$1\)$/);
+  assert.doesNotMatch(i.text, /returning/i); // RETURNING re-applies the SELECT policy and hides the very leak we hunt
+  assert.deepEqual(i.values, ['org_B']); // the OTHER tenant — a row that lands here is a cross-tenant insert
+});
+
+test('isRlsCheckViolation: matches a WITH CHECK block, NOT a NOT NULL/constraint error (which is inconclusive)', () => {
+  assert.equal(isRlsCheckViolation({ code: '42501', message: 'new row violates row-level security policy for table "invoices"' }), true);
+  assert.equal(isRlsCheckViolation({ code: '23502', message: 'null value in column "body" violates not-null constraint' }), false);
+  assert.equal(isRlsCheckViolation({ code: '42501', message: 'permission denied for table invoices' }), false); // no grant ≠ WITH CHECK block
 });
 
 test('tenantCountsSql: privileged per-tenant counts, bound as $1/$2', () => {
@@ -166,6 +181,15 @@ test('classify: WRITES the other tenant (reads clean) -> write leak (per-command
   assert.equal(v.leaks[0].kind, 'write');
   assert.match(v.leaks[0].message, /cross-tenant WRITE affecting 2 row/);
   assert.match(v.leaks[0].fix, /FOR ALL|WITH CHECK/);
+});
+
+test('classify: INSERTs into the other tenant (reads + update/delete clean) -> write leak (INSERT WITH CHECK gap)', () => {
+  const v = classifyTableResult({ rlsEnabled: true, ownVisible: 5, crossVisible: 0, writeAffected: 0, insertLeaked: true, tenantCount: 2, probedWrites: true });
+  assert.equal(v.status, 'leak');
+  assert.equal(v.leaks.length, 1);
+  assert.equal(v.leaks[0].kind, 'write');
+  assert.match(v.leaks[0].message, /INSERTed a row belonging to tenant B|CREATE rows in another tenant/);
+  assert.match(v.leaks[0].fix, /WITH CHECK/);
 });
 
 test('classify: reads AND writes the other tenant -> two leaks (read + write)', () => {

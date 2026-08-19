@@ -199,6 +199,58 @@ if (PGlite) {
     assert.match(res.summary, /proven isolated \(read \+ write\)/);
   });
 
+  test('CATCHES an INSERT leak: reads/updates are scoped, but a session can INSERT a row into another tenant', async () => {
+    const { query } = await freshDb(`
+      create table docs (id serial primary key, organization_id text not null, body text);
+      grant select, insert, update, delete on docs to authenticated;
+      grant usage on all sequences in schema public to authenticated;   -- Supabase grants this; the leak is the point
+      insert into docs (organization_id, body) values ('org_A','x'), ('org_B','y');
+      alter table docs enable row level security;
+      create policy sel on docs for select ${TENANT_POLICY};
+      create policy upd on docs for update ${TENANT_POLICY}
+        with check (organization_id = current_setting('app.current_tenant', true));
+      create policy ins on docs for insert with check (true);   -- BUG: any tenant id accepted on INSERT
+    `);
+    const res = await prove({ query });
+    assert.equal(res.ok, false, JSON.stringify(res, null, 2));
+    const w = res.violations.find((v) => v.kind === 'write' && /INSERT/i.test(v.message));
+    assert.ok(w, JSON.stringify(res.violations, null, 2));
+    assert.match(w.message, /INSERTed a row belonging to tenant B|CREATE rows in another tenant/);
+    assert.equal(res.violations.some((v) => v.kind === 'read'), false); // reads + update/delete are clean — INSERT is the only gap
+  });
+
+  test('PROVES INSERT isolation: a FOR ALL WITH CHECK policy blocks a cross-tenant INSERT (no false positive)', async () => {
+    const { query } = await freshDb(`
+      create table invoices (id serial primary key, organization_id text not null, amount int);
+      grant select, insert, update, delete on invoices to authenticated;
+      grant usage on all sequences in schema public to authenticated;
+      insert into invoices (organization_id, amount) values ('org_A',100),('org_B',200);
+      alter table invoices enable row level security;
+      create policy tenant_all on invoices for all ${TENANT_POLICY}
+        with check (organization_id = current_setting('app.current_tenant', true));
+    `);
+    const res = await prove({ query });
+    assert.equal(res.ok, true, JSON.stringify(res, null, 2));
+    assert.equal(res.violations.length, 0);
+  });
+
+  test('INSERT probe stays HONEST: a NOT NULL column it cannot fill is reported inconclusive, never a silent pass', async () => {
+    const { query } = await freshDb(`
+      create table docs (id serial primary key, organization_id text not null, body text not null);
+      grant select, insert, update, delete on docs to authenticated;
+      grant usage on all sequences in schema public to authenticated;   -- so the ONLY blocker is the NOT NULL body
+      insert into docs (organization_id, body) values ('org_A','x'), ('org_B','y');
+      alter table docs enable row level security;
+      create policy sel on docs for select ${TENANT_POLICY};
+      create policy ins on docs for insert with check (true);   -- permissive, but the probe can't reach it: body is NOT NULL
+    `);
+    const res = await prove({ query });
+    // We could NOT build a valid row, so we neither invent a leak ...
+    assert.equal(res.violations.some((v) => v.kind === 'write' && /INSERT/i.test(v.message)), false);
+    // ... nor pass it off as proven — a note names the inconclusive INSERT probe.
+    assert.ok(res.notes.some((n) => /INSERT probe was inconclusive/i.test(n.message)), JSON.stringify(res.notes, null, 2));
+  });
+
   // ── the RLS-on-no-policy trap (Reddit point 2) ─────────────────────
   test('NAMES the RLS-on-no-policy trap: deny-all that only *looks* isolated', async () => {
     const { query } = await freshDb(`

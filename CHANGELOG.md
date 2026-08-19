@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.6.0
+
+Closes the last write path the runtime proof was missing — **INSERT isolation** —
+the second half of a reviewer's ask (the first, the `claim` shortcut, shipped in
+0.5.0).
+
+- **feat(rls-proof): prove INSERT isolation.** As each tenant, the proof now tries
+  to `INSERT` a row belonging to the *other* tenant. INSERT is governed only by a
+  `WITH CHECK` clause, so a table can scope `SELECT`/`UPDATE` correctly yet let any
+  session create rows in any tenant — a real per-command gap the read/update
+  probes couldn't see. Three honest outcomes:
+  - **leak** — the row was accepted into the other tenant (fails the build);
+  - **blocked** — `WITH CHECK` rejected it, or a `BEFORE` trigger rewrote the
+    tenant column back to the acting tenant, or the role has no INSERT grant;
+  - **inconclusive** — a `NOT NULL`/FK/sequence error meant we couldn't build a
+    valid row, so nothing is proven. Reported as a **note**, never a silent pass.
+  - The probe deliberately uses **no `RETURNING`**: `RETURNING` re-applies the
+    SELECT policy, and a row `WITH CHECK` accepted but SELECT hides then raises the
+    *same* error a `WITH CHECK` block raises — which would mask the leak. Instead
+    it reads where the row landed from the acting tenant's own-row count, so it's
+    driver-agnostic and trigger-aware.
+- 104 tests (was 98).
+
 ## 0.5.0
 
 More from Reddit.

@@ -112,14 +112,21 @@ INSERT for it), and a broken seed statement fails with the exact SQL error.
 - **read leak** — it *read* another tenant's rows. A policy is permissive
   (`USING (true)` / missing the tenant predicate) or **RLS is off entirely**.
   Fails the build. ✗
-- **write leak** — it could *UPDATE/DELETE* another tenant's rows, **or reassign
-  its OWN rows into another tenant** (`SET organization_id = <other>` — a
-  tenant-hop the read policy passes because the row is yours on the way in, and no
-  `WITH CHECK` on the destination stops), even when reads were correctly scoped.
-  RLS is **per-command**: a right-looking `SELECT` policy says nothing about
-  `UPDATE`/`DELETE`, and `USING` says nothing about where an update *lands* — that
-  needs `WITH CHECK` (and `UPSERT` needs its own `UPDATE` policy). Fails the
+- **write leak** — it could *UPDATE/DELETE* another tenant's rows, **reassign its
+  OWN rows into another tenant** (`SET organization_id = <other>` — a tenant-hop
+  the read policy passes because the row is yours on the way in, and no `WITH
+  CHECK` on the destination stops), **or `INSERT` a row belonging to another
+  tenant** (INSERT is governed only by `WITH CHECK`, so a scoped `SELECT`/`UPDATE`
+  says nothing about it) — even when reads were correctly scoped. RLS is
+  **per-command**: a right-looking `SELECT` policy says nothing about
+  `UPDATE`/`DELETE`/`INSERT`, and `USING` says nothing about where a row *lands* —
+  that needs `WITH CHECK` (and `UPSERT` needs its own `UPDATE` policy). Fails the
   build. ✗
+- **INSERT probe inconclusive** (a note) — the INSERT probe sets only the tenant
+  column and relies on defaults for the rest, so a table with other `NOT NULL`
+  columns without defaults (or a role lacking sequence usage) yields a data error,
+  not an RLS verdict. That's reported as a note — never counted as a pass — so a
+  green result never overclaims. Default/seed the missing columns to prove it.
 - **no policy** (a note) — RLS is enabled but the table has **no policy at all**.
   Postgres then denies every row, which looks *exactly* like isolation but means
   the table is unfinished — the moment someone adds a permissive policy it leaks.

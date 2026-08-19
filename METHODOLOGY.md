@@ -109,9 +109,18 @@ missing: a user updates their **own** row and moves it *into* another tenant
 on the way in — and with no `WITH CHECK` on the destination, nothing validates
 where it lands (worst when the policy is scoped by `created_by`/owner rather than
 the tenant column). So the write probe now also tries setting the tenant column to
-the *other* tenant, not just stealing/deleting the other tenant's rows. That is
-the meta-pattern of this whole project: the strongest guard is the one a real
-failure — or a sharp reviewer — taught you to write. The mechanism, the config,
+the *other* tenant, not just stealing/deleting the other tenant's rows. And a
+third reviewer named the last write path — `INSERT`, governed only by `WITH
+CHECK`, which a scoped `SELECT`/`UPDATE` says nothing about — so the probe now also
+tries to *create* a row in the other tenant. Building that one surfaced its own
+subtlety worth recording: you cannot use `INSERT … RETURNING` to see where the row
+landed, because `RETURNING` re-applies the `SELECT` policy and a row `WITH CHECK`
+*accepted* but `SELECT` hides then raises the very same error a `WITH CHECK` *block*
+raises — masking the leak. The probe instead reads the acting tenant's own-row
+count before and after, which is driver-agnostic and correctly ignores a `BEFORE`
+trigger that rewrites the tenant back. That is the meta-pattern of this whole
+project: the strongest guard is the one a real failure — or a sharp reviewer —
+taught you to write. The mechanism, the config,
 and a zero-infrastructure demo are in
 [`examples/rls-proof/`](examples/rls-proof/README.md).
 

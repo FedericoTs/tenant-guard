@@ -30,6 +30,7 @@ import {
   planTables,
   DEFAULTS as PROOF_DEFAULTS,
 } from './rls-proof.mjs';
+import { viewIntrospectionSql, planViews, fixForView } from './view-isolation.mjs';
 
 export const meta = {
   id: 'anon-reads',
@@ -70,35 +71,63 @@ export function anonSelectCountSql(schema, table) {
 }
 
 /**
- * Verdict for one tenant table.
+ * Verdict for one tenant table, view, or materialized view.
+ *
+ * NOTE the asymmetry, which matters: for a base TABLE, "RLS off + SELECT grant"
+ * is a structural leak — no policy exists to gate it, so it's true even when the
+ * table is empty. For a VIEW or MATERIALIZED VIEW that shortcut is WRONG: views
+ * always report `relrowsecurity = false` (RLS is not a thing you enable on them),
+ * so applying it would false-flag a perfectly-safe `security_invoker` view over an
+ * RLS'd table. Views are therefore always judged by the PROBE.
+ *
  * @returns {{status:'leak'|'safe'|'not-proven', viaRls?:boolean, message?:string}}
  */
-export function classifyRead({ rlsEnabled, canSelect, total, anonVisible, role = 'anon' }) {
-  if (!rlsEnabled) {
+export function classifyRead({ kind = 'table', rlsEnabled, canSelect, total, anonVisible, role = 'anon' }) {
+  if (!canSelect) return { status: 'safe' }; // no grant at all — nothing exposed, whatever the kind
+  if (kind === 'table' && !rlsEnabled) {
     // No RLS: the SELECT grant is the whole story — structural, true even if empty.
-    return canSelect
-      ? { status: 'leak', viaRls: false, message: `"${role}" can read this tenant table — RLS is OFF and "${role}" holds a SELECT grant, so every tenant's rows are readable with no login (the CVE-2025-48757 class)` }
-      : { status: 'safe' };
+    return { status: 'leak', viaRls: false, message: `"${role}" can read this tenant table — RLS is OFF and "${role}" holds a SELECT grant, so every tenant's rows are readable with no login (the CVE-2025-48757 class)` };
   }
   if (anonVisible > 0) {
-    return { status: 'leak', viaRls: true, message: `"${role}" can read ${anonVisible} row(s) of this tenant table — a policy permits unauthenticated reads (proven by probe)` };
+    const why =
+      kind === 'matview'
+        ? `row-level security NEVER applies to a materialized view, so this snapshot of every tenant is readable with no login`
+        : kind === 'view'
+          ? `the view exposes tenant rows to an unauthenticated caller (it runs with its owner's rights unless security_invoker is set)`
+          : `a policy permits unauthenticated reads`;
+    return { status: 'leak', viaRls: true, message: `"${role}" can read ${anonVisible} row(s) through this ${KIND_LABEL[kind]} — ${why} (proven by probe)` };
   }
   if (total === 0) {
-    return { status: 'not-proven', message: `table is empty — could not prove whether "${role}" can read it; seed a row or add it to the check's data` };
+    return { status: 'not-proven', message: `${KIND_LABEL[kind].toLowerCase()} is empty — could not prove whether "${role}" can read it; seed a row or add it to the check's data` };
   }
   return { status: 'safe' };
 }
 
-/** Build a violation for a flagged table. */
-export function violationForRead(id, schema, table, role, viaRls) {
+const KIND_LABEL = { table: 'tenant table', view: 'VIEW', matview: 'MATERIALIZED VIEW' };
+
+/** Build a violation for a flagged table / view / materialized view. */
+export function violationForRead(id, schema, table, role, viaRls, opts = {}) {
+  const { kind = 'table', securityInvoker = false, pgVersionNum = null } = opts;
+  const base =
+    `Unauthenticated reads of tenant data are the CVE class this tool exists to stop. ` +
+    (kind === 'table'
+      ? `Enable RLS with a tenant policy, or REVOKE SELECT ON ${qualified(schema, table)} FROM ${role};`
+      : fixForView({ kind, schema, view: table, securityInvoker, role, pgVersionNum }));
   return {
     where: id,
+    kind,
     message:
-      `the "${role}" role can SELECT this tenant table ` +
-      (viaRls ? `(a policy permits it — proven by probe)` : `(RLS is OFF, so its SELECT grant is unguarded)`),
+      `the "${role}" role can SELECT this ${KIND_LABEL[kind]} ` +
+      (!viaRls
+        ? `(RLS is OFF, so its SELECT grant is unguarded)`
+        : kind === 'matview'
+          ? `(RLS never applies to a materialized view — proven by probe)`
+          : kind === 'view'
+            ? `(the view exposes it to an unauthenticated caller — proven by probe)`
+            : `(a policy permits it — proven by probe)`),
     fix:
-      `Unauthenticated reads of tenant data are the CVE class this tool exists to stop. Enable RLS with a tenant policy, or REVOKE SELECT ON ${qualified(schema, table)} FROM ${role};\n` +
-      `      If this table is intentionally public (reference data, published content), add "${id}" to anonReads.allowlist[] or grandfather[].`,
+      `${base}\n` +
+      `      If this ${kind === 'table' ? 'table' : 'view'} is intentionally public (reference data, published content), add "${id}" to anonReads.allowlist[] or grandfather[].`,
   };
 }
 
@@ -119,14 +148,23 @@ export async function check({ query, config = {} }) {
     return OK({ skipped: true, reason: `role "${role}" does not exist — set anonReads.role to your unauthenticated role`, summary: `skipped — no "${role}" role` });
   }
 
-  // Tenant tables only (reuse rls-proof's introspection + planner).
+  // Everything with a tenant column that anon might read: base tables, views, and
+  // materialized views. A matview of every tenant, auto-granted to anon and
+  // auto-exposed by PostgREST, is this CVE class at its worst — and it is
+  // invisible to a base-table-only scan.
   const intro = introspectionSql(cfg.schemas, cfg.tenantColumns);
-  const plan = planTables(await q(intro.text, intro.values), cfg.tenantColumns, cfg.grandfather);
+  const tablePlan = planTables(await q(intro.text, intro.values), cfg.tenantColumns, cfg.grandfather)
+    .map((t) => ({ ...t, kind: 'table', name: t.table }));
+  const vintro = viewIntrospectionSql(cfg.schemas, cfg.tenantColumns);
+  const viewPlan = planViews(await q(vintro.text, vintro.values), cfg.tenantColumns, cfg.grandfather)
+    .map((v) => ({ ...v, name: v.view, rlsEnabled: false }));
   const skip = new Set(cfg.allowlist);
-  const tables = plan.filter((t) => !skip.has(`${t.schema}.${t.table}`) && !skip.has(t.table));
+  const tables = [...tablePlan, ...viewPlan].filter((t) => !skip.has(`${t.schema}.${t.name}`) && !skip.has(t.name));
   if (tables.length === 0) {
-    return OK({ skipped: true, reason: `no tenant-column tables in ${cfg.schemas.join(', ')}`, summary: 'skipped — no tenant tables' });
+    return OK({ skipped: true, reason: `no tenant-column tables or views in ${cfg.schemas.join(', ')}`, summary: 'skipped — no tenant tables' });
   }
+  let pgVersionNum = null;
+  try { pgVersionNum = Number((await q(`select current_setting('server_version_num') as v`, []))[0].v); } catch { /* optional */ }
 
   const violations = [];
   const notes = [];
@@ -136,7 +174,7 @@ export async function check({ query, config = {} }) {
   try {
     // Read the privileged surface (grant + total rows) BEFORE dropping role.
     for (const t of tables) {
-      const s = readSurfaceSql(t.schema, t.table, role);
+      const s = readSurfaceSql(t.schema, t.name, role);
       const row = (await q(s.text, s.values))[0];
       t.canSelect = row.can_select === true || row.can_select === 't';
       t.total = row.total ?? 0;
@@ -171,20 +209,25 @@ export async function check({ query, config = {} }) {
     for (const t of tables) {
       scanned++;
       let anonVisible = 0;
-      if (t.rlsEnabled && t.canSelect) {
-        // Probe the real policy as anon (read-only; savepoint just for isolation).
+      // Probe whenever anon holds a grant and the structural rule doesn't already
+      // settle it. Views ALWAYS get probed (see classifyRead) — their
+      // relrowsecurity is meaninglessly false.
+      if (t.canSelect && (t.kind !== 'table' || t.rlsEnabled)) {
         await query('savepoint tg_r', []);
         try {
-          const c = anonSelectCountSql(t.schema, t.table);
+          const c = anonSelectCountSql(t.schema, t.name);
           anonVisible = (await q(c.text, c.values))[0].n;
         } catch { /* denied => 0 */ }
         await query('rollback to savepoint tg_r', []);
         await query('release savepoint tg_r', []);
       }
-      const verdict = classifyRead({ rlsEnabled: t.rlsEnabled, canSelect: t.canSelect, total: t.total, anonVisible, role });
-      const id = `${t.schema}.${t.table}`;
-      if (verdict.status === 'leak') violations.push(violationForRead(id, t.schema, t.table, role, verdict.viaRls));
-      else if (verdict.status === 'not-proven') notes.push({ where: id, message: verdict.message });
+      const verdict = classifyRead({ kind: t.kind, rlsEnabled: t.rlsEnabled, canSelect: t.canSelect, total: t.total, anonVisible, role });
+      const id = `${t.schema}.${t.name}`;
+      if (verdict.status === 'leak') {
+        violations.push(violationForRead(id, t.schema, t.name, role, verdict.viaRls, { kind: t.kind, securityInvoker: t.securityInvoker, pgVersionNum }));
+      } else if (verdict.status === 'not-proven') {
+        notes.push({ where: id, message: verdict.message });
+      }
     }
   } finally {
     try { await query('rollback', []); } catch { /* ignore */ }

@@ -7,17 +7,19 @@
  *   tenant-guard drift   compare migrations vs the database's RLS; exit 1 on drift
  *   tenant-guard anon-writes  exit 1 if the anon role can write any table
  *   tenant-guard anon-reads   exit 1 if the anon role can read any tenant table
+ *   tenant-guard views   exit 1 if a view/matview leaks across tenants
  *   tenant-guard init    write a tenant-guard.config.json, seeded from this repo
  *   tenant-guard list    list the available guards and what each prevents
  *
  * `run`, `init`, `list` are zero-dependency and run in CI without `npm ci`.
- * `prove`, `drift`, `anon-writes`, `anon-reads` additionally need a database URL
- * and the `pg` driver; without them they skip (a skip is not a pass — it says so).
+ * `prove`, `drift`, `anon-writes`, `anon-reads`, `views` additionally need a
+ * database URL and the `pg` driver; without them they skip (a skip is not a pass
+ * — it says so).
  */
 import { writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { GUARDS, runAll, runProof, runDrift, runAnonWrites, runAnonReads } from '../src/index.mjs';
-import { rlsProof, rlsDrift, anonWrites, anonReads } from '../src/index.mjs';
+import { GUARDS, runAll, runProof, runDrift, runAnonWrites, runAnonReads, runViews } from '../src/index.mjs';
+import { rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation } from '../src/index.mjs';
 import { CONFIG_FILENAME, autodetect } from '../src/config.mjs';
 import { report, bold, dim, green, yellow } from '../src/runner.mjs';
 
@@ -79,9 +81,19 @@ if (cmd === 'anon-reads') {
   process.exit(code);
 }
 
+if (cmd === 'views') {
+  // Prove views/matviews don't leak across tenants. Async — needs a DB.
+  const result = await runViews(cwd);
+  const code = report([result], { emptyHint: false });
+  if (result.skipped) {
+    console.log(dim('  (A skip is not a pass. Point it at a seeded test/staging database:\n   export TENANT_GUARD_DATABASE_URL=postgres://…  &&  npm i -D pg  &&  tenant-guard views)\n'));
+  }
+  process.exit(code);
+}
+
 if (cmd === 'list') {
   console.log(bold('\ntenant-guard guards\n'));
-  for (const g of [...GUARDS, rlsProof, rlsDrift, anonWrites, anonReads]) {
+  for (const g of [...GUARDS, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation]) {
     console.log(`  ${bold(g.meta.id)}`);
     console.log(dim(`    ${g.meta.title}`));
     console.log(dim(`    ${g.meta.why}\n`));
@@ -147,6 +159,15 @@ if (cmd === 'init') {
       schemas: ['public'],
       allowlist: [], // "schema.table" intentionally readable by anon (published/reference data)
     },
+    viewIsolation: {
+      // Proves VIEWS and MATERIALIZED VIEWS don't leak across tenants. A view
+      // runs with its OWNER's rights unless security_invoker is set, and RLS
+      // never applies to a materialized view at all — so a perfectly-RLS'd table
+      // can still be handed out wholesale by the view beside it. Identity
+      // (role/becomeTenant/claim) is inherited from rlsProof unless set here.
+      schemas: ['public'],
+      allowlist: [], // "schema.view" that intentionally spans tenants (an admin reporting view)
+    },
   };
   writeFileSync(path, JSON.stringify(config, null, 2) + '\n');
   console.log(green(`✓ wrote ${CONFIG_FILENAME}`));
@@ -162,5 +183,5 @@ if (cmd === 'init') {
   process.exit(0);
 }
 
-console.error(`Unknown command: ${cmd}\nUsage: tenant-guard [run|prove|drift|anon-writes|anon-reads|init|list]`);
+console.error(`Unknown command: ${cmd}\nUsage: tenant-guard [run|prove|drift|anon-writes|anon-reads|views|init|list]`);
 process.exit(2);

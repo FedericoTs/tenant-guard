@@ -129,6 +129,18 @@ the one a real failure — or a sharp reviewer — taught you to write. The mech
 and a zero-infrastructure demo are in
 [`examples/rls-proof/`](examples/rls-proof/README.md).
 
+The most interesting thing that fell out of writing the failure surface down
+first, rather than waiting for the next bug report, was a class nobody had
+reported: **the objects that aren't tables.** A Postgres view executes with its
+*owner's* privileges unless it is created `WITH (security_invoker = true)` — off
+by default — so a convenience view over a perfectly-protected table evaluates that
+table's RLS as the owner and returns every tenant's rows. A materialized view is
+worse: RLS never applies to it at all, and no policy exists that could scope it.
+In both cases the base table proves clean, which is precisely why a table-only
+checker reports success. There is a test that asserts exactly that: `rls-proof`
+passes while `view-isolation` fails, on the same database. A guard suite is only
+as good as its inventory of *what to point itself at*.
+
 The same discipline runs one level deeper. Another reviewer pointed out that a
 prover you can't falsify is worthless: if the identity switch silently fails and
 the session still bypasses RLS, every isolation test can go green for the wrong

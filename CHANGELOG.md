@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.9.0
+
+Closes the highest-severity item on the [threat model](THREAT-MODEL.md): the
+objects that **aren't base tables**. Every table-only checker — including this
+tool's own `rls-proof` until now — is blind to these.
+
+- **feat: new guard `view-isolation`** (`tenant-guard views`). Proves a tenant's
+  session can't read another tenant's rows through a **view** or **materialized
+  view**. Two different Postgres mechanisms, and the guard distinguishes them
+  because *the fix is different*:
+  - A **view runs with its OWNER's privileges** unless created `WITH
+    (security_invoker = true)` — which is **off by default**. So a convenience
+    view over a perfectly-RLS'd table evaluates that RLS *as the owner* and hands
+    back every tenant. Fix: `ALTER VIEW … SET (security_invoker = true)` (and the
+    guard says so only when your Postgres is 15+; older servers get the honest
+    alternative).
+  - A **materialized view ignores RLS entirely** — it's a stored snapshot owned by
+    whoever refreshes it, and *no policy can scope it per caller*. The fix text
+    never suggests `security_invoker` here, because it would not work.
+  - A view that **already** sets `security_invoker` and still leaks is reported as
+    the *base table's* bug, pointing at `tenant-guard prove` — precise blame
+    instead of a generic finding.
+  - Scoped to views exposing a tenant column, so public/reference views aren't
+    flagged; identity (`role`/`becomeTenant`/`claim`) is inherited from `rlsProof`
+    so you configure it once.
+- **feat(anon-reads): also covers views and materialized views.** An
+  anon-readable matview of every tenant — auto-granted and auto-exposed in
+  Supabase — is the CVE-2025-48757 class at its worst, and a base-table-only scan
+  never sees it. Important asymmetry, deliberately encoded: for a base table
+  "RLS off + grant" is a structural leak, but views *always* report
+  `relrowsecurity = false`, so applying that rule to them would false-flag every
+  safe `security_invoker` view. **Views are therefore always judged by the probe.**
+- **refactor:** the `claim` shortcut moved to a shared `applyClaimShortcut()` so
+  every impersonating guard uses one implementation.
+- 155 tests (was 128).
+
 ## 0.8.0
 
 Stop growing one reported bug at a time. This release derives the **whole failure

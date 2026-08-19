@@ -270,6 +270,25 @@ export function buildBecomeTenant(templates, tenantId) {
 }
 
 /**
+ * The `claim` shortcut: `claim: "org_id"` (or `{ key, role }`) builds the
+ * request.jwt.claims `becomeTenant` and defaults the role to `authenticated`, so
+ * CI never needs the JWT secret. An explicitly-configured `becomeTenant` always
+ * wins (it's the SQL hook for membership-table apps). Mutates and returns `cfg`.
+ * `explicitConfig` is the user's raw config — used only to tell "the user set
+ * this" from "this came from DEFAULTS". Shared by every guard that impersonates.
+ */
+export function applyClaimShortcut(cfg, explicitConfig = {}) {
+  if (cfg.claim && explicitConfig.becomeTenant === undefined) {
+    const key = typeof cfg.claim === 'string' ? cfg.claim : cfg.claim.key;
+    if (!/^[A-Za-z0-9_]+$/.test(key || '')) throw new Error(`unsafe claim key: ${JSON.stringify(key)}`);
+    cfg.becomeTenant = [`select set_config('request.jwt.claims', json_build_object('${key}', $1::text)::text, true)`];
+    if (typeof cfg.claim === 'object' && cfg.claim.role) cfg.role = cfg.claim.role;
+    else if (explicitConfig.role === undefined) cfg.role = 'authenticated';
+  }
+  return cfg;
+}
+
+/**
  * Did a caught error mean the write/read was BLOCKED by the database rather than
  * a real failure? Covers "permission denied" and "new row violates row-level
  * security policy" — both SQLSTATE 42501. A blocked write is a SAFE outcome.
@@ -376,16 +395,7 @@ const OK = (extra) => ({ id: meta.id, ok: true, violations: [], scanned: 0, note
  * @param {object} config  see DEFAULTS
  */
 export async function prove({ query, config = {} }) {
-  const cfg = { ...DEFAULTS, ...config };
-  // `claim` shortcut: build the request.jwt.claims becomeTenant (unless one was
-  // given explicitly). Impersonate by set_config — no JWT secret needed in CI.
-  if (cfg.claim && config.becomeTenant === undefined) {
-    const key = typeof cfg.claim === 'string' ? cfg.claim : cfg.claim.key;
-    if (!/^[A-Za-z0-9_]+$/.test(key || '')) throw new Error(`unsafe claim key: ${JSON.stringify(key)}`);
-    cfg.becomeTenant = [`select set_config('request.jwt.claims', json_build_object('${key}', $1::text)::text, true)`];
-    if (typeof cfg.claim === 'object' && cfg.claim.role) cfg.role = cfg.claim.role;
-    else if (config.role === undefined) cfg.role = 'authenticated';
-  }
+  const cfg = applyClaimShortcut({ ...DEFAULTS, ...config }, config);
   const role = safeRole(cfg.role);
   const violations = [];
   const notes = [];

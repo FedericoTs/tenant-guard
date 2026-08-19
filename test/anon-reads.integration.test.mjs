@@ -96,6 +96,49 @@ if (PGlite) {
     assert.match(res.summary, /skipped|none readable/);
   });
 
+  test('FLAGS a MATERIALIZED VIEW anon can read — this CVE class at its worst, invisible to a table-only scan', async () => {
+    const { query } = await fresh(`
+      create table invoices (id serial primary key, organization_id text not null, amount int);
+      grant select on invoices to authenticated;      -- base table is locked down for anon
+      insert into invoices (organization_id, amount) values ('org_A',100),('org_B',200);
+      alter table invoices enable row level security;
+      create policy tenant on invoices for select to authenticated using (true);
+      -- ...but the dashboard matview beside it is granted to anon, and RLS can
+      -- never apply to a materialized view.
+      create materialized view invoice_totals as
+        select organization_id, sum(amount)::int as amount from invoices group by organization_id;
+      grant select on invoice_totals to anon;
+    `);
+    const res = await check({ query });
+    assert.equal(res.ok, false, JSON.stringify(res, null, 2));
+    const v = res.violations.find((x) => x.where === 'public.invoice_totals');
+    assert.ok(v, JSON.stringify(res.violations, null, 2));
+    assert.equal(v.kind, 'matview');
+    assert.match(v.message, /MATERIALIZED VIEW/);
+    assert.match(v.fix, /CANNOT be scoped by RLS/i);
+    // the base table itself is NOT flagged — anon has no grant on it
+    assert.equal(res.violations.some((x) => x.where === 'public.invoices'), false);
+  });
+
+  test('does NOT false-flag a security_invoker VIEW over an RLS table (views are probed, never judged structurally)', async () => {
+    const { query } = await fresh(`
+      create table invoices (id serial primary key, organization_id text not null);
+      grant select on invoices to anon;
+      insert into invoices (organization_id) values ('org_A'),('org_B');
+      alter table invoices enable row level security;
+      -- anon-scoped policy that evaluates false for an unauthenticated caller
+      create policy tenant on invoices for select to public
+        using (organization_id = current_setting('app.current_tenant', true));
+      create view invoice_v with (security_invoker = true) as select id, organization_id from invoices;
+      grant select on invoice_v to anon;
+    `);
+    const res = await check({ query });
+    // A view's relrowsecurity is always false — judging it structurally would
+    // false-flag this safe view. The probe returns 0 rows, so it passes.
+    assert.equal(res.ok, true, JSON.stringify(res, null, 2));
+    assert.equal(res.violations.length, 0);
+  });
+
   test('allowlist: a deliberately-public tenant table can be exempted', async () => {
     const { query } = await fresh(`
       create table price_book (id serial primary key, organization_id text not null, sku text);

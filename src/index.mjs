@@ -12,18 +12,20 @@ import * as rlsProof from './guards/rls-proof.mjs';
 import * as rlsDrift from './guards/rls-drift.mjs';
 import * as anonWrites from './guards/anon-writes.mjs';
 import * as anonReads from './guards/anon-reads.mjs';
-import { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig } from './config.mjs';
+import * as viewIsolation from './guards/view-isolation.mjs';
+import { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig } from './config.mjs';
 
 // The static guards: synchronous, zero-dependency, no database. These are what
 // `tenant-guard run` executes and what a project's vitest/jest suite imports.
 export const GUARDS = [migrationCollisions, definerGrants, routeOrgScoping];
 
-export { migrationCollisions, definerGrants, routeOrgScoping, rlsProof, rlsDrift, anonWrites, anonReads };
+export { migrationCollisions, definerGrants, routeOrgScoping, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation };
 export { prove } from './guards/rls-proof.mjs';
 export { drift } from './guards/rls-drift.mjs';
 export { check as checkAnonWrites } from './guards/anon-writes.mjs';
 export { check as checkAnonReads } from './guards/anon-reads.mjs';
-export { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig } from './config.mjs';
+export { check as checkViews } from './guards/view-isolation.mjs';
+export { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig } from './config.mjs';
 
 /** Run every static guard against a resolved per-guard config map. Returns results[]. */
 export function runAll(cwd = process.cwd()) {
@@ -70,4 +72,15 @@ export async function runAnonWrites(cwd = process.cwd()) {
 export async function runAnonReads(cwd = process.cwd()) {
   const config = loadConfig(cwd);
   return anonReads.run(resolveAnonReadsConfig(config));
+}
+
+/**
+ * Run the view/materialized-view isolation proof (async; needs a database URL +
+ * `pg`). Views run with their owner's rights unless security_invoker is set, and
+ * RLS never applies to materialized views — neither is visible to a table-only
+ * check. Returns a single guard result.
+ */
+export async function runViews(cwd = process.cwd()) {
+  const config = loadConfig(cwd);
+  return viewIsolation.run(resolveViewIsolationConfig(config));
 }

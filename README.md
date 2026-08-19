@@ -25,6 +25,7 @@ npx tenant-guard prove    # runtime proof — exit 1 if a tenant can read/write 
 npx tenant-guard drift    # exit 1 if the DB has RLS/policies no migration declares
 npx tenant-guard anon-writes  # exit 1 if the anonymous role can write any table
 npx tenant-guard anon-reads   # exit 1 if the anonymous role can read any tenant table
+npx tenant-guard views        # exit 1 if a view/materialized view leaks across tenants
 ```
 
 ---
@@ -80,7 +81,8 @@ tenant-guard  — guard tests for multi-tenant isolation
 | `rls-proof` *(runtime)* | a tenant's session can actually read **or write** another tenant's rows | it isn't reading source at all — it runs real queries as your app role (SELECT, plus `UPDATE`/`DELETE`/tenant-hop/`INSERT` probes) and measures the leak; nothing static can prove isolation *holds*, and RLS is per-command so reads passing says nothing about writes |
 | `rls-drift` *(runtime)* | the database has RLS enabled or a policy that **no migration declares** | catches security posture applied by hand in the dashboard/psql — invisible to code review, absent from CI, changeable with no diff or history |
 | `anon-writes` *(runtime)* | the **anonymous** role can INSERT/UPDATE/DELETE a table | a table with no tenant column, writable by `anon`, is neither a tenant leak nor drift — it's the cache-poisoning class; it proves the real `USING`/`WITH CHECK` by probing, so it doesn't false-flag `TO public USING (auth.uid()…)` policies |
-| `anon-reads` *(runtime)* | the **anonymous** role can SELECT a **tenant** table | the CVE-2025-48757 class — the public anon key reads every tenant's data with no login; scoped to tables with a tenant column so public content isn't flagged, and it *probes* as `anon` so it evaluates the real policy, not just the grant |
+| `anon-reads` *(runtime)* | the **anonymous** role can SELECT a **tenant** table, view, or materialized view | the CVE-2025-48757 class — the public anon key reads every tenant's data with no login; scoped to objects with a tenant column so public content isn't flagged, and it *probes* as `anon` so it evaluates the real policy, not just the grant |
+| `view-isolation` *(runtime)* | a **view** or **materialized view** leaks across tenants | a view runs with its **owner's** rights unless `security_invoker` is set, and RLS **never applies to a materialized view at all** — so a perfectly-RLS'd table can still be handed out wholesale by the view beside it, and every table-only checker (including `rls-proof`) sees nothing wrong |
 
 `npx tenant-guard list` describes each.
 

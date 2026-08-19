@@ -101,12 +101,12 @@ The highest-severity blind spot of any table-only scanner.
 
 | # | Failure | Status | How |
 |---|---|---|---|
-| 4.1 | **View without `security_invoker`** — runs as its owner, so base-table RLS is evaluated as the owner and returns every tenant | 🔜 | high priority: enumerate views, probe each as the app role |
-| 4.2 | **Materialized view** — RLS *never* applies; it's an RLS-free snapshot of every tenant | 🔜 | high priority: enumerate `pg_matviews`, probe as app role/anon |
+| 4.1 | **View without `security_invoker`** — runs as its owner, so base-table RLS is evaluated as the owner and returns every tenant | ✅ | `view-isolation` probes every tenant-column view as the app role; the catalog (owner, `security_invoker`, kind) is used only to explain *why* and pick the right fix |
+| 4.2 | **Materialized view** — RLS *never* applies; it's an RLS-free snapshot of every tenant | ✅ | `view-isolation` (cross-tenant) and `anon-reads` (unauthenticated). The fix text never suggests `security_invoker` here — no policy can scope a matview |
 | 4.3 | `SECURITY DEFINER` **function** that doesn't re-filter by tenant, or trusts a tenant argument | 🟡 | `definer-grants` flags mutating definer functions not revoked from `PUBLIC`/`anon` (static). Calling them to prove a data leak is 🔜 — and gated, since an unknown definer body can have side effects a rollback won't undo |
 | 4.4 | Definer function with **mutable `search_path`** → object-shadowing escalation | 🔜 | catalog: `prosecdef` + no pinned `search_path`, plus `CREATE` on `public` |
 | 4.5 | Definer **helper used inside a policy** (the recursion-avoidance idiom) inherits any flaw | 🔜 | shows up behaviourally once 4.1/4.3 probes exist |
-| 4.6 | View/function over `auth.users` exposing every tenant's email | 🔜 | covered once 4.1 lands |
+| 4.6 | View/function over `auth.users` exposing every tenant's email | 🟡 | a *view* over `auth.users` is covered by 4.1 **if it exposes a tenant column**; one keyed only by user id isn't yet |
 | 4.7 | **Partitions**: RLS on the parent, but a partition queried directly uses *its own* (often unset) RLS; newly attached partitions miss `ENABLE`/`FORCE` | 🔜 | enumerate `pg_inherits`, probe each partition directly |
 | 4.8 | Legacy `INHERITS` children don't inherit parent policies | 🔜 | same enumeration |
 | 4.9 | Triggers/rules writing tenant rows into an un-RLS'd audit/outbox table | 🟡 | the audit table is itself scanned *if* it has a tenant column; without one it's invisible → 🔜 |
@@ -158,10 +158,13 @@ listed so nobody reads a green run as more than it is.
 ## What this means for the roadmap
 
 Ordered by (severity × prevalence in real AI-generated apps) ÷ build cost, the
-next builds are: **4.1/4.2 (views & materialized views)** — highest severity of
-anything still open and invisible to every table-only checker; **2.8/2.9
-(forgeable identity: settable GUC, user-writable claim)**; **3.7/3.9 (upsert,
-TRUNCATE)**; then **4.7 (partitions)** and **5.1 (storage paths)**.
+next builds are: **2.8/2.9 (forgeable identity — a policy trusting a client-settable
+GUC or a user-writable `user_metadata` claim)**; **3.7/3.9 (upsert conflict path,
+`TRUNCATE`)**; then **4.7 (partitions queried directly)** and **5.1 (storage object
+paths)**.
+
+*Done: 4.1/4.2 (views & materialized views) shipped in 0.9.0 — they were the
+highest-severity open item and invisible to every table-only checker.*
 
 If you know a failure mode that isn't in this table, that's the most useful bug
 report this project can get — open an issue.

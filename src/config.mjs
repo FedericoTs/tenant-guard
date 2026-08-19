@@ -122,6 +122,23 @@ export function resolveAnonReadsConfig(config) {
   return out;
 }
 
+/** Resolve the view-isolation config from the user's `viewIsolation` block. */
+export function resolveViewIsolationConfig(config) {
+  const v = config.viewIsolation ?? {};
+  const out = {};
+  for (const k of ['url', 'urlEnv', 'schemas', 'tenantColumns', 'role', 'becomeTenant', 'claim', 'allowlist', 'sampleLimit']) {
+    if (v[k] !== undefined) out[k] = v[k];
+  }
+  // Views are probed with the same identity as the RLS proof; inherit it unless
+  // the user configured viewIsolation explicitly, so `claim`/`becomeTenant` only
+  // have to be written once.
+  const p = config.rlsProof ?? {};
+  for (const k of ['role', 'becomeTenant', 'claim', 'tenantColumns', 'schemas']) {
+    if (out[k] === undefined && p[k] !== undefined) out[k] = p[k];
+  }
+  return out;
+}
+
 export function autodetect(cwd = process.cwd()) {
   return {
     migrationsDir: firstExisting(cwd, CANDIDATE_MIGRATION_DIRS),

@@ -61,6 +61,33 @@ test('classify: RLS ON + empty table -> not-proven (never a silent pass)', () =>
   assert.match(v.message, /empty/);
 });
 
+test('classify: a VIEW is NEVER judged structurally — rlsEnabled=false must not mean "leak"', () => {
+  // Views always report relrowsecurity=false. Applying the table rule here would
+  // false-flag every safe security_invoker view; the probe is the only authority.
+  const v = classifyRead({ kind: 'view', rlsEnabled: false, canSelect: true, total: 9, anonVisible: 0 });
+  assert.equal(v.status, 'safe');
+});
+
+test('classify: a MATERIALIZED VIEW anon can read -> leak naming that RLS never applies', () => {
+  const v = classifyRead({ kind: 'matview', rlsEnabled: false, canSelect: true, total: 9, anonVisible: 9 });
+  assert.equal(v.status, 'leak');
+  assert.match(v.message, /MATERIALIZED VIEW/);
+  assert.match(v.message, /NEVER applies/i);
+});
+
+test('classify: no SELECT grant -> safe for any kind (nothing exposed)', () => {
+  for (const kind of ['table', 'view', 'matview']) {
+    assert.equal(classifyRead({ kind, rlsEnabled: false, canSelect: false, total: 5, anonVisible: 0 }).status, 'safe');
+  }
+});
+
+test('violationForRead: a matview fix never suggests security_invoker', () => {
+  const v = violationForRead('public.mv', 'public', 'mv', 'anon', true, { kind: 'matview' });
+  assert.equal(v.kind, 'matview');
+  assert.match(v.fix, /CANNOT be scoped by RLS/i);
+  assert.doesNotMatch(v.fix, /ALTER VIEW/);
+});
+
 test('violationForRead: names the table, the role, and the REVOKE / allowlist fix', () => {
   const v = violationForRead('public.invoices', 'public', 'invoices', 'anon', true);
   assert.equal(v.where, 'public.invoices');

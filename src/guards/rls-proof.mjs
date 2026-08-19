@@ -183,6 +183,16 @@ export function tenantRowCountSql(schema, table, column, tenantId) {
 }
 
 /**
+ * Restricted-role count of ALL rows the acting tenant can SELECT (no tenant
+ * filter). Used by the omitted-tenant probe: a NULL-tenant orphan matches no
+ * `col = tenant` filter, so only an unfiltered visible count reveals whether the
+ * read policy exposes it to this session.
+ */
+export function tenantOwnVisibleSql(schema, table) {
+  return { text: `select count(*)::int as n from ${qualified(schema, table)}`, values: [] };
+}
+
+/**
  * Privileged per-tenant row counts, so a write probe can tell "wrote my own
  * rows" from "wrote another tenant's rows". Returns { text, values:[a,b] }.
  */
@@ -237,6 +247,21 @@ export function insertProbeSql(schema, table, column, otherTenantId) {
   return { text: `insert into ${qualified(schema, table)} (${c}) values ($1)`, values: [otherTenantId] };
 }
 
+/**
+ * Write probe — INSERT a row with NO tenant (the tenant column explicitly NULL).
+ * A wrong-tenant probe walks straight past this: the client never *claims* a
+ * tenant. A strict policy (`tenant = current`) rejects NULL cleanly — `NULL =
+ * 'org_A'` is NULL, not true — but where the column is nullable and the read
+ * policy treats NULL as global (`… OR tenant IS NULL`), you get a row nobody owns
+ * that every tenant can read. The caller detects it by whether the acting tenant
+ * can then SEE the row it just made (own-row count grew) — see probeInsertOmitted.
+ * A NOT NULL tenant column makes such orphans schema-impossible (a safe block).
+ */
+export function insertOmittedProbeSql(schema, table, column) {
+  const c = quoteIdent(column);
+  return { text: `insert into ${qualified(schema, table)} (${c}) values (NULL)`, values: [] };
+}
+
 /** Expand the becomeTenant templates into { text, values } for a tenant id. */
 export function buildBecomeTenant(templates, tenantId) {
   return templates.map((text) => ({ text, values: [tenantId] }));
@@ -273,7 +298,7 @@ export function isRlsCheckViolation(err) {
  * one entry per kind, and the caller emits a violation for each.
  * @returns {{ status:'isolated'|'leak'|'no-policy'|'insufficient-data'|'over-restrictive'|'no-access', message?:string, leaks?:Array<{kind:'read'|'write',message:string,fix:string}> }}
  */
-export function classifyTableResult({ rlsEnabled, policyCount, ownVisible, crossVisible, writeAffected = 0, insertLeaked = false, tenantCount, noAccess, probedWrites = false }) {
+export function classifyTableResult({ rlsEnabled, policyCount, ownVisible, crossVisible, writeAffected = 0, insertLeaked = false, orphanLeaked = false, tenantCount, noAccess, probedWrites = false }) {
   if (noAccess) {
     return { status: 'no-access', message: `role cannot read this table at all (no SELECT grant) — nothing to prove` };
   }
@@ -317,6 +342,13 @@ export function classifyTableResult({ rlsEnabled, policyCount, ownVisible, cross
       kind: 'write',
       message: `tenant A's session INSERTed a row belonging to tenant B — it can CREATE rows in another tenant. INSERT is governed only by a WITH CHECK clause; SELECT/UPDATE/DELETE policies don't cover it, so a table can scope reads correctly yet let any session write into any tenant`,
       fix: `Add a WITH CHECK on INSERT — a FOR ALL policy covers it — scoped by the tenant column:\n  CREATE POLICY tenant_all ON {tbl} FOR ALL\n    USING ({col} = current_setting('app.current_tenant'))\n    WITH CHECK ({col} = current_setting('app.current_tenant'));`,
+    });
+  }
+  if (orphanLeaked) {
+    leaks.push({
+      kind: 'write',
+      message: `tenant A's session INSERTed a row with NO tenant ({col} = NULL) and could then read it back — the column is nullable and the read policy treats NULL as global, so this row is owned by nobody and readable by EVERY tenant. A wrong-tenant check misses it because the client simply omits the tenant`,
+      fix: `Make the tenant column NOT NULL, and make the WITH CHECK reject NULL (a bare {col} = current_setting(...) already does, since NULL = x is not true); never write a read policy as "{col} = current OR {col} IS NULL".`,
     });
   }
   if (leaks.length) return { status: 'leak', leaks };
@@ -552,6 +584,37 @@ export async function prove({ query, config = {} }) {
       }
     };
 
+    // OMITTED-tenant probe — insert a row with the tenant column NULL and see if
+    // the acting tenant can then READ it. Delta logic is INVERTED vs probeInsert:
+    // here own-count GROWING means the orphan is visible to this session (and so
+    // to every session, since NULL matches no specific tenant) => an everybody-can-
+    // read leak. A NOT NULL violation ON THE TENANT COLUMN means orphans are
+    // schema-impossible (safe); on any OTHER column it's inconclusive.
+    const probeInsertOmitted = async (insSql, insValues, ownCountSql, ownCountValues, tenantColumn) => {
+      await query('savepoint tg_o', []);
+      try {
+        const before = (await q(ownCountSql, ownCountValues))[0].n;
+        const res = await query(insSql, insValues);
+        const affected = res.rowCount ?? res.affectedRows ?? 0;
+        if (affected < 1) {
+          await query('rollback to savepoint tg_o', []); await query('release savepoint tg_o', []);
+          return { outcome: 'blocked' };
+        }
+        const after = (await q(ownCountSql, ownCountValues))[0].n;
+        await query('rollback to savepoint tg_o', []); await query('release savepoint tg_o', []);
+        // Own count grew => this session can see a row it doesn't own (tenant NULL)
+        // => the read policy treats NULL as global => every tenant can read it.
+        return after > before ? { outcome: 'leak' } : { outcome: 'blocked' };
+      } catch (err) {
+        try { await query('rollback to savepoint tg_o', []); await query('release savepoint tg_o', []); } catch { /* ignore */ }
+        if (isRlsCheckViolation(err)) return { outcome: 'blocked' }; // WITH CHECK rejected the null tenant — good
+        // NOT NULL on the TENANT column itself => orphan rows are impossible; safe.
+        if (new RegExp(`null value in column "${tenantColumn.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`, 'i').test(err.message || '')) return { outcome: 'blocked' };
+        if (/permission denied for (table|relation|view)/i.test(err.message || '')) return { outcome: 'blocked' };
+        return { outcome: 'inconclusive', reason: err.message };     // some OTHER NOT NULL / FK / sequence — couldn't complete a valid insert
+      }
+    };
+
     for (const t of plan) {
       if (t.introspectError) {
         notes.push({ where: `${t.schema}.${t.table}`, message: `could not sample tenants: ${t.introspectError}` });
@@ -578,6 +641,7 @@ export async function prove({ query, config = {} }) {
       let crossVisible = 0;
       let writeAffected = 0;
       const insertOutcomes = [];
+      const orphanOutcomes = [];
       try {
         // become tenant A: read own + the other tenant's rows, then try to write theirs
         for (const s of buildBecomeTenant(cfg.becomeTenant, tenantA)) await query(s.text, s.values);
@@ -602,6 +666,11 @@ export async function prove({ query, config = {} }) {
           const iA = insertProbeSql(t.schema, t.table, t.tenantColumn, tenantB);
           const ownCntA = tenantRowCountSql(t.schema, t.table, t.tenantColumn, tenantA);
           insertOutcomes.push(await probeInsert(iA.text, iA.values, ownCntA.text, ownCntA.values));
+          // (4) INSERT with the tenant OMITTED (NULL) — the orphan-readable-by-all
+          // case a wrong-tenant probe walks past. Own-visible count grows => leak.
+          const oA = insertOmittedProbeSql(t.schema, t.table, t.tenantColumn);
+          const ownAllA = tenantOwnVisibleSql(t.schema, t.table);
+          orphanOutcomes.push(await probeInsertOmitted(oA.text, oA.values, ownAllA.text, ownAllA.values, t.tenantColumn));
         }
 
         // reverse direction: become tenant B, check reading/writing A's rows
@@ -618,6 +687,9 @@ export async function prove({ query, config = {} }) {
           const iB = insertProbeSql(t.schema, t.table, t.tenantColumn, tenantA);
           const ownCntB = tenantRowCountSql(t.schema, t.table, t.tenantColumn, tenantB);
           insertOutcomes.push(await probeInsert(iB.text, iB.values, ownCntB.text, ownCntB.values));
+          const oB = insertOmittedProbeSql(t.schema, t.table, t.tenantColumn);
+          const ownAllB = tenantOwnVisibleSql(t.schema, t.table);
+          orphanOutcomes.push(await probeInsertOmitted(oB.text, oB.values, ownAllB.text, ownAllB.values, t.tenantColumn));
         }
       } catch (err) {
         if (isPermissionDenied(err)) noAccess = true;
@@ -641,13 +713,15 @@ export async function prove({ query, config = {} }) {
       // otherwise, if we couldn't build a valid row in either direction, the
       // insert path is INCONCLUSIVE (a note — never silently counted as proven).
       const insertLeaked = insertOutcomes.some((o) => o.outcome === 'leak');
-      const insertInconclusive = !insertLeaked && insertOutcomes.find((o) => o.outcome === 'inconclusive');
-      const verdict = classifyTableResult({ rlsEnabled: t.rlsEnabled, policyCount: t.policyCount, ownVisible, crossVisible, writeAffected, insertLeaked, tenantCount: t.tenants.length, noAccess, probedWrites });
+      const orphanLeaked = orphanOutcomes.some((o) => o.outcome === 'leak');
+      const insertInconclusive = !insertLeaked && !orphanLeaked &&
+        (insertOutcomes.find((o) => o.outcome === 'inconclusive') || orphanOutcomes.find((o) => o.outcome === 'inconclusive'));
+      const verdict = classifyTableResult({ rlsEnabled: t.rlsEnabled, policyCount: t.policyCount, ownVisible, crossVisible, writeAffected, insertLeaked, orphanLeaked, tenantCount: t.tenants.length, noAccess, probedWrites });
       const tbl = qualified(t.schema, t.table);
       // An otherwise-clean table whose insert path we couldn't exercise: say so,
       // so a green result never overclaims "no write can cross tenants".
       if (verdict.status !== 'leak' && insertInconclusive) {
-        notes.push({ where: `${t.schema}.${t.table}`, message: `read/UPDATE/DELETE isolation proven, but the INSERT probe was inconclusive — a minimal row hit: ${insertInconclusive.reason}. Give the app role what the insert needs (e.g. grant usage on the table's sequence, or default/seed the missing NOT NULL columns) to prove INSERT isolation too` });
+        notes.push({ where: `${t.schema}.${t.table}`, message: `read/UPDATE/DELETE isolation proven, but an INSERT probe was inconclusive — a minimal row hit: ${insertInconclusive.reason}. Give the app role what the insert needs (e.g. grant usage on the table's sequence, or default/seed the missing NOT NULL columns) to prove INSERT isolation too` });
       }
       if (verdict.status === 'leak') {
         for (const leak of verdict.leaks) {

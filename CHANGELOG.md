@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.7.0
+
+Another sharp one from the same reviewer: alongside the wrong-tenant INSERT, probe
+the **omitted tenant**.
+
+- **feat(rls-proof): the omitted-tenant / orphan-row probe.** As each tenant, the
+  proof now also inserts a row with the tenant column **NULL** (the client simply
+  doesn't claim a tenant). A strict `tenant = current` policy rejects it cleanly —
+  `NULL = 'org_A'` is not true — but where the column is **nullable** and the read
+  policy treats NULL as global (`… OR tenant IS NULL`), you get a row **owned by
+  nobody and readable by every tenant**. A wrong-tenant probe walks straight past
+  it, because it never omits the tenant. Detected by whether the acting session can
+  then *read* the row it created (its visible-row count grows). A `NOT NULL` tenant
+  column makes such orphans schema-impossible — reported as a safe block, not a
+  leak; a `NOT NULL` on some *other* column is inconclusive (a note).
+- 109 tests (was 104).
+
 ## 0.6.0
 
 Closes the last write path the runtime proof was missing — **INSERT isolation** —

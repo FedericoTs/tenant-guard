@@ -15,10 +15,12 @@ import {
   planTables,
   distinctTenantsSql,
   tenantRowCountSql,
+  tenantOwnVisibleSql,
   tenantCountsSql,
   updateProbeSql,
   deleteProbeSql,
   insertProbeSql,
+  insertOmittedProbeSql,
   buildBecomeTenant,
   isPermissionDenied,
   isRlsCheckViolation,
@@ -92,6 +94,18 @@ test('insertProbeSql: inserts a row for the OTHER tenant, NO returning (RETURNIN
   assert.match(i.text, /^insert into "public"\."invoices" \("organization_id"\) values \(\$1\)$/);
   assert.doesNotMatch(i.text, /returning/i); // RETURNING re-applies the SELECT policy and hides the very leak we hunt
   assert.deepEqual(i.values, ['org_B']); // the OTHER tenant — a row that lands here is a cross-tenant insert
+});
+
+test('insertOmittedProbeSql: inserts the tenant column as NULL (the omitted-tenant / orphan case)', () => {
+  const o = insertOmittedProbeSql('public', 'invoices', 'organization_id');
+  assert.match(o.text, /^insert into "public"\."invoices" \("organization_id"\) values \(NULL\)$/);
+  assert.deepEqual(o.values, []);
+});
+
+test('tenantOwnVisibleSql: unfiltered visible count (so a NULL-tenant orphan is countable)', () => {
+  const v = tenantOwnVisibleSql('public', 'invoices');
+  assert.match(v.text, /^select count\(\*\)::int as n from "public"\."invoices"$/);
+  assert.doesNotMatch(v.text, /where/i); // no tenant filter — a NULL orphan matches no `col = tenant`
 });
 
 test('isRlsCheckViolation: matches a WITH CHECK block, NOT a NOT NULL/constraint error (which is inconclusive)', () => {
@@ -190,6 +204,15 @@ test('classify: INSERTs into the other tenant (reads + update/delete clean) -> w
   assert.equal(v.leaks[0].kind, 'write');
   assert.match(v.leaks[0].message, /INSERTed a row belonging to tenant B|CREATE rows in another tenant/);
   assert.match(v.leaks[0].fix, /WITH CHECK/);
+});
+
+test('classify: an OMITTED-tenant orphan readable by all -> write leak (nullable tenant + NULL-is-global read)', () => {
+  const v = classifyTableResult({ rlsEnabled: true, ownVisible: 5, crossVisible: 0, writeAffected: 0, orphanLeaked: true, tenantCount: 2, probedWrites: true });
+  assert.equal(v.status, 'leak');
+  assert.equal(v.leaks.length, 1);
+  assert.equal(v.leaks[0].kind, 'write');
+  assert.match(v.leaks[0].message, /NO tenant|owned by nobody|readable by EVERY tenant/);
+  assert.match(v.leaks[0].fix, /NOT NULL|IS NULL/);
 });
 
 test('classify: reads AND writes the other tenant -> two leaks (read + write)', () => {

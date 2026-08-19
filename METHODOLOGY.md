@@ -118,9 +118,14 @@ landed, because `RETURNING` re-applies the `SELECT` policy and a row `WITH CHECK
 *accepted* but `SELECT` hides then raises the very same error a `WITH CHECK` *block*
 raises — masking the leak. The probe instead reads the acting tenant's own-row
 count before and after, which is driver-agnostic and correctly ignores a `BEFORE`
-trigger that rewrites the tenant back. That is the meta-pattern of this whole
-project: the strongest guard is the one a real failure — or a sharp reviewer —
-taught you to write. The mechanism, the config,
+trigger that rewrites the tenant back. The same reviewer then named the case a
+wrong-tenant probe walks straight past: the **omitted** tenant. Insert a row with
+the tenant column `NULL` — the client simply never claims a tenant — and where the
+column is nullable and the read policy treats `NULL` as global (`… OR tenant IS
+NULL`), you get a row owned by nobody that every tenant can read. So the probe now
+also inserts a `NULL`-tenant row and checks whether the acting session can then
+*read* it. That is the meta-pattern of this whole project: the strongest guard is
+the one a real failure — or a sharp reviewer — taught you to write. The mechanism, the config,
 and a zero-infrastructure demo are in
 [`examples/rls-proof/`](examples/rls-proof/README.md).
 

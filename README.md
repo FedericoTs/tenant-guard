@@ -123,8 +123,10 @@ seeded test database it:
 3. drops to your **non-superuser app role** (e.g. `authenticated`), assumes
    tenant A's identity, and asserts A's session can neither **read nor write**
    tenant B's rows — SELECT, plus the full write path: `UPDATE`/`DELETE` of B's
-   rows, a **tenant-hop** (reassigning A's own row *into* B), and an **`INSERT`**
-   that creates a row in B — then checks the other direction.
+   rows, a **tenant-hop** (reassigning A's own row *into* B), an **`INSERT`** that
+   creates a row in B, and an **omitted-tenant `INSERT`** (tenant column `NULL`)
+   that creates an orphan row every tenant can read — then checks the other
+   direction.
 
 If RLS is off, a policy is `USING (true)`, a policy forgot the tenant predicate,
 **the write path is unprotected** (RLS is per-command — a correct `SELECT` policy

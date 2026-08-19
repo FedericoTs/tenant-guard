@@ -122,6 +122,12 @@ INSERT for it), and a broken seed statement fails with the exact SQL error.
   `UPDATE`/`DELETE`/`INSERT`, and `USING` says nothing about where a row *lands* —
   that needs `WITH CHECK` (and `UPSERT` needs its own `UPDATE` policy). Fails the
   build. ✗
+- **orphan / omitted-tenant leak** — a session could `INSERT` a row with the
+  tenant column **NULL** (it never claims a tenant) *and then read it back*. Where
+  the column is nullable and the read policy treats NULL as global (`… OR tenant IS
+  NULL`), that row is owned by nobody and readable by every tenant — and a
+  wrong-tenant check walks right past it. Fix: make the tenant column `NOT NULL`
+  and never write a read policy as `tenant = current OR tenant IS NULL`. ✗
 - **INSERT probe inconclusive** (a note) — the INSERT probe sets only the tenant
   column and relies on defaults for the rest, so a table with other `NOT NULL`
   columns without defaults (or a role lacking sequence usage) yields a data error,

@@ -251,6 +251,39 @@ if (PGlite) {
     assert.ok(res.notes.some((n) => /INSERT probe was inconclusive/i.test(n.message)), JSON.stringify(res.notes, null, 2));
   });
 
+  test('CATCHES the OMITTED-tenant orphan: a NULL-tenant row nobody owns that every tenant can read', async () => {
+    const { query } = await freshDb(`
+      create table docs (id serial primary key, organization_id text, body text);   -- organization_id NULLABLE
+      grant select, insert, update, delete on docs to authenticated;
+      grant usage on all sequences in schema public to authenticated;
+      insert into docs (organization_id, body) values ('org_A','x'), ('org_B','y');
+      alter table docs enable row level security;
+      -- read policy treats NULL as global (the bug); insert allows own-or-null (rejects wrong-tenant)
+      create policy sel on docs for select using (organization_id = current_setting('app.current_tenant', true) or organization_id is null);
+      create policy ins on docs for insert with check (organization_id = current_setting('app.current_tenant', true) or organization_id is null);
+    `);
+    const res = await prove({ query });
+    assert.equal(res.ok, false, JSON.stringify(res, null, 2));
+    const w = res.violations.find((v) => v.kind === 'write' && /NO tenant|owned by nobody|readable by EVERY tenant/.test(v.message));
+    assert.ok(w, JSON.stringify(res.violations, null, 2));
+    assert.equal(res.violations.some((v) => v.kind === 'read'), false); // reads are scoped; wrong-tenant insert is rejected — only the orphan leaks
+  });
+
+  test('NO false orphan: a nullable tenant column with a strict WITH CHECK rejects the NULL insert', async () => {
+    const { query } = await freshDb(`
+      create table invoices (id serial primary key, organization_id text, amount int);   -- nullable, but strict policy
+      grant select, insert, update, delete on invoices to authenticated;
+      grant usage on all sequences in schema public to authenticated;
+      insert into invoices (organization_id, amount) values ('org_A',100),('org_B',200);
+      alter table invoices enable row level security;
+      create policy tenant_all on invoices for all ${TENANT_POLICY}
+        with check (organization_id = current_setting('app.current_tenant', true));
+    `);
+    const res = await prove({ query });
+    assert.equal(res.ok, true, JSON.stringify(res, null, 2));
+    assert.equal(res.violations.length, 0); // NULL insert fails WITH CHECK (NULL = current is not true) — no orphan
+  });
+
   // ── the RLS-on-no-policy trap (Reddit point 2) ─────────────────────
   test('NAMES the RLS-on-no-policy trap: deny-all that only *looks* isolated', async () => {
     const { query } = await freshDb(`

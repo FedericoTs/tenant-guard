@@ -84,27 +84,37 @@ The first three guards are heuristics on source text. They catch the obvious
 leak cheaply, but they can't *prove* isolation holds. So there's now a fourth,
 runtime guard — `tenant-guard prove`. Against a real Postgres it drops to your
 non-superuser app role, assumes one tenant's identity, and asserts that session
-literally cannot read another tenant's rows, across every table with a tenant
-column. A static scanner can never do this; a query can.
+literally cannot read **or write** another tenant's rows, across every table with
+a tenant column. A static scanner can never do this; a query can.
 
-It catches the three ways real apps leak that no source scan proves: RLS switched
+It catches the ways real apps leak that no source scan proves: RLS switched
 **off** on a tenant table (the [CVE-2025-48757](https://nvd.nist.gov/vuln/detail/CVE-2025-48757)
-class — 10.3% of a sample of AI-built apps), a policy left `USING (true)`, and a
-policy that simply forgot the tenant predicate. It runs read-only inside a
-rolled-back transaction, and it distinguishes "proven isolated" from "couldn't
-be proven" so a single-tenant fixture is never mistaken for a pass.
+class — 303 endpoints across 170 Lovable projects were readable unauthenticated),
+a policy left `USING (true)`, a policy that forgot the tenant predicate, an
+unprotected **write path** (RLS is per-command, so a correct `SELECT` policy
+leaves `UPDATE`/`DELETE` open), and RLS **enabled with no policy at all** — a
+deny-all that only *looks* isolated. It runs inside a rolled-back transaction
+(reads plus `UPDATE`/`DELETE` probes in savepoints), and distinguishes "proven
+isolated" from "couldn't be proven" so a single-tenant fixture is never mistaken
+for a pass.
 
-That is the guard that turns "we think RLS is on" into "the build proves it, on
-every commit." The mechanism, the config, and a zero-infrastructure demo are in
+The write-path check exists because a practitioner pointed out that read-only
+isolation tests miss the leaks that actually bite — `UPDATE`. Building it
+surfaced a subtlety worth writing down: a `WHERE tenant = 'other'` probe is
+*masked* by a correct `SELECT` policy — you can't target rows you can't see — so
+the probe rewrites the whole table with no `WHERE` and compares the affected-row
+count to the tenant's own. That is the meta-pattern of this whole project: the
+strongest guard is the one a real failure — or a sharp reviewer — taught you to
+write. The mechanism, the config, and a zero-infrastructure demo are in
 [`examples/rls-proof/`](examples/rls-proof/README.md).
 
 ## Roadmap: what's next
 
 The proof tests the tables that already carry two tenants' data. The natural next
 step is a **seeding** mode that manufactures two synthetic tenants for tables
-that don't, so coverage doesn't depend on fixture data — plus a Supabase preset
-that discovers the app role and JWT shape automatically. Those are conveniences
-on top of a mechanism that already holds.
+that don't, so coverage doesn't depend on fixture data; an `INSERT` probe to round
+out the write path; and a Supabase preset that discovers the app role and JWT
+shape automatically. Those are conveniences on top of a mechanism that holds.
 
 ---
 

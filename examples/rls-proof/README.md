@@ -53,13 +53,24 @@ from users where organization_id = $1::text limit 1) ...`).
 
 ## What it reports
 
-- **isolated** — the session saw its own rows and **zero** of the other tenant's. ✓
-- **leak** — it saw the other tenant's rows. Either a policy is permissive
+- **isolated** — the session could neither read nor write the other tenant's
+  rows, and saw its own. ✓
+- **read leak** — it *read* another tenant's rows. A policy is permissive
   (`USING (true)` / missing the tenant predicate) or **RLS is off entirely**.
-  This fails the build. ✗
-- **not proven** (a note, not a failure) — the table has only one tenant's data,
-  or the `becomeTenant`/`role` config doesn't match your policies, so isolation
-  couldn't be demonstrated. Seed a second tenant, or fix the config.
+  Fails the build. ✗
+- **write leak** — it could *UPDATE/DELETE* another tenant's rows even when reads
+  were correctly scoped. RLS is **per-command**: a right-looking `SELECT` policy
+  says nothing about `UPDATE`/`DELETE` (and `UPSERT` needs its own `UPDATE`
+  policy). Fails the build. ✗
+- **no policy** (a note) — RLS is enabled but the table has **no policy at all**.
+  Postgres then denies every row, which looks *exactly* like isolation but means
+  the table is unfinished — the moment someone adds a permissive policy it leaks.
+  Named explicitly so it can't masquerade as a pass.
+- **not proven** (a note) — only one tenant's data, no read access, or the
+  `becomeTenant`/`role` config doesn't match your policies. Seed a second tenant,
+  or fix the config.
 
-Everything runs inside a transaction that is rolled back, and the proof only
-ever issues `SELECT`s — it never writes to your database.
+Everything runs inside a transaction that is rolled back, and each `UPDATE`/`DELETE`
+write probe is additionally wrapped in its own `SAVEPOINT` that is rolled back —
+nothing is ever committed. (Triggers still fire inside the rolled-back
+transaction; set `"probeWrites": false` to test reads only.)

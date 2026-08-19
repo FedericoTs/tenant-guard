@@ -10,17 +10,23 @@
  *   2. as the PRIVILEGED role (which bypasses RLS, like Supabase `service_role`)
  *      finds two real tenant ids that already have data in each table;
  *   3. drops to your non-superuser APP role (e.g. `authenticated`), assumes the
- *      identity of tenant A, and asserts A's session sees **zero** of tenant B's
- *      rows — then swaps and checks the other direction.
+ *      identity of tenant A, and asserts A's session can neither READ nor WRITE
+ *      tenant B's rows (SELECT, plus UPDATE/DELETE probes) — then swaps and
+ *      checks the other direction. RLS is per-command, so a correct read policy
+ *      can leave writes wide open; this catches that.
  *
- * A static scanner can never do this. A test can: if RLS is off, or a policy is
- * `USING (true)`, or a policy forgot the tenant predicate, tenant A's session
- * sees tenant B's rows and this guard fails your build — on every commit.
+ * A static scanner can never do this. A test can: if RLS is off, a policy is
+ * `USING (true)`, a policy forgot the tenant predicate, the write path is
+ * unprotected, or RLS is on with no policy at all (deny-all that only *looks*
+ * isolated) — this guard names it and fails your build, on every commit.
  *
- * Everything runs inside a single transaction that is ROLLED BACK, and the
- * guard only ever SELECTs, so it is non-destructive by construction. It needs a
- * Postgres driver (`pg`, an optional peer dependency) and a database URL; with
- * neither it SKIPS, exactly like the other guards on a stack they don't fit.
+ * Non-destructive by construction: the whole run is one transaction that is
+ * ROLLED BACK, and each write probe is additionally wrapped in its own SAVEPOINT
+ * that is rolled back, so nothing is ever committed. (If you have triggers with
+ * external side effects, note they still fire inside the rolled-back
+ * transaction; set `probeWrites: false` to test reads only.) It needs a Postgres
+ * driver (`pg`, an optional peer dependency) and a database URL; with neither it
+ * SKIPS, exactly like the other guards on a stack they don't fit.
  *
  * The pure helpers below are I/O-free and unit-tested with zero dependencies;
  * `prove()` takes an injected `query` function so it can be driven by `pg` in
@@ -30,7 +36,7 @@
 export const meta = {
   id: 'rls-proof',
   title: 'Runtime RLS isolation proof',
-  why: "Proves at runtime that a tenant's session cannot read another tenant's rows — catches RLS that is off, permissive, or missing the tenant predicate, which no source scan can prove.",
+  why: "Proves at runtime that a tenant's session cannot read OR write another tenant's rows — catches RLS that is off, permissive, missing the tenant predicate, unprotected on the write path, or enabled with no policy at all, which no source scan can prove.",
 };
 
 // ── configuration defaults ───────────────────────────────────────────
@@ -51,6 +57,10 @@ export const DEFAULTS = {
   tables: null, // null = autodiscover; or [{ table, schema?, tenantColumn }]
   grandfather: [], // table names deliberately shared/unscoped (reference data)
   sampleLimit: 3, // distinct tenant ids to sample per table
+  // Also test the WRITE path: attempt UPDATE/DELETE of another tenant's rows,
+  // each inside a rolled-back savepoint. RLS is per-command, so a correct SELECT
+  // policy can still leave UPDATE/DELETE open. Set false to test reads only.
+  probeWrites: true,
 };
 
 // ── pure helpers (unit-tested, no I/O) ───────────────────────────────
@@ -87,7 +97,8 @@ export function introspectionSql(schemas, tenantColumns) {
            c.relname            as table,
            a.attname            as column,
            c.relrowsecurity     as rls_enabled,
-           c.relforcerowsecurity as rls_forced
+           c.relforcerowsecurity as rls_forced,
+           (select count(*) from pg_catalog.pg_policy pol where pol.polrelid = c.oid)::int as policy_count
     from pg_catalog.pg_class c
     join pg_catalog.pg_namespace n on n.oid = c.relnamespace
     join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
@@ -119,6 +130,7 @@ export function planTables(rows, tenantColumns, grandfather = []) {
         tenantColumn: r.column,
         rlsEnabled: r.rls_enabled === true || r.rls_enabled === 't',
         rlsForced: r.rls_forced === true || r.rls_forced === 't',
+        policyCount: r.policy_count == null ? null : Number(r.policy_count),
         prio,
       });
     }
@@ -145,54 +157,115 @@ export function tenantRowCountSql(schema, table, column, tenantId) {
   return { text, values: [tenantId] };
 }
 
+/**
+ * Privileged per-tenant row counts, so a write probe can tell "wrote my own
+ * rows" from "wrote another tenant's rows". Returns { text, values:[a,b] }.
+ */
+export function tenantCountsSql(schema, table, column, tenantA, tenantB) {
+  const c = quoteIdent(column);
+  const text =
+    `select count(*) filter (where ${c}::text = $1)::int as own_a, ` +
+    `count(*) filter (where ${c}::text = $2)::int as own_b ` +
+    `from ${qualified(schema, table)}`;
+  return { text, values: [tenantA, tenantB] };
+}
+
+/**
+ * Write probe — UPDATE the WHOLE table, reassigning the tenant column to the
+ * ACTING tenant (`$1`). Deliberately has NO WHERE clause: a WHERE would have to
+ * *read* rows, and a correct SELECT policy would then mask the write (the exact
+ * trap where reads look isolated but writes aren't). With no WHERE it affects
+ * every row the UPDATE policy lets this tenant touch; compare that to the
+ * tenant's own row count — a higher number means it can rewrite (even steal)
+ * other tenants' rows. Runs in a rolled-back savepoint; nothing persists.
+ */
+export function updateProbeSql(schema, table, column, actingTenantId) {
+  const c = quoteIdent(column);
+  return { text: `update ${qualified(schema, table)} set ${c} = $1`, values: [actingTenantId] };
+}
+
+/**
+ * Write probe — DELETE the WHOLE table (no WHERE, same masking reason as above).
+ * DELETE policies carry only a USING clause, so this cleanly measures how many
+ * rows this tenant can delete; more than it owns is a delete leak. Rolled back.
+ */
+export function deleteProbeSql(schema, table) {
+  return { text: `delete from ${qualified(schema, table)}`, values: [] };
+}
+
 /** Expand the becomeTenant templates into { text, values } for a tenant id. */
 export function buildBecomeTenant(templates, tenantId) {
   return templates.map((text) => ({ text, values: [tenantId] }));
 }
 
-/** Is a caught error a Postgres "permission denied" (42501)? Then the role simply can't read — safe. */
+/**
+ * Did a caught error mean the write/read was BLOCKED by the database rather than
+ * a real failure? Covers "permission denied" and "new row violates row-level
+ * security policy" — both SQLSTATE 42501. A blocked write is a SAFE outcome.
+ */
 export function isPermissionDenied(err) {
   if (!err) return false;
   if (err.code === '42501') return true;
-  return /permission denied/i.test(err.message || '');
+  return /permission denied|violates row-level security/i.test(err.message || '');
 }
 
 /**
- * Turn one table's measurements into a verdict.
- * @returns {{ status: 'isolated'|'leak'|'insufficient-data'|'over-restrictive'|'no-access', message: string, fix?: string }}
+ * Turn one table's measurements into a verdict. A table can leak on the READ
+ * path (SELECT) and/or the WRITE path (UPDATE/DELETE) independently, because
+ * Postgres RLS is per-command — so a 'leak' verdict carries a `leaks[]` array,
+ * one entry per kind, and the caller emits a violation for each.
+ * @returns {{ status:'isolated'|'leak'|'no-policy'|'insufficient-data'|'over-restrictive'|'no-access', message?:string, leaks?:Array<{kind:'read'|'write',message:string,fix:string}> }}
  */
-export function classifyTableResult({ rlsEnabled, ownVisible, crossVisible, tenantCount, noAccess }) {
+export function classifyTableResult({ rlsEnabled, policyCount, ownVisible, crossVisible, writeAffected = 0, tenantCount, noAccess, probedWrites = false }) {
   if (noAccess) {
-    return {
-      status: 'no-access',
-      message: `role cannot read this table at all (no SELECT grant) — nothing to prove`,
-    };
+    return { status: 'no-access', message: `role cannot read this table at all (no SELECT grant) — nothing to prove` };
   }
   if (tenantCount < 2) {
+    return { status: 'insufficient-data', message: `only ${tenantCount} tenant(s) of data present — cannot prove cross-tenant isolation until two tenants exist` };
+  }
+  // RLS on but ZERO policies of any kind => Postgres denies every row to the app
+  // role. That reads exactly like isolation (tenant B sees nothing) but the
+  // table is unfinished — the moment someone adds a permissive policy it leaks.
+  // Detect it explicitly from the catalog rather than inferring from empty reads.
+  if (rlsEnabled === true && policyCount === 0) {
     return {
-      status: 'insufficient-data',
-      message: `only ${tenantCount} tenant(s) of data present — cannot prove cross-tenant isolation until two tenants exist`,
+      status: 'no-policy',
+      message:
+        `RLS is ENABLED but this table has NO policy — Postgres then denies all rows to your app role, which looks identical to correct isolation but means the table is unfinished (and unreadable by the app if it shouldn't be). Isolation is NOT proven here; add a tenant policy or drop RLS if the table is intentionally locked to the service role.`,
     };
   }
+
+  const leaks = [];
   if (crossVisible > 0) {
     const cause = rlsEnabled
-      ? `a policy is permissive or missing the tenant predicate`
+      ? `a SELECT policy is permissive or missing the tenant predicate`
       : `ROW LEVEL SECURITY is not enabled on this table`;
-    return {
-      status: 'leak',
-      message: `tenant A's session read ${crossVisible} row(s) belonging to tenant B — ${cause}`,
+    leaks.push({
+      kind: 'read',
+      message: `tenant A's session READ ${crossVisible} row(s) belonging to tenant B — ${cause}`,
       fix: rlsEnabled
-        ? `Fix the policy so it scopes by the tenant column, e.g. USING (${'{col}'} = current_setting('app.current_tenant')). Re-run: it must show 0 cross-tenant rows.`
-        : `Enable + force RLS and add a tenant policy:\n  ALTER TABLE ${'{tbl}'} ENABLE ROW LEVEL SECURITY;\n  ALTER TABLE ${'{tbl}'} FORCE ROW LEVEL SECURITY;\n  CREATE POLICY tenant_isolation ON ${'{tbl}'} USING (${'{col}'} = current_setting('app.current_tenant'));`,
-    };
+        ? `Scope the read policy by the tenant column, e.g. USING ({col} = current_setting('app.current_tenant')).`
+        : `Enable RLS and add a tenant policy:\n  ALTER TABLE {tbl} ENABLE ROW LEVEL SECURITY;\n  ALTER TABLE {tbl} FORCE ROW LEVEL SECURITY;\n  CREATE POLICY tenant_isolation ON {tbl} USING ({col} = current_setting('app.current_tenant'));`,
+    });
   }
+  if (writeAffected > 0) {
+    leaks.push({
+      kind: 'write',
+      message: `tenant A's session WROTE to ${writeAffected} row(s) belonging to tenant B (UPDATE/DELETE) — RLS is per-command, so a correct SELECT policy does not protect writes`,
+      fix: `Add write coverage — a FOR ALL policy, or explicit UPDATE/DELETE policies, scoped by the tenant column:\n  CREATE POLICY tenant_all ON {tbl} FOR ALL\n    USING ({col} = current_setting('app.current_tenant'))\n    WITH CHECK ({col} = current_setting('app.current_tenant'));`,
+    });
+  }
+  if (leaks.length) return { status: 'leak', leaks };
+
   if (ownVisible === 0) {
-    return {
-      status: 'over-restrictive',
-      message: `the tenant session sees none of its own rows either — likely the role/becomeTenant config doesn't match your policies (not a leak, but this table wasn't actually proven)`,
-    };
+    return { status: 'over-restrictive', message: `the tenant session sees none of its own rows either — likely the role/becomeTenant config doesn't match your policies (not a leak, but this table wasn't actually proven)` };
   }
-  return { status: 'isolated', message: `isolated — tenant session sees its own rows and zero of the other tenant's` };
+  return {
+    status: 'isolated',
+    message: probedWrites
+      ? `isolated — tenant session can neither read nor write the other tenant's rows`
+      : `isolated — tenant session sees its own rows and zero of the other tenant's`,
+  };
 }
 
 // ── async orchestration ──────────────────────────────────────────────
@@ -236,11 +309,18 @@ export async function prove({ query, config = {} }) {
 
   await query('begin', []);
   try {
-    // Pass 1 — PRIVILEGED: sample the tenant ids present in each table.
+    // Pass 1 — PRIVILEGED: sample the tenant ids present in each table, plus the
+    // per-tenant row counts a write probe needs to tell own rows from others'.
     for (const t of plan) {
       try {
         const d = distinctTenantsSql(t.schema, t.table, t.tenantColumn, cfg.sampleLimit);
         t.tenants = (await q(d.text, d.values)).map((r) => r.t);
+        if (t.tenants.length >= 2) {
+          const cnt = tenantCountsSql(t.schema, t.table, t.tenantColumn, t.tenants[0], t.tenants[1]);
+          const row = (await q(cnt.text, cnt.values))[0];
+          t.ownA = row.own_a;
+          t.ownB = row.own_b;
+        }
       } catch (err) {
         t.introspectError = err.message;
         t.tenants = [];
@@ -249,6 +329,29 @@ export async function prove({ query, config = {} }) {
 
     // Pass 2 — RESTRICTED: assume the app role and prove isolation per table.
     await query(`set local role ${role}`, []);
+    const probedWrites = cfg.probeWrites !== false;
+
+    // Run one mutating statement inside a savepoint, read the affected-row count,
+    // then ROLLBACK TO SAVEPOINT + RELEASE so nothing changes even within this
+    // (already rolled-back) transaction — and so later probes see intact data.
+    // Any block or error counts as 0 affected: conservative, never invents a leak.
+    const probeWrite = async (sql, values) => {
+      await query('savepoint tg_w', []);
+      try {
+        const res = await query(sql, values);
+        const affected = res.rowCount ?? res.affectedRows ?? 0;
+        await query('rollback to savepoint tg_w', []);
+        await query('release savepoint tg_w', []);
+        return affected;
+      } catch {
+        try {
+          await query('rollback to savepoint tg_w', []);
+          await query('release savepoint tg_w', []);
+        } catch { /* ignore */ }
+        return 0;
+      }
+    };
+
     for (const t of plan) {
       if (t.introspectError) {
         notes.push({ where: `${t.schema}.${t.table}`, message: `could not sample tenants: ${t.introspectError}` });
@@ -256,8 +359,7 @@ export async function prove({ query, config = {} }) {
       }
       if (t.tenants.length < 2) {
         scanned++;
-        const verdict = classifyTableResult({ rlsEnabled: t.rlsEnabled, tenantCount: t.tenants.length, ownVisible: 0, crossVisible: 0 });
-        notes.push({ where: `${t.schema}.${t.table}`, message: verdict.message });
+        notes.push({ where: `${t.schema}.${t.table}`, message: classifyTableResult({ rlsEnabled: t.rlsEnabled, policyCount: t.policyCount, tenantCount: t.tenants.length, ownVisible: 0, crossVisible: 0 }).message });
         continue;
       }
       const [tenantA, tenantB] = t.tenants;
@@ -267,18 +369,33 @@ export async function prove({ query, config = {} }) {
       let probeError = null;
       let ownVisible = 0;
       let crossVisible = 0;
+      let writeAffected = 0;
       try {
-        // become tenant A, look for tenant B's rows (and confirm A sees its own)
+        // become tenant A: read own + the other tenant's rows, then try to write theirs
         for (const s of buildBecomeTenant(cfg.becomeTenant, tenantA)) await query(s.text, s.values);
-        const own = tenantRowCountSql(t.schema, t.table, t.tenantColumn, tenantA);
-        const cross = tenantRowCountSql(t.schema, t.table, t.tenantColumn, tenantB);
-        ownVisible = (await q(own.text, own.values))[0].n;
-        crossVisible = (await q(cross.text, cross.values))[0].n;
+        const ownA = tenantRowCountSql(t.schema, t.table, t.tenantColumn, tenantA);
+        const crossB = tenantRowCountSql(t.schema, t.table, t.tenantColumn, tenantB);
+        ownVisible = (await q(ownA.text, ownA.values))[0].n;
+        crossVisible = (await q(crossB.text, crossB.values))[0].n;
+        if (probedWrites) {
+          // as tenant A: reassign / delete the whole table; anything beyond A's
+          // own rows means A can write another tenant's rows.
+          const uA = updateProbeSql(t.schema, t.table, t.tenantColumn, tenantA);
+          const dA = deleteProbeSql(t.schema, t.table);
+          const affA = Math.max(await probeWrite(uA.text, uA.values), await probeWrite(dA.text, dA.values));
+          writeAffected = Math.max(writeAffected, affA - t.ownA);
+        }
 
-        // reverse direction: become tenant B, look for tenant A's rows
+        // reverse direction: become tenant B, check reading/writing A's rows
         for (const s of buildBecomeTenant(cfg.becomeTenant, tenantB)) await query(s.text, s.values);
-        const crossRev = tenantRowCountSql(t.schema, t.table, t.tenantColumn, tenantA);
-        crossVisible = Math.max(crossVisible, (await q(crossRev.text, crossRev.values))[0].n);
+        const crossA = tenantRowCountSql(t.schema, t.table, t.tenantColumn, tenantA);
+        crossVisible = Math.max(crossVisible, (await q(crossA.text, crossA.values))[0].n);
+        if (probedWrites) {
+          const uB = updateProbeSql(t.schema, t.table, t.tenantColumn, tenantB);
+          const dB = deleteProbeSql(t.schema, t.table);
+          const affB = Math.max(await probeWrite(uB.text, uB.values), await probeWrite(dB.text, dB.values));
+          writeAffected = Math.max(writeAffected, affB - t.ownB);
+        }
       } catch (err) {
         if (isPermissionDenied(err)) noAccess = true;
         else probeError = err.message; // e.g. a becomeTenant config error — don't crash the whole proof
@@ -297,16 +414,20 @@ export async function prove({ query, config = {} }) {
         continue;
       }
 
-      const verdict = classifyTableResult({ rlsEnabled: t.rlsEnabled, ownVisible, crossVisible, tenantCount: t.tenants.length, noAccess });
+      const verdict = classifyTableResult({ rlsEnabled: t.rlsEnabled, policyCount: t.policyCount, ownVisible, crossVisible, writeAffected, tenantCount: t.tenants.length, noAccess, probedWrites });
       const tbl = qualified(t.schema, t.table);
       if (verdict.status === 'leak') {
-        violations.push({
-          where: `${t.schema}.${t.table} (${t.tenantColumn})`,
-          message: verdict.message,
-          fix: (verdict.fix || '').split('{col}').join(quoteIdent(t.tenantColumn)).split('{tbl}').join(tbl),
-          crossVisible,
-          rlsEnabled: t.rlsEnabled,
-        });
+        for (const leak of verdict.leaks) {
+          violations.push({
+            where: `${t.schema}.${t.table} (${t.tenantColumn})`,
+            kind: leak.kind,
+            message: leak.message,
+            fix: leak.fix.split('{col}').join(quoteIdent(t.tenantColumn)).split('{tbl}').join(tbl),
+            crossVisible,
+            writeAffected,
+            rlsEnabled: t.rlsEnabled,
+          });
+        }
       } else if (verdict.status === 'isolated') {
         provenCount++;
       } else {
@@ -327,8 +448,8 @@ export async function prove({ query, config = {} }) {
     scanned,
     summary:
       violations.length === 0
-        ? `${Math.max(proven, 0)}/${scanned} tenant table(s) proven isolated` + (notes.length ? `; ${notes.length} not proven (see notes)` : '')
-        : `${violations.length} table(s) leak across tenants`,
+        ? `${Math.max(proven, 0)}/${scanned} tenant table(s) proven isolated (read + write)` + (notes.length ? `; ${notes.length} not proven (see notes)` : '')
+        : `${violations.length} cross-tenant leak(s) across ${new Set(violations.map((v) => v.where)).size} table(s)`,
   };
 }
 

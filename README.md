@@ -73,7 +73,7 @@ tenant-guard  — guard tests for multi-tenant isolation
 | `route-org-scoping` | an authenticated route filters by a bare `id` and never mentions a tenant column | catches the *shape* of the IDOR (auth + bare-id + no-tenant), and it lives in your CI so it blocks the merge instead of adding one more report |
 | `definer-grants` | a new mutating `SECURITY DEFINER` function isn't revoked from `PUBLIC`/`anon` | requires knowing Postgres default grants + PostgREST exposure interact — *revoking from `anon` alone is a no-op* |
 | `migration-collisions` | two migrations share a numeric prefix | a project-specific CI invariant (your numbering scheme), not a code smell |
-| `rls-proof` *(runtime)* | a tenant's session can actually read another tenant's rows | it isn't reading source at all — it runs a real query as your app role and measures the leak; nothing static can prove isolation *holds* |
+| `rls-proof` *(runtime)* | a tenant's session can actually read **or write** another tenant's rows | it isn't reading source at all — it runs real queries as your app role (SELECT + UPDATE/DELETE probes) and measures the leak; nothing static can prove isolation *holds*, and RLS is per-command so reads passing says nothing about writes |
 
 `npx tenant-guard list` describes each.
 
@@ -117,11 +117,14 @@ seeded test database it:
 2. as the privileged role (which bypasses RLS, like Supabase `service_role`)
    picks two real tenant ids that already have data;
 3. drops to your **non-superuser app role** (e.g. `authenticated`), assumes
-   tenant A's identity, and asserts A's session sees **zero** of tenant B's
-   rows — then checks the other direction.
+   tenant A's identity, and asserts A's session can neither **read nor write**
+   tenant B's rows — SELECT, plus `UPDATE`/`DELETE` probes — then checks the
+   other direction.
 
-If RLS is off, or a policy is `USING (true)`, or a policy forgot the tenant
-predicate, tenant A sees tenant B's rows and the proof **fails your build**.
+If RLS is off, a policy is `USING (true)`, a policy forgot the tenant predicate,
+**the write path is unprotected** (RLS is per-command — a correct `SELECT` policy
+does not cover `UPDATE`/`DELETE`), or **RLS is on with no policy at all** (a
+deny-all that only *looks* isolated), the proof names it and **fails your build**.
 
 See it catch a real leak with zero infrastructure:
 
@@ -138,9 +141,11 @@ export TENANT_GUARD_DATABASE_URL="postgres://…/your_test_db"
 npx tenant-guard prove
 ```
 
-It only ever runs `SELECT`s, inside a transaction it rolls back — non-destructive
-by construction. A skip (no database, or `pg` not installed) is **not** a pass,
-and the CLI says so. Full setup — including the Supabase JWT-claim config — is in
+It runs read probes plus `UPDATE`/`DELETE` write probes, each inside a `SAVEPOINT`
+that is rolled back, and the whole run is one transaction that is rolled back —
+non-destructive by construction (set `probeWrites: false` to test reads only). A
+skip (no database, or `pg` not installed) is **not** a pass, and the CLI says so.
+Full setup — including the Supabase JWT-claim config — is in
 [`examples/rls-proof/`](examples/rls-proof/README.md).
 
 ## Why not just a SAST scanner?

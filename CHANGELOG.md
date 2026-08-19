@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.1.3
+
+The runtime proof (`rls-proof`) now tests the **write path**, not just reads —
+prompted by sharp reviewer feedback that the leaks that actually bite are on
+`UPDATE`.
+
+- **feat(rls-proof): write-path proving.** As each tenant, the proof now probes
+  `UPDATE`/`DELETE` of other tenants' rows and reports a **write leak** when they
+  succeed — a distinct violation from a read leak. RLS is per-command, so a
+  correct `SELECT` policy can leave `UPDATE`/`DELETE` wide open; this catches it.
+  Each write probe runs in a `SAVEPOINT` that is rolled back inside the
+  already-rolled-back transaction, so it stays non-destructive. Toggle with
+  `probeWrites` (default `true`).
+  - The probe deliberately uses whole-table `UPDATE`/`DELETE` with **no `WHERE`**
+    and compares the affected-row count to the tenant's own: a `WHERE tenant =
+    'other'` probe is *masked* by a correct read policy (you can't target rows
+    you can't see), which would hide the very leak we're hunting.
+- **feat(rls-proof): name the RLS-on-no-policy trap.** A table with RLS enabled
+  and **no policy** denies every row — which looks exactly like isolation but is
+  really an unfinished table. It's now detected from `pg_policy` and reported
+  explicitly (`no policy`) instead of passing silently or as a vague note.
+- **docs:** README, METHODOLOGY, and the rls-proof example updated; the demo gains
+  a third scenario — reads correctly scoped, `UPDATE` wide open — the exact case
+  a SELECT-only test misses.
+- 61 tests (was 48).
+
 ## 0.1.2
 
 Docs only — no code changes since 0.1.1.

@@ -15,6 +15,9 @@ import {
   planTables,
   distinctTenantsSql,
   tenantRowCountSql,
+  tenantCountsSql,
+  updateProbeSql,
+  deleteProbeSql,
   buildBecomeTenant,
   isPermissionDenied,
   classifyTableResult,
@@ -56,6 +59,42 @@ test('distinctTenantsSql / tenantRowCountSql: quote idents, bind values, cast to
   assert.match(c.text, /count\(\*\)/);
   assert.match(c.text, /"organization_id"::text = \$1/);
   assert.deepEqual(c.values, ['org_B']); // value bound, not interpolated
+});
+
+test('introspectionSql: also asks for a per-table policy count (to catch RLS-on-no-policy)', () => {
+  const { text } = introspectionSql(['public'], ['organization_id']);
+  assert.match(text, /pg_policy/);
+  assert.match(text, /policy_count/);
+});
+
+test('planTables: carries the policy count through', () => {
+  const rows = [{ schema: 'public', table: 't', column: 'organization_id', rls_enabled: true, rls_forced: false, policy_count: 0 }];
+  const plan = planTables(rows, ['organization_id']);
+  assert.equal(plan[0].policyCount, 0);
+});
+
+test('write probes: whole-table UPDATE/DELETE with NO WHERE (to dodge SELECT masking)', () => {
+  const u = updateProbeSql('public', 'invoices', 'organization_id', 'org_A');
+  assert.match(u.text, /^update "public"\."invoices" set "organization_id" = \$1$/);
+  assert.deepEqual(u.values, ['org_A']); // sets the tenant column to the ACTING tenant (steal probe)
+  assert.doesNotMatch(u.text, /where/i); // a WHERE would be masked by a correct read policy
+
+  const d = deleteProbeSql('public', 'invoices');
+  assert.match(d.text, /^delete from "public"\."invoices"$/);
+  assert.deepEqual(d.values, []);
+  assert.doesNotMatch(d.text, /where/i);
+});
+
+test('tenantCountsSql: privileged per-tenant counts, bound as $1/$2', () => {
+  const c = tenantCountsSql('public', 'invoices', 'organization_id', 'org_A', 'org_B');
+  assert.match(c.text, /own_a/);
+  assert.match(c.text, /own_b/);
+  assert.match(c.text, /"organization_id"::text = \$1/);
+  assert.deepEqual(c.values, ['org_A', 'org_B']);
+});
+
+test('isPermissionDenied: also treats a WITH CHECK violation (blocked write) as blocked/safe', () => {
+  assert.equal(isPermissionDenied({ message: 'new row violates row-level security policy for table "invoices"' }), true);
 });
 
 test('buildBecomeTenant: one statement per template, tenant id bound as $1', () => {
@@ -103,18 +142,47 @@ test('classify: sees own rows, none of the other tenant -> isolated (pass)', () 
   assert.equal(v.status, 'isolated');
 });
 
-test('classify: sees the other tenant with RLS on -> leak (permissive policy)', () => {
+test('classify: READS the other tenant with RLS on -> read leak (permissive policy)', () => {
   const v = classifyTableResult({ rlsEnabled: true, ownVisible: 5, crossVisible: 3, tenantCount: 2 });
   assert.equal(v.status, 'leak');
-  assert.match(v.message, /permissive or missing the tenant predicate/);
-  assert.match(v.fix, /current_setting/);
+  assert.equal(v.leaks.length, 1);
+  assert.equal(v.leaks[0].kind, 'read');
+  assert.match(v.leaks[0].message, /permissive or missing the tenant predicate/);
+  assert.match(v.leaks[0].fix, /current_setting/);
 });
 
-test('classify: sees the other tenant with RLS off -> leak (RLS disabled = the CVE case)', () => {
+test('classify: READS the other tenant with RLS off -> read leak (RLS disabled = the CVE case)', () => {
   const v = classifyTableResult({ rlsEnabled: false, ownVisible: 5, crossVisible: 3, tenantCount: 2 });
   assert.equal(v.status, 'leak');
-  assert.match(v.message, /ROW LEVEL SECURITY is not enabled/);
-  assert.match(v.fix, /ENABLE ROW LEVEL SECURITY/);
+  assert.equal(v.leaks[0].kind, 'read');
+  assert.match(v.leaks[0].message, /ROW LEVEL SECURITY is not enabled/);
+  assert.match(v.leaks[0].fix, /ENABLE ROW LEVEL SECURITY/);
+});
+
+test('classify: WRITES the other tenant (reads clean) -> write leak (per-command RLS gap)', () => {
+  const v = classifyTableResult({ rlsEnabled: true, ownVisible: 5, crossVisible: 0, writeAffected: 2, tenantCount: 2, probedWrites: true });
+  assert.equal(v.status, 'leak');
+  assert.equal(v.leaks.length, 1);
+  assert.equal(v.leaks[0].kind, 'write');
+  assert.match(v.leaks[0].message, /WROTE to 2 row/);
+  assert.match(v.leaks[0].fix, /FOR ALL|WITH CHECK/);
+});
+
+test('classify: reads AND writes the other tenant -> two leaks (read + write)', () => {
+  const v = classifyTableResult({ rlsEnabled: true, ownVisible: 5, crossVisible: 3, writeAffected: 1, tenantCount: 2, probedWrites: true });
+  assert.equal(v.status, 'leak');
+  assert.deepEqual(v.leaks.map((l) => l.kind).sort(), ['read', 'write']);
+});
+
+test('classify: RLS enabled but zero policies -> no-policy (deny-all that only looks isolated)', () => {
+  const v = classifyTableResult({ rlsEnabled: true, policyCount: 0, ownVisible: 0, crossVisible: 0, tenantCount: 2 });
+  assert.equal(v.status, 'no-policy');
+  assert.match(v.message, /NO policy/);
+});
+
+test('classify: no-access takes precedence over no-policy (can\'t even SELECT)', () => {
+  const v = classifyTableResult({ noAccess: true, rlsEnabled: true, policyCount: 0, tenantCount: 2, ownVisible: 0, crossVisible: 0 });
+  assert.equal(v.status, 'no-access');
 });
 
 test('classify: fewer than two tenants -> insufficient-data (not a failure)', () => {

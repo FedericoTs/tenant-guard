@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.13.0
+
+The last surface on the threat model this tool could not reach: **Supabase
+Storage** (5.1/5.2). It needed a genuinely new capability rather than a reuse of
+existing machinery — storage has **no tenant column**.
+
+- **feat: new guard `storage-isolation`** (`tenant-guard storage`). Tenancy in
+  storage lives in the object **path** (`org_A/invoices/q1.pdf`), so the tenant is
+  an *expression* over `name` rather than a column. That single difference is why
+  every other guard here was blind to it.
+  - **Tenant-expression support**, via `split_part(name, '/', N)` — deliberately
+    *not* Supabase's `storage.foldername()`, so the same SQL also runs on vanilla
+    Postgres and the guard is testable without a Supabase instance. The segment is
+    validated as a bounded integer, never interpolated as a string.
+  - **The upload path-hop.** The client supplies the object name on upload, so an
+    INSERT policy that doesn't pin the tenant segment lets a user write straight
+    into another tenant's folder — overwriting or planting files — no matter how
+    correct the read policy is. The probe has a **control arm**: it first uploads
+    into its *own* folder, so a refusal elsewhere is never miscredited to tenant
+    scoping when the session simply can't upload at all.
+  - **Public buckets.** `storage.buckets.public = true` serves
+    `/storage/v1/object/public/…` with no auth and **no RLS evaluated at all**;
+    "the path is unguessable" is not a boundary. Flagged when the bucket holds
+    objects under two or more tenant folders — a single-folder asset bucket
+    (logos, marketing) is not. Stated as a **catalog fact**, not claimed as probed:
+    the CDN behaviour lives in the Storage service, not in Postgres.
+  - Also flags RLS disabled outright on `storage.objects`, and **skips cleanly on
+    non-Supabase databases** so nobody is punished for a surface they don't have.
+- 231 tests (was 210).
+
 ## 0.12.0
 
 Threat-model **3.8**, and it rhymes with 0.11.0: the policy is right, the thing it

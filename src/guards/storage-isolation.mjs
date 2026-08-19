@@ -1,0 +1,390 @@
+/**
+ * Guard: tenant isolation in Supabase Storage.
+ *
+ * Every other guard here answers "which tenant owns this row?" by reading a
+ * tenant COLUMN. Storage doesn't have one. `storage.objects` keys tenancy off the
+ * object **path** — `org_A/invoices/q1.pdf` — so the tenant is an *expression*
+ * over `name`, and policies are written as
+ * `(storage.foldername(name))[1] = auth.uid()::text`. That single difference is
+ * why storage was the last thing on the threat model this tool could not reach.
+ *
+ * Two consequences make it worth its own guard rather than a config knob:
+ *
+ *   • **The client picks the path.** On upload the caller supplies `name`, so if
+ *     the INSERT policy doesn't pin the first segment, a user writes straight into
+ *     another tenant's folder — the same tenant-hop as `SET org_id = <other>`,
+ *     one layer up. Nothing about a correct *read* policy prevents it.
+ *
+ *   • **A public bucket has no RLS at all.** `storage.buckets.public = true` serves
+ *     `/storage/v1/object/public/<bucket>/<path>` with no auth and no policy
+ *     evaluation. "The path is unguessable" is not a tenant boundary; it is
+ *     security through obscurity with a CDN in front of it.
+ *
+ * `storage.objects` itself IS a normal RLS-guarded table, so reads and writes are
+ * probed for real, as your app role, inside a rolled-back transaction. The bucket
+ * flag is read from the catalog and reported with that caveat stated — the CDN
+ * behaviour is in the Storage service, not in Postgres, so it is named as a
+ * catalog fact rather than claimed as probed.
+ *
+ * Skips cleanly when there is no `storage` schema, so non-Supabase projects are
+ * never punished for a surface they don't have.
+ */
+import {
+  safeRole,
+  buildBecomeTenant,
+  isPermissionDenied,
+  isRlsCheckViolation,
+  applyClaimShortcut,
+  DEFAULTS as PROOF_DEFAULTS,
+} from './rls-proof.mjs';
+
+export const meta = {
+  id: 'storage-isolation',
+  title: 'Supabase Storage tenant isolation (object paths, not columns)',
+  why: "Storage keys tenancy off the object PATH, not a column, and the client chooses that path on upload — so a read policy can be perfect while any user writes into another tenant's folder. Also flags public buckets holding multi-tenant objects, which are served with no auth and no RLS at all.",
+};
+
+export const DEFAULTS = {
+  urlEnv: 'TENANT_GUARD_DATABASE_URL',
+  role: PROOF_DEFAULTS.role,
+  becomeTenant: PROOF_DEFAULTS.becomeTenant,
+  claim: null,
+  // Which path segment identifies the tenant: `org_A/invoices/q1.pdf` => 1.
+  pathSegment: 1,
+  buckets: null, // null = every bucket; or ["docs", "invoices"]
+  allowlist: [], // bucket ids that are intentionally public/shared (a CDN asset bucket)
+  sampleLimit: 3,
+  probeWrites: true,
+};
+
+/** The filename tenant-guard would upload; never committed. */
+export const PROBE_OBJECT = '.tenant-guard-probe';
+
+// ── pure helpers (unit-tested, no I/O) ───────────────────────────────
+
+/** Is this a Supabase project at all? */
+export function storagePresentSql() {
+  return {
+    text: `select count(*)::int as n
+             from pg_catalog.pg_class c
+             join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+            where n.nspname = 'storage' and c.relname in ('objects', 'buckets')`,
+    values: [],
+  };
+}
+
+/**
+ * The tenant EXPRESSION over an object path. This is the whole reason storage
+ * needed its own guard: there is no tenant column to compare, so the tenant is
+ * computed from `name`. `split_part` is used rather than Supabase's
+ * `storage.foldername()` so the same SQL runs on vanilla Postgres.
+ */
+export function tenantExpr(pathSegment) {
+  const seg = Number(pathSegment);
+  if (!Number.isInteger(seg) || seg < 1 || seg > 10) {
+    throw new Error(`unsafe path segment: ${JSON.stringify(pathSegment)} (expected an integer 1-10)`);
+  }
+  return `split_part(name, '/', ${seg})`;
+}
+
+/** RLS status of storage.objects. */
+export function objectsRlsSql() {
+  return {
+    text: `select c.relrowsecurity as rls_enabled,
+                  (select count(*) from pg_catalog.pg_policy p where p.polrelid = c.oid)::int as policy_count
+             from pg_catalog.pg_class c
+             join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+            where n.nspname = 'storage' and c.relname = 'objects'`,
+    values: [],
+  };
+}
+
+/** Buckets, with the public flag and how many distinct tenant folders they hold. */
+export function bucketsSql(pathSegment) {
+  const expr = tenantExpr(pathSegment);
+  return {
+    text: `select b.id,
+                  b.public as is_public,
+                  (select count(distinct ${expr})::int
+                     from storage.objects o
+                    where o.bucket_id = b.id and o.name like '%/%') as tenant_folders,
+                  (select count(*)::int from storage.objects o where o.bucket_id = b.id) as object_count
+             from storage.buckets b
+            order by b.id`,
+    values: [],
+  };
+}
+
+/** Distinct tenant folders in a bucket (privileged — sees everything). */
+export function distinctFoldersSql(pathSegment, limit) {
+  const expr = tenantExpr(pathSegment);
+  return {
+    text: `select distinct ${expr} as t
+             from storage.objects
+            where bucket_id = $1 and name like '%/%'
+            order by 1
+            limit $2`,
+    values: null, // caller supplies [bucketId, limit]
+    limit,
+  };
+}
+
+/** How many objects under a given tenant folder the CURRENT session can see. */
+export function folderObjectCountSql(pathSegment) {
+  const expr = tenantExpr(pathSegment);
+  return {
+    text: `select count(*)::int as n from storage.objects where bucket_id = $1 and ${expr} = $2`,
+  };
+}
+
+/** Upload probe: create an object inside `folder` — the path the CLIENT chooses. */
+export function uploadProbeSql() {
+  return { text: `insert into storage.objects (bucket_id, name) values ($1, $2)` };
+}
+
+/**
+ * Verdict for one bucket.
+ * @returns {{status:'leak'|'isolated'|'insufficient-data'|'no-access', kind?:string, message?:string, fix?:string}}
+ */
+export function classifyBucket({ bucket, isPublic, tenantFolders, crossVisible, uploadedIntoOther, ownUploadWorked, noAccess, role = 'authenticated' }) {
+  if (isPublic && tenantFolders >= 2) {
+    return {
+      status: 'leak',
+      kind: 'public-bucket',
+      message: `bucket "${bucket}" is PUBLIC and holds objects under ${tenantFolders} different tenant folders. A public bucket is served at /storage/v1/object/public/${bucket}/<path> with NO auth and NO row-level security — policies are not consulted at all — so every tenant's files are readable by anyone who has or guesses the path. (Read from storage.buckets.public; the CDN behaviour itself is in the Storage service, not in Postgres, so this is a catalog fact rather than a probe result.)`,
+      fix:
+        `Make the bucket private and serve files through signed URLs:\n` +
+        `        UPDATE storage.buckets SET public = false WHERE id = '${bucket}';\n` +
+        `      then issue short-lived signed URLs (createSignedUrl) for downloads. If this bucket is genuinely public\n` +
+        `      (logos, marketing assets), add "${bucket}" to storageIsolation.allowlist[].`,
+    };
+  }
+  if (noAccess) return { status: 'no-access', message: `"${role}" cannot read storage.objects for bucket "${bucket}" at all — nothing exposed through it` };
+  if (tenantFolders < 2) return { status: 'insufficient-data', message: `bucket "${bucket}" holds objects under ${tenantFolders} tenant folder(s) — cannot prove cross-tenant isolation until two exist` };
+  if (crossVisible > 0) {
+    return {
+      status: 'leak',
+      kind: 'read',
+      message: `a session acting as one tenant listed ${crossVisible} object(s) inside ANOTHER tenant's folder in bucket "${bucket}" — the SELECT policy on storage.objects does not pin the tenant path segment, so users can enumerate (and download) each other's files`,
+      fix:
+        `Scope the read policy by the tenant path segment:\n` +
+        `        CREATE POLICY tenant_read ON storage.objects FOR SELECT\n` +
+        `          USING (bucket_id = '${bucket}' AND (storage.foldername(name))[1] = <the caller's tenant>);`,
+    };
+  }
+  if (uploadedIntoOther) {
+    return {
+      status: 'leak',
+      kind: 'write',
+      message: `a session acting as one tenant UPLOADED an object into ANOTHER tenant's folder in bucket "${bucket}". The client chooses the object path on upload, so unless the INSERT policy pins the tenant segment, any user can write into anyone's folder — overwriting or planting files. Reads being correctly scoped does not prevent this`,
+      fix:
+        `Pin the path on WRITE as well as read — INSERT is governed only by WITH CHECK:\n` +
+        `        CREATE POLICY tenant_write ON storage.objects FOR INSERT\n` +
+        `          WITH CHECK (bucket_id = '${bucket}' AND (storage.foldername(name))[1] = <the caller's tenant>);\n` +
+        `      Add matching UPDATE/DELETE policies, or a user can move and remove other tenants' objects too.`,
+    };
+  }
+  return { status: 'isolated', ownUploadWorked };
+}
+
+// ── async orchestration ──────────────────────────────────────────────
+
+const OK = (extra) => ({ id: meta.id, ok: true, violations: [], scanned: 0, notes: [], ...extra });
+
+export async function check({ query, config = {} }) {
+  const cfg = applyClaimShortcut({ ...DEFAULTS, ...config }, config);
+  const role = safeRole(cfg.role);
+  const q = async (text, values) => (await query(text, values)).rows;
+  const skip = new Set(cfg.allowlist);
+  const seg = cfg.pathSegment;
+  tenantExpr(seg); // validate early, before any I/O
+
+  const present = (await q(storagePresentSql().text, []))[0];
+  if (!present || present.n < 2) {
+    return OK({ skipped: true, reason: 'no Supabase storage schema (storage.objects / storage.buckets)', summary: 'skipped — no storage schema' });
+  }
+
+  const violations = [];
+  const notes = [];
+  let scanned = 0;
+  let proven = 0;
+
+  const rlsRow = (await q(objectsRlsSql().text, []))[0];
+  const rlsEnabled = rlsRow && (rlsRow.rls_enabled === true || rlsRow.rls_enabled === 't');
+  if (!rlsEnabled) {
+    violations.push({
+      where: 'storage.objects',
+      kind: 'read',
+      message: `ROW LEVEL SECURITY is not enabled on storage.objects — every object in every bucket is readable and writable by any role holding a grant, with no policy evaluated at all`,
+      fix: `ALTER TABLE storage.objects ENABLE ROW LEVEL SECURITY;\n      then add per-bucket policies pinning the tenant path segment for SELECT, INSERT, UPDATE and DELETE.`,
+    });
+  }
+
+  const bs = bucketsSql(seg);
+  let buckets = await q(bs.text, []);
+  if (Array.isArray(cfg.buckets)) buckets = buckets.filter((b) => cfg.buckets.includes(b.id));
+  buckets = buckets.filter((b) => !skip.has(b.id));
+  if (buckets.length === 0) {
+    return OK({ skipped: true, reason: 'no storage buckets to check', summary: 'skipped — no buckets', violations, notes });
+  }
+
+  await query('begin', []);
+  try {
+    // Negative control: the app role must actually be subject to RLS.
+    let canaryReady = false;
+    try {
+      await query('create temp table tg_storage_canary (x int)', []);
+      await query('insert into tg_storage_canary values (1)', []);
+      await query('alter table tg_storage_canary enable row level security', []);
+      await query('alter table tg_storage_canary force row level security', []);
+      await query(`grant select on tg_storage_canary to ${role}`, []);
+      canaryReady = true;
+    } catch (err) {
+      notes.push({ where: '(self-check)', message: `could not set up the RLS self-check canary (${err.message})` });
+    }
+
+    for (const b of buckets) {
+      scanned++;
+      const isPublic = b.is_public === true || b.is_public === 't';
+      const tenantFolders = Number(b.tenant_folders || 0);
+
+      // A public bucket is settled from the catalog — no probe can observe the
+      // CDN, and none is needed: RLS is not consulted for public reads.
+      if (isPublic && tenantFolders >= 2) {
+        const v = classifyBucket({ bucket: b.id, isPublic, tenantFolders, role });
+        violations.push({ where: `storage.buckets.${b.id}`, kind: v.kind, message: v.message, fix: v.fix });
+        continue;
+      }
+
+      if (tenantFolders < 2) {
+        notes.push({ where: `storage.objects (bucket "${b.id}")`, message: classifyBucket({ bucket: b.id, isPublic, tenantFolders, role }).message });
+        continue;
+      }
+
+      const df = distinctFoldersSql(seg, cfg.sampleLimit);
+      const folders = (await q(df.text, [b.id, cfg.sampleLimit])).map((r) => r.t);
+      if (folders.length < 2) {
+        notes.push({ where: `storage.objects (bucket "${b.id}")`, message: `could not sample two tenant folders in bucket "${b.id}"` });
+        continue;
+      }
+      const [folderA, folderB] = folders;
+
+      await query(`set local role ${role}`, []);
+      if (canaryReady) {
+        let seen = null;
+        try { seen = (await q('select count(*)::int as n from tg_storage_canary', []))[0].n; } catch { /* denied => enforced */ }
+        if (seen !== null && seen > 0) {
+          await query('reset role', []);
+          try { await query('rollback', []); } catch { /* ignore */ }
+          return {
+            id: meta.id, ok: false, notes, scanned,
+            violations: [{ where: `role "${role}"`, message: `identity self-check FAILED — "${role}" read a deny-all RLS table, so RLS is NOT enforced for it. Every "isolated" result would be a vacuous pass.`, fix: `Set the role to your non-superuser app role (e.g. "authenticated").` }],
+            summary: 'identity switch is not enforcing RLS — refusing to report a vacuous pass',
+          };
+        }
+      }
+
+      let noAccess = false;
+      let crossVisible = 0;
+      let uploadedIntoOther = false;
+      let ownUploadWorked = false;
+      let probeError = null;
+      try {
+        // Become tenant A, then look inside tenant B's folder.
+        for (const s of buildBecomeTenant(cfg.becomeTenant, folderA)) await query(s.text, s.values);
+        const cnt = folderObjectCountSql(seg);
+        crossVisible = (await q(cnt.text, [b.id, folderB]))[0].n;
+
+        // Reverse direction.
+        for (const s of buildBecomeTenant(cfg.becomeTenant, folderB)) await query(s.text, s.values);
+        crossVisible = Math.max(crossVisible, (await q(cnt.text, [b.id, folderA]))[0].n);
+
+        if (cfg.probeWrites !== false) {
+          // The upload path-hop. Control arm first: if this session cannot even
+          // upload into its OWN folder, a failure on the other folder proves
+          // nothing about tenant scoping — so we don't claim it does.
+          const up = uploadProbeSql();
+          ownUploadWorked = await probeUpload(query, up.text, [b.id, `${folderB}/${PROBE_OBJECT}`]);
+          if (ownUploadWorked) {
+            uploadedIntoOther = await probeUpload(query, up.text, [b.id, `${folderA}/${PROBE_OBJECT}`]);
+          }
+        }
+      } catch (err) {
+        if (isPermissionDenied(err)) noAccess = true;
+        else probeError = err.message;
+      }
+      await query('reset role', []);
+
+      if (probeError) {
+        notes.push({ where: `storage.objects (bucket "${b.id}")`, message: `could not probe — check role/becomeTenant: ${probeError}` });
+        continue;
+      }
+
+      const verdict = classifyBucket({ bucket: b.id, isPublic, tenantFolders, crossVisible, uploadedIntoOther, ownUploadWorked, noAccess, role });
+      if (verdict.status === 'leak') {
+        violations.push({ where: `storage.objects (bucket "${b.id}")`, kind: verdict.kind, message: verdict.message, fix: verdict.fix, crossVisible });
+      } else if (verdict.status === 'isolated') {
+        proven++;
+        if (cfg.probeWrites !== false && !ownUploadWorked) {
+          notes.push({ where: `storage.objects (bucket "${b.id}")`, message: `reads are proven isolated, but the upload probe was inconclusive — this session could not create an object even in its own folder, so the write path was not exercised. Grant the app role INSERT on storage.objects in a test database to prove it.` });
+        }
+      } else {
+        notes.push({ where: `storage.objects (bucket "${b.id}")`, message: verdict.message });
+      }
+    }
+  } finally {
+    try { await query('rollback', []); } catch { /* ignore */ }
+  }
+
+  return {
+    id: meta.id,
+    ok: violations.length === 0,
+    violations,
+    notes,
+    scanned,
+    summary:
+      violations.length > 0
+        ? `${violations.length} storage isolation issue(s) across ${scanned} bucket(s)`
+        : `${proven}/${scanned} storage bucket(s) proven isolated`,
+  };
+}
+
+/** One upload attempt in a rolled-back savepoint. True = the object was created. */
+async function probeUpload(query, text, values) {
+  await query('savepoint tg_up', []);
+  try {
+    const res = await query(text, values);
+    const affected = res.rowCount ?? res.affectedRows ?? 0;
+    await query('rollback to savepoint tg_up', []);
+    await query('release savepoint tg_up', []);
+    return affected > 0;
+  } catch (err) {
+    try { await query('rollback to savepoint tg_up', []); await query('release savepoint tg_up', []); } catch { /* ignore */ }
+    // An RLS/permission rejection is a real "no"; anything else (NOT NULL, FK)
+    // means we couldn't build a valid row, which is also a "no" for our purposes
+    // — the control arm is what distinguishes the two.
+    if (isRlsCheckViolation(err) || isPermissionDenied(err)) return false;
+    return false;
+  }
+}
+
+/** CLI/programmatic entry: resolve a connection, import `pg`, run the check. */
+export async function run(config = {}) {
+  const cfg = { ...DEFAULTS, ...config };
+  const url = cfg.url || process.env[cfg.urlEnv] || process.env.DATABASE_URL;
+  if (!url) return OK({ skipped: true, reason: `no database configured — set ${cfg.urlEnv} (or DATABASE_URL)`, summary: 'skipped — no database' });
+  let pg;
+  try {
+    pg = await import('pg');
+  } catch {
+    return OK({ skipped: true, reason: 'Postgres driver not installed — run `npm i -D pg`', summary: 'skipped — pg not installed' });
+  }
+  const Client = pg.default?.Client ?? pg.Client;
+  const client = new Client({ connectionString: url });
+  await client.connect();
+  try {
+    return await check({ query: (text, values) => client.query(text, values), config: cfg });
+  } finally {
+    await client.end();
+  }
+}

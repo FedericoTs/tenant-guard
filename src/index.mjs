@@ -14,20 +14,22 @@ import * as anonWrites from './guards/anon-writes.mjs';
 import * as anonReads from './guards/anon-reads.mjs';
 import * as viewIsolation from './guards/view-isolation.mjs';
 import * as identityTrust from './guards/identity-trust.mjs';
-import { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig } from './config.mjs';
+import * as storageIsolation from './guards/storage-isolation.mjs';
+import { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig, resolveStorageConfig } from './config.mjs';
 
 // The static guards: synchronous, zero-dependency, no database. These are what
 // `tenant-guard run` executes and what a project's vitest/jest suite imports.
 export const GUARDS = [migrationCollisions, definerGrants, routeOrgScoping];
 
-export { migrationCollisions, definerGrants, routeOrgScoping, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust };
+export { migrationCollisions, definerGrants, routeOrgScoping, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation };
 export { prove } from './guards/rls-proof.mjs';
 export { drift } from './guards/rls-drift.mjs';
 export { check as checkAnonWrites } from './guards/anon-writes.mjs';
 export { check as checkAnonReads } from './guards/anon-reads.mjs';
 export { check as checkViews } from './guards/view-isolation.mjs';
 export { check as checkIdentity } from './guards/identity-trust.mjs';
-export { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig } from './config.mjs';
+export { check as checkStorage } from './guards/storage-isolation.mjs';
+export { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig, resolveStorageConfig } from './config.mjs';
 
 /** Run every static guard against a resolved per-guard config map. Returns results[]. */
 export function runAll(cwd = process.cwd()) {
@@ -96,4 +98,14 @@ export async function runViews(cwd = process.cwd()) {
 export async function runIdentity(cwd = process.cwd()) {
   const config = loadConfig(cwd);
   return identityTrust.run(resolveIdentityTrustConfig(config));
+}
+
+/**
+ * Run the Supabase Storage isolation check (async; needs a database URL + `pg`).
+ * Storage keys tenancy off the object PATH rather than a column, and the client
+ * chooses that path on upload. Skips cleanly on non-Supabase databases.
+ */
+export async function runStorage(cwd = process.cwd()) {
+  const config = loadConfig(cwd);
+  return storageIsolation.run(resolveStorageConfig(config));
 }

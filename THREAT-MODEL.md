@@ -115,8 +115,8 @@ The highest-severity blind spot of any table-only scanner.
 
 | # | Failure | Status | How |
 |---|---|---|---|
-| 5.1 | `storage.objects` — tenancy lives in the **object path** or `owner`, not a column | 🔜 | the metadata table *is* RLS-guarded and probeable; needs tenant-**expression** support (path segment), not just a tenant column. Named as an honest limit in the README today |
-| 5.2 | `storage.buckets.public = true` — CDN serves objects with no auth and no RLS | 🟡→🔜 | the flag is a catalog read; the actual public GET is HTTP behaviour, outside SQL |
+| 5.1 | `storage.objects` — tenancy lives in the **object path** or `owner`, not a column | ✅ | `storage-isolation`. Tenant-**expression** support (`split_part(name,'/',N)` — deliberately not Supabase's `storage.foldername()`, so the same SQL runs on vanilla Postgres). Probes cross-tenant reads AND the **upload path-hop**: the client picks the object name on upload, so an unpinned INSERT policy lets a user write into another tenant's folder. The upload probe has a control arm — it first uploads into its OWN folder, so a refusal elsewhere is never miscredited to tenant scoping |
+| 5.2 | `storage.buckets.public = true` — CDN serves objects with no auth and no RLS | ✅ | `storage-isolation` fails a public bucket that holds objects under **two or more tenant folders**. The flag is a catalog read and the message says so — the public GET is HTTP behaviour in the Storage service, so it is reported as a catalog fact, not claimed as probed. A single-folder public bucket (logos, assets) is not flagged |
 | 5.3 | Realtime `postgres_changes` streams rows to subscribers | 🟡 | delivery is gated by the **SELECT policy**, which §2 already proves; naming it explicitly (publication membership + permissive policy) is 🔜 |
 | 5.4 | Realtime broadcast/presence authorization (`realtime.messages` RLS) | 🔜 | it's an RLS-guarded table — same probe shape |
 | 5.5 | Tables exposed in **non-`public` schemas** (PostgREST `db-schemas`) | 🟡 | `schemas` is configurable, but defaults to `public` — a `public`-only run under-reports |
@@ -158,16 +158,19 @@ listed so nobody reads a green run as more than it is.
 ## What this means for the roadmap
 
 Ordered by (severity × prevalence in real AI-generated apps) ÷ build cost, the
-next builds are: **5.1 (storage object paths — the one remaining item that needs
-a genuinely new capability, tenant-*expression* support rather than a tenant
-column)**; then **2.11 (existence oracles: a global `UNIQUE` key or single-column FK
-that answers "does this row exist in another tenant?")**. **3.7 (the UPSERT conflict
-path)** stays low: the permissive-`UPDATE`-policy case it depends on is already
-caught by the existing write probes, so it buys less than its position suggests.
+next builds are **2.11 (existence oracles: a global `UNIQUE` key or
+single-column FK that answers "does this row exist in another tenant?" — real, but
+enumeration rather than bulk read)** and **5.4 (Realtime broadcast authorization,
+an RLS-guarded table with the same probe shape)**. **3.7 (the UPSERT conflict path)**
+stays low: the permissive-`UPDATE`-policy case it depends on is already caught by the
+existing write probes, so it buys less than its position suggests. What remains after
+that is mostly ⛔ by construction — leaked keys, pooler state, app-layer IDOR — and is
+listed as such rather than quietly omitted.
 
 *Done: 4.1/4.2 views & materialized views (0.9.0); 2.9 user-writable claims, 2.8
 callable GUC-setting definer functions, 4.7 partitions, 3.9 TRUNCATE (0.10.0);
-2.10 user-writable policy authority (0.11.0); 3.8 self-row escalation (0.12.0).
+2.10 user-writable policy authority (0.11.0); 3.8 self-row escalation and
+5.1/5.2 storage paths + public buckets (0.13.0).
 4.7 is the one to learn from — it was a false NEGATIVE in the flagship guard,
 found by writing the failure surface down rather than by waiting for a bug report.
 2.10 and 3.8 are the pair to learn from: in both, the policy is correct and the

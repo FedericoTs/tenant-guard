@@ -154,6 +154,21 @@ export function resolveIdentityTrustConfig(config) {
   return out;
 }
 
+/** Resolve the storage-isolation config from the user's `storageIsolation` block. */
+export function resolveStorageConfig(config) {
+  const s = config.storageIsolation ?? {};
+  const out = {};
+  for (const k of ['url', 'urlEnv', 'role', 'becomeTenant', 'claim', 'pathSegment', 'buckets', 'allowlist', 'sampleLimit', 'probeWrites']) {
+    if (s[k] !== undefined) out[k] = s[k];
+  }
+  // Identity is inherited from rlsProof so it is configured once.
+  const p = config.rlsProof ?? {};
+  for (const k of ['role', 'becomeTenant', 'claim']) {
+    if (out[k] === undefined && p[k] !== undefined) out[k] = p[k];
+  }
+  return out;
+}
+
 export function autodetect(cwd = process.cwd()) {
   return {
     migrationsDir: firstExisting(cwd, CANDIDATE_MIGRATION_DIRS),

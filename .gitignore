@@ -1,3 +1,8 @@
 node_modules/
 .DS_Store
 *.log
+
+# scratch patch scripts
+.tg_*.cjs
+.tg_*.txt
+spike.mjs

@@ -137,7 +137,7 @@ The highest-severity blind spot of any table-only scanner.
 | # | Failure | Status | How |
 |---|---|---|---|
 | 7.1 | Over-broad `GRANT ALL` / `TO PUBLIC` amplifying any RLS gap | 🟡 | the *effect* is proven by the probes; the grant itself is a catalog read (and `GRANT ALL` is what makes 3.9 possible) |
-| 7.2 | `ALTER DEFAULT PRIVILEGES` auto-granting every *future* table | 🔜 | catalog: `pg_default_acl` |
+| 7.2 | `ALTER DEFAULT PRIVILEGES` auto-granting every *future* table | ✅ | `default-privileges`, the only guard about the database as it **will be**. Every other check here answers a question about the tables that exist; this one is about the one added next week, which arrives already granted, with no policy, and with **no migration diff showing a security change**. It **proves rather than infers**: reading `pg_default_acl` and reasoning about what it implies gets the interaction with schema grants, role membership and `FOR ROLE` wrong in exactly the cases that matter, so instead it creates a table inside a rolled-back transaction and reads what that table actually inherited. Calibrated deliberately: the condition is latent, and granting to `anon`/`authenticated` in `public` is the **stock Supabase configuration**, so failing on it would fire on essentially every user of the platform this tool targets. The default fails only on **PUBLIC** — every role that exists or ever will, and nobody's platform default — and reports the rest as a note that says what the next table inherits. `failRoles` escalates. An enabled `ddl_command_end` event trigger that enables RLS is detected and downgrades the finding |
 | 7.3 | `CREATE` on `public` granted to `anon`/`authenticated` (feeds 4.4) | 🔜 | catalog or probe |
 | 7.4 | Mutating `SECURITY DEFINER` function not revoked from `PUBLIC`/`anon` | ✅ | `definer-grants`, judged on the **net state** of migration history |
 
@@ -160,14 +160,13 @@ listed so nobody reads a green run as more than it is.
 ## What this means for the roadmap
 
 Every failure mode above that is **both** coverable by this tool's method **and**
-worth the noise it would add now has a guard behind it. Seven rows are still
+worth the noise it would add now has a guard behind it. Six rows are still
 🔜, and they are listed here rather than summarised away, ordered by
 (severity × prevalence) ÷ build cost:
 
 | # | Why it hasn't been built |
 |---|---|
-| 7.2 `ALTER DEFAULT PRIVILEGES` | The best of the remaining set — a **time bomb**: today's green becomes tomorrow's leak when the next table auto-inherits the grant. Catalog read of `pg_default_acl`; cheap |
-| 3.11 cross-tenant FK / cascade | Real, moderate cost: insert a child pointing at another tenant's parent and see whether the reference is allowed |
+| 3.11 cross-tenant FK / cascade | The best of the remaining set. Moderate cost: insert a child pointing at another tenant's parent and see whether the reference is allowed |
 | 7.3 `CREATE` on `public` granted to `anon`/`authenticated` | Already checked *as a precondition* inside `definer-rpc` (§4.4); standalone it is a small catalog read |
 | 3.10 `MERGE` per-arm policies | PG15+, and rare in the app shapes this targets |
 | 4.8 legacy `INHERITS` children | Same enumeration as partitions, far rarer |
@@ -193,7 +192,8 @@ callable GUC-setting definer functions, 4.7 partitions, 3.9 TRUNCATE (0.10.0);
 5.1/5.2 storage paths + public buckets (0.13.0); 2.11 constraint oracles (0.14.0);
 5.3/5.4 Realtime channels (0.15.0); 4.3/4.4/4.10 definer RPCs and SQL injection
 inside them (0.16.0–0.17.0); 4.9 shadow tables, 7.1 role capabilities (0.18.0);
-2.14 schema-per-tenant (0.19.0); 6.1 session-scoped tenant GUCs (0.21.0).*
+2.14 schema-per-tenant (0.19.0); 6.1 session-scoped tenant GUCs (0.21.0);
+7.2 inherited default privileges (0.22.0).*
 
 *Three of these are worth learning from. **4.7** was a false NEGATIVE in the
 flagship guard, found by writing the failure surface down rather than by waiting

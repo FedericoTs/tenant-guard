@@ -264,6 +264,18 @@ export function resolvePoolerBleedConfig(config) {
   return out;
 }
 
+/** Resolve the default-privileges config from the user's `defaultPrivileges` block. */
+export function resolveDefaultPrivilegesConfig(config) {
+  const d = config.defaultPrivileges ?? {};
+  const out = {};
+  for (const k of ['url', 'urlEnv', 'role', 'schemas', 'failRoles', 'unauthenticatedRoles', 'probeTable', 'allowlist']) {
+    if (d[k] !== undefined) out[k] = d[k];
+  }
+  const p = config.rlsProof ?? {};
+  if (out.role === undefined && p.role !== undefined) out.role = p.role;
+  return out;
+}
+
 export function autodetect(cwd = process.cwd()) {
   return {
     migrationsDir: firstExisting(cwd, CANDIDATE_MIGRATION_DIRS),

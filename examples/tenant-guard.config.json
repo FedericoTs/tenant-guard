@@ -83,6 +83,13 @@
     "allowlist": []
   },
 
+  "defaultPrivileges": {
+    "//": "Runtime. Threat-model 7.2 — the only guard about the database as it WILL be. ALTER DEFAULT PRIVILEGES grants on every table created AFTER it, and Postgres never enables RLS by default, so a green run says nothing about the table somebody adds next week: it arrives already granted, with no policy, and no migration diff shows a security change. Proves it by creating a table inside a rolled-back transaction and reading what it inherited. Fails only on PUBLIC by default — granting to anon/authenticated is the stock Supabase shape, so it is reported as a note; add a role to failRoles[] to block the build on it.",
+    "schemas": ["public"],
+    "failRoles": ["PUBLIC"],
+    "allowlist": []
+  },
+
   "poolerBleed": {
     "//": "Runtime + source. Threat-model 6.1, and the only guard that must read BOTH halves of the repo. A policy keyed on current_setting('app.tenant') is only as good as the SCOPE it is set with: set_config(guc, v, false) and a bare SET last for the whole CONNECTION, so on a pooled connection the next request inherits the previous tenant and the policy hands over their rows working exactly as designed. Every single-request test passes. Skips cleanly when no policy uses a custom GUC (the usual Supabase auth.jwt() case).",
     "schemas": ["public"],

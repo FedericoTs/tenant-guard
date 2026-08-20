@@ -25,7 +25,7 @@ npx tenant-guard all      # everything: static guards + every runtime proof
 ```
 
 Or run one at a time: `prove`, `drift`, `anon-reads`, `anon-writes`, `identity`,
-`rpc`, `views`, `storage`, `realtime`, `oracles`, `shadows`, `caps`, `schemas`, `pooler`.
+`rpc`, `views`, `storage`, `realtime`, `oracles`, `shadows`, `caps`, `schemas`, `pooler`, `defaults`.
 `npx tenant-guard list` describes each, and `--help` documents the rest.
 
 Every command also speaks machine: `--json` for anything downstream, `--sarif`
@@ -117,6 +117,7 @@ tenant-guard  — guard tests for multi-tenant isolation
 | `shadow-tables` | a trigger copies tenant data into a table nothing protects | the source has flawless RLS; the audit log, outbox or cache it feeds usually has **no tenant column at all**, so every tenant-aware check walks past it. Verified: the source returns one row to its tenant while the shadow returns both tenants', and `rls-proof` reports green |
 | `role-capabilities` | the app role holds a capability that defeats RLS, or a direct grant on the `auth` schema | `dblink` opens a **new connection** as whatever role its string names — RLS on it has nothing to do with the caller's; file reads never touch the policy layer; and `auth.users` is every tenant's email in one table with no policy of yours in front of it. Outbound HTTP (`pg_net`) is surfaced as a **note**: real, but exfiltration rather than a cross-tenant read |
 | `schema-tenancy` | one role can read **more than one tenant schema** | the other multi-tenant architecture — a schema per tenant — where the boundary is **GRANTs and nothing else**. `search_path` is not a control: it doesn't stop anyone writing `tenant_b.docs` directly, and the client can reset it. Every column-based check is blind here: point `rls-proof` at such a database and it reports "1/1 proven isolated" while the app role reads both tenants |
+| `default-privileges` | a table created **tomorrow** arrives granted and unprotected | the only guard about the database as it *will be*. `ALTER DEFAULT PRIVILEGES` grants on every table created after it, and Postgres never enables RLS by default — so a green run says nothing about the table somebody adds next week: it arrives already granted, with no policy, exposed the instant it exists, and **no migration diff shows a security change**. It proves rather than infers, by creating a table inside a rolled-back transaction and reading what that table actually inherited |
 
 **Catalog** — the schema's shape rather than its behaviour:
 

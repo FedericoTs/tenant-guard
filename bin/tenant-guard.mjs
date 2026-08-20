@@ -17,12 +17,12 @@ import { join, dirname, resolve } from 'node:path';
 import {
   GUARDS, runAll, runProof, runDrift, runAnonWrites, runAnonReads, runViews, runIdentity,
   runStorage, runOracles, runRealtime, runDefinerRpc, runShadowTables, runCapabilities,
-  runSchemaTenancy, runPoolerBleed, runEverything,
+  runSchemaTenancy, runPoolerBleed, runDefaultPrivileges, runEverything,
 } from '../src/index.mjs';
 import {
   rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation,
   constraintOracles, realtimeIsolation, definerRpc, shadowTables, roleCapabilities, schemaTenancy,
-  poolerBleed,
+  poolerBleed, defaultPrivileges,
 } from '../src/index.mjs';
 import { CONFIG_FILENAME, autodetect, loadConfig } from '../src/config.mjs';
 import { report, bold, dim, green, yellow, red } from '../src/runner.mjs';
@@ -34,7 +34,7 @@ import { VERSION } from '../src/version.mjs';
 const ALL_GUARDS = [
   ...GUARDS, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust,
   storageIsolation, constraintOracles, realtimeIsolation, definerRpc, shadowTables,
-  roleCapabilities, schemaTenancy, poolerBleed,
+  roleCapabilities, schemaTenancy, poolerBleed, defaultPrivileges,
 ];
 
 /**
@@ -57,6 +57,7 @@ const RUNTIME_COMMANDS = {
   caps: { fn: runCapabilities, needs: 'migrated' },
   schemas: { fn: runSchemaTenancy, needs: 'seeded' },
   pooler: { fn: runPoolerBleed, needs: 'migrated' },
+  defaults: { fn: runDefaultPrivileges, needs: 'migrated' },
   all: { fn: runEverything, needs: 'seeded', many: true },
 };
 
@@ -147,6 +148,7 @@ ${bold('COMMANDS')}
   realtime       Realtime channels leak across tenants
   schemas        one role reaches more than one tenant SCHEMA
   pooler         a tenant identity outlives the request that set it
+  defaults       what a table created TOMORROW will inherit
   shadows        a trigger copies tenant data somewhere unprotected
   oracles        a UNIQUE key reveals another tenant's rows
   caps           the app role holds an RLS-bypassing capability
@@ -325,6 +327,16 @@ if (cmd === 'init') {
       // a column-tenancy database.
       //"schemaPattern": "^tenant_",
       allowlist: [], // schema names shared on purpose
+    },
+    defaultPrivileges: {
+      // What a table created TOMORROW will inherit. ALTER DEFAULT PRIVILEGES
+      // grants on every table created after it, and Postgres never enables RLS
+      // by default — so this run being green says nothing about the next table
+      // somebody adds. Proves it by creating one inside a rolled-back
+      // transaction and reading what it actually inherited.
+      schemas: ['public'],
+      failRoles: ['PUBLIC'], // add 'anon' to fail the build on it too
+      allowlist: [], // schema names that inherit grants on purpose
     },
     poolerBleed: {
       // The tenant identity outliving the request that set it. Reads BOTH the

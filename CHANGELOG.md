@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.22.0
+
+New guard `default-privileges` (`tenant-guard defaults`) — threat-model §7.2.
+Every other guard here answers a question about the tables that exist. This one
+is about the table somebody adds **next week**.
+
+- **The time bomb.** `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON
+  TABLES TO anon` grants on every table created *after* it, and Postgres never
+  enables row-level security by default. So the day someone adds a table and
+  forgets `ENABLE ROW LEVEL SECURITY`, it is readable the instant it exists —
+  with no `GRANT` in the migration, **no security statement of any kind in the
+  diff**, and no guard having failed, because when this tool last ran the table
+  did not exist. That is the CVE-2025-48757 shape, pre-armed.
+
+- **Demonstrated in the tests.** `anon-reads` passes against the database as it
+  stands. One ordinary `create table` later — nothing unusual in it, no grant,
+  no policy — and `anon-reads` fails on the new table. That progression is the
+  guard's reason to exist.
+
+- **It proves rather than infers.** Reading `pg_default_acl` and reasoning about
+  what it implies gets the interaction with schema grants, role membership and
+  `FOR ROLE` wrong in exactly the cases that matter. So the guard **creates a
+  table inside a transaction it rolls back** and reads what that table actually
+  inherited — grantees, privileges, and the RLS flag. The answer is a fact about
+  your database rather than a deduction. A test asserts the probe table is gone
+  afterwards; identifiers are validated, never interpolated blind.
+
+- **Calibration, deliberately conservative.** This condition is latent — nothing
+  is exposed until a table is created — and granting to `anon`/`authenticated`
+  in `public` is the **stock configuration of a Supabase project**. Failing the
+  build on it would fire on essentially every user of the platform this tool
+  targets, which is how a security tool gets deleted. So the default fails only
+  on **PUBLIC**: every role that exists or ever will, and nobody's platform
+  default. Everything else is a note that states exactly what the next table
+  inherits and why the green run is conditional. `failRoles` escalates it for
+  teams that want it stricter — one knob, tested both ways.
+
+- **Mitigation is detected.** An enabled `ddl_command_end` event trigger whose
+  body enables RLS closes this the other way, and downgrades the finding rather
+  than nagging a database that has already solved the problem. Read from the
+  function body, since plpgsql records no catalog dependency for what it runs.
+
+- **docs: THREAT-MODEL 7.2 closed** — 40 rows covered, 6 still planned, and the
+  counts in the prose match the tables.
+- 466 tests (was 439), 18 guards.
+
 ## 0.21.0
 
 New guard `pooler-bleed` (`tenant-guard pooler`) — threat-model §6.1, the last

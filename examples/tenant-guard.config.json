@@ -78,6 +78,11 @@
     "allowlist": ["brand-assets"]
   },
 
+  "schemaTenancy": {
+    "//": "Runtime. The OTHER multi-tenant architecture: one schema per tenant, where the boundary is GRANTs and nothing else (search_path is not a control — anyone can write tenant_b.docs directly). Proves how many tenant schemas one role can actually READ. Tenant schemas are inferred by shape; set schemaPattern for an irregular layout. Skips cleanly on a column-tenancy database.",
+    "allowlist": []
+  },
+
   "shadowTables": {
     "//": "Runtime. Follows triggers on tenant tables to the tables they WRITE into. An audit log or outbox with no tenant column and no RLS holds every tenant activity record, and the tenant-column guards walk past it. Reads the function body, because plpgsql records no catalog dependency for what it writes.",
     "schemas": ["public"],

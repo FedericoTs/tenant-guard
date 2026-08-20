@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.19.0
+
+The other multi-tenant architecture, and an honest answer to "which databases is
+this for?".
+
+- **feat: new guard `schema-tenancy`** (`tenant-guard schemas`). Every guard until
+  now assumed tenancy is a **column** guarded by RLS. The other major architecture
+  gives each tenant its **own schema** — and tenant-guard was completely blind to
+  it. Verified: with `tenant_a.docs` and `tenant_b.docs` both granted to the app
+  role, `rls-proof` reports **"1/1 proven isolated"**, having found the one table
+  in `public` and never noticed the role reads both tenants.
+  - In that architecture the boundary is **GRANTs and nothing else**. In
+    particular it is **not `search_path`** — setting the path to `tenant_a` does
+    not stop anyone writing `select * from tenant_b.docs`, and the client can
+    reset it anyway. Same failure shape as trusting a client-settable GUC, one
+    level up: a convention mistaken for a control.
+  - So it asks one question and answers it by probing: **how many tenant schemas
+    can this role actually read?** More than one and the database isolates
+    nothing. Reachability is *read*, not inferred from grants — schema `USAGE`
+    without a table grant is correctly not counted as access.
+  - Tenant schemas are found **by shape** (two or more schemas holding identically
+    named tables), so it needs no configuration — and an ordinary multi-schema
+    database (`public` + `analytics` + `audit`, all holding different things) is
+    correctly not mistaken for one. `schemaPattern` overrides that for irregular
+    layouts.
+- **docs: "Which databases this is for".** Neon, RDS/Aurora, Cloud SQL, Timescale
+  and self-hosted Postgres were **always** fully supported — the Supabase-only
+  guards skip cleanly with a stated reason — but every document said "Supabase",
+  so nobody could tell. Now stated, with a verified non-Supabase run shown. Also
+  stated plainly: **MySQL, SQLite and MongoDB are not supported and not planned**,
+  because they have no row-level security, so there is no policy layer to prove;
+  SQL Server and Oracle have RLS but would be a rewrite sharing a name.
+  CockroachDB is listed as untested-but-plausible rather than claimed.
+- 352 tests (was 334), 16 guards.
+
 ## 0.18.0
 
 Three candidates from a scope review, built with their severities kept apart

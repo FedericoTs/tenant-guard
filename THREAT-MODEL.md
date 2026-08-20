@@ -74,6 +74,7 @@ These are checked *before* any isolation claim.
 | 2.11 | Existence oracles: global `UNIQUE` key, single-column FK, `ON CONFLICT DO NOTHING` reveal another tenant's hidden rows | ✅ | `constraint-oracles`, catalog-only. **UNIQUE omitting the tenant column → fails** (conclusive: the constraint either carries the tenant or it doesn't). Skips primary keys and single-UUID columns — unguessable values answer nothing. Expression indexes are skipped rather than guessed at. **Single-column FKs between tenant tables → an aggregated note**, since composite tenant FKs are rare and exploiting one needs a guessable parent id *and* an insert that passes `WITH CHECK` |
 | 2.12 | `pg_stat_activity` exposes other tenants' live query text (all users share one DB role) | 🔜 | read it as the app role |
 | 2.13 | Planner/statistics side channels (`pg_stats`, non-`LEAKPROOF` functions) | ⛔ | needs adversarial query construction; low yield, high noise |
+| 2.14 | **Schema-per-tenant**: one role reaches more than one tenant schema | ✅ | `schema-tenancy`. A different architecture entirely — the boundary is GRANTs, not policies, and `search_path` is not a control. Was a verified blind spot: `rls-proof` reported "1/1 proven isolated" on a database where the app role read both tenant schemas |
 
 ## 3. Write path
 

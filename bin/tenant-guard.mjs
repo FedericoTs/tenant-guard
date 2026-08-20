@@ -15,6 +15,7 @@
  *   tenant-guard rpc      exit 1 if a SECURITY DEFINER RPC routes around RLS
  *   tenant-guard shadows  exit 1 if a trigger copies tenant data somewhere unprotected
  *   tenant-guard caps     exit 1 if the app role holds an RLS-bypassing capability
+ *   tenant-guard schemas  exit 1 if one role reaches more than one tenant SCHEMA
  *   tenant-guard all      run every guard above, in order
  *   tenant-guard init    write a tenant-guard.config.json, seeded from this repo
  *   tenant-guard list    list the available guards and what each prevents
@@ -26,8 +27,8 @@
  */
 import { writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { GUARDS, runAll, runProof, runDrift, runAnonWrites, runAnonReads, runViews, runIdentity, runStorage, runOracles, runRealtime, runDefinerRpc, runShadowTables, runCapabilities, runEverything } from '../src/index.mjs';
-import { rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation, definerRpc, shadowTables, roleCapabilities } from '../src/index.mjs';
+import { GUARDS, runAll, runProof, runDrift, runAnonWrites, runAnonReads, runViews, runIdentity, runStorage, runOracles, runRealtime, runDefinerRpc, runShadowTables, runCapabilities, runSchemaTenancy, runEverything } from '../src/index.mjs';
+import { rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation, definerRpc, shadowTables, roleCapabilities, schemaTenancy } from '../src/index.mjs';
 import { CONFIG_FILENAME, autodetect } from '../src/config.mjs';
 import { report, bold, dim, green, yellow } from '../src/runner.mjs';
 
@@ -173,9 +174,17 @@ if (cmd === 'caps') {
   process.exit(code);
 }
 
+if (cmd === 'schemas') {
+  // Schema-per-tenant: how many tenant schemas can one role read? Needs a DB.
+  const result = await runSchemaTenancy(cwd);
+  const code = report([result], { emptyHint: false });
+  if (result.skipped) console.log(dim(SKIP_HINT('schemas')));
+  process.exit(code);
+}
+
 if (cmd === 'list') {
   console.log(bold('\ntenant-guard guards\n'));
-  for (const g of [...GUARDS, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation, definerRpc, shadowTables, roleCapabilities]) {
+  for (const g of [...GUARDS, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation, definerRpc, shadowTables, roleCapabilities, schemaTenancy]) {
     console.log(`  ${bold(g.meta.id)}`);
     console.log(dim(`    ${g.meta.title}`));
     console.log(dim(`    ${g.meta.why}\n`));
@@ -240,6 +249,15 @@ if (cmd === 'init') {
       role: 'anon',
       schemas: ['public'],
       allowlist: [], // "schema.table" intentionally readable by anon (published/reference data)
+    },
+    schemaTenancy: {
+      // The OTHER multi-tenant architecture: one schema per tenant, where the
+      // boundary is GRANTs and nothing else (search_path is not a control —
+      // anyone can write tenant_b.docs directly). Tenant schemas are inferred
+      // from shape; set schemaPattern for an irregular layout. Skips cleanly on
+      // a column-tenancy database.
+      //"schemaPattern": "^tenant_",
+      allowlist: [], // schema names shared on purpose
     },
     shadowTables: {
       // Follows triggers on tenant tables to the tables they WRITE into. An audit
@@ -314,5 +332,5 @@ if (cmd === 'init') {
   process.exit(0);
 }
 
-console.error(`Unknown command: ${cmd}\nUsage: tenant-guard [run|prove|drift|anon-writes|all|anon-reads|views|identity|storage|oracles|realtime|rpc|shadows|caps|init|list]`);
+console.error(`Unknown command: ${cmd}\nUsage: tenant-guard [run|prove|drift|anon-writes|all|anon-reads|views|identity|storage|oracles|realtime|rpc|shadows|caps|schemas|init|list]`);
 process.exit(2);

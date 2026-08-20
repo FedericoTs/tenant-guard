@@ -25,7 +25,7 @@ npx tenant-guard all      # everything: static guards + every runtime proof
 ```
 
 Or run one at a time: `prove`, `drift`, `anon-reads`, `anon-writes`, `identity`,
-`rpc`, `views`, `storage`, `realtime`, `oracles`, `shadows`, `caps`. `npx tenant-guard list` describes each.
+`rpc`, `views`, `storage`, `realtime`, `oracles`, `shadows`, `caps`, `schemas`. `npx tenant-guard list` describes each.
 
 ---
 
@@ -111,11 +111,42 @@ tenant-guard  — guard tests for multi-tenant isolation
 | `shadow-tables` | a trigger copies tenant data into a table nothing protects | the source has flawless RLS; the audit log, outbox or cache it feeds usually has **no tenant column at all**, so every tenant-aware check walks past it. Verified: the source returns one row to its tenant while the shadow returns both tenants', and `rls-proof` reports green |
 | `role-capabilities` | the app role holds a capability that defeats RLS, or a direct grant on the `auth` schema | `dblink` opens a **new connection** as whatever role its string names — RLS on it has nothing to do with the caller's; file reads never touch the policy layer; and `auth.users` is every tenant's email in one table with no policy of yours in front of it. Outbound HTTP (`pg_net`) is surfaced as a **note**: real, but exfiltration rather than a cross-tenant read |
 
+| `schema-tenancy` | one role can read **more than one tenant schema** | the other multi-tenant architecture — a schema per tenant — where the boundary is **GRANTs and nothing else**. `search_path` is not a control: it doesn't stop anyone writing `tenant_b.docs` directly, and the client can reset it. Every column-based check is blind here: point `rls-proof` at such a database and it reports "1/1 proven isolated" while the app role reads both tenants |
+
 **Catalog** — the schema's shape rather than its behaviour:
 
 | Guard | Fails when… | Why a scanner misses it |
 |---|---|---|
 | `constraint-oracles` | a constraint answers questions **across** tenants | RLS hides rows, not constraints — and constraints are enforced *below* it. `users.email UNIQUE` on a tenant table means inserting `victim@corp.com` raises a duplicate-key error even though RLS hides the row that caused it, so anyone can test whether a value exists in another tenant (and `ON CONFLICT DO NOTHING` asks the same question with no error at all). Nothing about the policies is wrong; the *schema* is the leak |
+
+## Which databases this is for
+
+**PostgreSQL, and anything that speaks it.** The runtime guards work by dropping to
+your app role and proving row-level security actually holds — so they need an
+engine that *has* RLS, and a `pg_catalog` to introspect.
+
+| | Status |
+|---|---|
+| **Supabase** | Fully supported, and the Supabase-only surfaces (Storage, Realtime, the `auth` schema) have guards of their own |
+| **Neon, RDS/Aurora, Cloud SQL, Timescale, self-hosted Postgres** | **Fully supported.** Nothing is Supabase-specific except the guards that say so, and those *skip cleanly* with a stated reason rather than failing you |
+| **CockroachDB** | Untested. It speaks the Postgres wire protocol and has Postgres-compatible RLS from v25.2, so this may work as-is — if you try it, a report either way is welcome |
+| **MySQL, MariaDB, PlanetScale, SQLite, MongoDB** | **Not supported, and not planned.** These have no row-level security, so there is no policy layer to prove. Isolation there is enforced in application code or by schema/database separation — a genuinely different check, not a port of this one |
+| **SQL Server, Oracle** | Not supported. Both have real RLS (predicate functions, VPD), but a different driver, catalog and impersonation model — that's a rewrite sharing a name, not an extension |
+
+If your tenancy is **one schema per tenant** rather than a tenant column, that's
+covered too — see `tenant-guard schemas`. It's the usual pattern on engines
+without RLS, and it's common on Postgres as well.
+
+A non-Supabase run looks like this — real guards doing real work, and the
+Supabase-only ones stepping aside:
+
+```
+rls-proof            ok   | 1/1 tenant table(s) proven isolated (read + write)
+anon-reads           ok   | 1 tenant table(s) checked; none readable by "app_user"
+identity-trust       ok   | 1 tenant policy/policies checked; identity sources look unforgeable
+storage-isolation    ok   | skipped — no storage schema
+realtime-isolation   ok   | skipped — no realtime schema
+```
 
 ## How it fits your project
 

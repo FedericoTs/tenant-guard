@@ -237,6 +237,18 @@ export function resolveCapabilitiesConfig(config) {
   return out;
 }
 
+/** Resolve the schema-tenancy config from the user's `schemaTenancy` block. */
+export function resolveSchemaTenancyConfig(config) {
+  const s = config.schemaTenancy ?? {};
+  const out = {};
+  for (const k of ['url', 'urlEnv', 'role', 'schemaPattern', 'systemSchemas', 'allowlist']) {
+    if (s[k] !== undefined) out[k] = s[k];
+  }
+  const p = config.rlsProof ?? {};
+  if (out.role === undefined && p.role !== undefined) out.role = p.role;
+  return out;
+}
+
 export function autodetect(cwd = process.cwd()) {
   return {
     migrationsDir: firstExisting(cwd, CANDIDATE_MIGRATION_DIRS),

@@ -80,10 +80,10 @@ commits is one they keep.
 
 ## From tripwire to proof (shipped)
 
-The first three guards are heuristics on source text. They catch the obvious
-leak cheaply, but they can't *prove* isolation holds. So there's now a fourth,
-runtime guard — `tenant-guard prove`. Against a real Postgres it drops to your
-non-superuser app role, assumes one tenant's identity, and asserts that session
+The three static guards are heuristics on source text. They catch the obvious
+leak cheaply, but they can't *prove* isolation holds. So there is a runtime guard
+that can — `tenant-guard prove`, the first of nine database-backed guards.
+Against a real Postgres it drops to your non-superuser app role, assumes one tenant's identity, and asserts that session
 literally cannot read **or write** another tenant's rows, across every table with
 a tenant column. A static scanner can never do this; a query can.
 
@@ -157,7 +157,7 @@ policy that let `anon` write that shared table, and the deeper finding was *why 
 had hidden*: **the policy existed only in production**, applied by hand and never
 captured in a migration. Its whole security posture was invisible to code review.
 
-So there's now a fifth guard — `rls-drift`. It reads every `ENABLE ROW LEVEL
+So there's a guard for exactly that — `rls-drift`. It reads every `ENABLE ROW LEVEL
 SECURITY` and `CREATE POLICY` your migrations declare (net of `DROP`/`DISABLE`)
 and diffs it against the live catalog (`pg_policies`). Anything in the database
 that no migration declares fails the build. That turns "our RLS is in git" from a
@@ -166,20 +166,47 @@ shipped in the review: *don't trust the declared state; exercise the real one.*
 (The diff is name-and-flag presence, not policy-expression parsing — reliable by
 design, no false drift.)
 
-## Roadmap: what's next
+## Stop waiting for the next bug report
 
-Two of those roadmap items shipped, both taught by real use. Seeding mode
-(`rlsProof.seed`) manufactures two synthetic tenants for databases that don't
-already have them, so coverage no longer depends on fixture data — and it's what
-makes membership-table policies provable. And a review of a real app found a
-class every tenant guard missed: a table with no tenant column that `anon` could
-write (that's how a shared cache gets poisoned). `anon-writes` closes it — and
-the interesting part is *how*: a catalog-only check would false-flag the
-well-secured `TO public USING (auth.uid() = …)` policies real apps use, so it
-proves the write path by actually attempting it as `anon` and reading the real
-result. Same lesson, again: don't infer what you can exercise. The remaining
-steps: an `INSERT` probe under RLS, and a Supabase preset that discovers the app
-role and JWT shape automatically.
+Every guard described so far was taught by something: a real failure, or a sharp
+reviewer. That works, and it produced good checks — but it has a structural
+problem. **A security tool that grows one reported bug at a time is always one
+reviewer behind.** Its coverage is a function of who happened to look, not of how
+the thing actually breaks.
+
+So the project stopped doing that. [`THREAT-MODEL.md`](THREAT-MODEL.md) enumerates
+the failure surface up front — every way multi-tenant isolation is known to break
+in Postgres/Supabase — each entry tagged **covered / partial / out-of-scope**, with
+the reason spelled out for the ones that will never be covered. Then the work
+became: build down the map.
+
+Two things came out of that which no amount of waiting would have produced.
+
+**It found a false negative in the flagship guard.** Partitioned tables reported
+*green while leaking*. Two causes compounded: a partitioned parent is
+`relkind = 'p'` and the introspection only looked at `'r'`, so the parent was
+never scanned; and list-partitioning by tenant means each partition holds exactly
+one tenant *by construction*, so the two-tenant probe could never fire and every
+partition was written off as "cannot prove". The result was `ok: true` on a
+database where any authenticated user could read every other tenant by naming the
+partition directly. Nobody had reported it. Writing the surface down found it in
+an afternoon — and the fix (impersonate a tenant that exists *elsewhere*) also
+upgraded ordinary single-tenant tables from "cannot prove" to a real verdict.
+
+**It forced the calibration question.** Once you are working from a list rather
+than a queue, you meet failure modes that are real but whose *exploitability
+depends on architecture SQL cannot see* — a client-settable tenant GUC, `TRUNCATE`
+privilege, single-column foreign keys. The temptation is to fail the build on all
+of them and call it thorough. That is how a security tool becomes ignorable. Each
+of those is a **note**, never a failure, and the note says why. The corollary
+matters just as much: where a finding *is* conclusive — `user_metadata` used for
+authorization, a globally-unique natural key on a tenant table — it fails hard,
+with no hedging.
+
+The map is now closed: every failure mode on it that is reachable by "run SQL as
+the app role" has a guard behind it. What remains open is open on purpose, and
+says so. **The most useful contribution now is a failure mode that isn't in the
+table at all.**
 
 ---
 

@@ -137,16 +137,49 @@ INSERT for it), and a broken seed statement fails with the exact SQL error.
   Postgres then denies every row, which looks *exactly* like isolation but means
   the table is unfinished — the moment someone adds a permissive policy it leaks.
   Named explicitly so it can't masquerade as a pass.
-- **not proven** (a note) — only one tenant's data, no read access, or the
-  `becomeTenant`/`role` config doesn't match your policies. Seed a second tenant,
-  or fix the config.
+- **partition leak** — RLS on a partitioned parent does **not** govern a
+  partition queried by its own name, and PostgREST exposes each partition as its
+  own endpoint. Because list-partitioning by tenant puts exactly one tenant in
+  each partition, the ordinary two-tenant probe can never fire there — so the
+  proof impersonates a tenant that exists *elsewhere* and checks whether this
+  partition's rows are visible to them. Fix: enable and scope RLS on each
+  partition too (and on every new one you attach). ✗
+- **owner-bypass** (a note) — a table's **owner** is exempt from its own RLS
+  unless `FORCE ROW LEVEL SECURITY` is set. If your configured role owns the
+  table, RLS is silently inert there and the probe can't be trusted, so it is
+  reported as *not proven* with the exact `ALTER TABLE … FORCE ROW LEVEL SECURITY`
+  fix — rather than producing a vacuous pass or blaming the wrong policy. (The
+  deny-all canary below can't catch this: the canary isn't owned by your role.)
+- **not proven** (a note) — no read access, or the `becomeTenant`/`role` config
+  doesn't match your policies. Note that a table holding a **single** tenant's
+  data can usually still be proven, by impersonating a tenant that exists
+  elsewhere in the database; "not proven" means it genuinely couldn't be, and it
+  is never reported as passing.
 - **identity self-check failed** — before trusting any pass, the proof drops to
   your app role and checks it *cannot* read a deliberately deny-all RLS table. If
   it can, RLS isn't being enforced for that role (a superuser, a `BYPASSRLS` role,
   a table owner, or a `SET ROLE` that didn't take effect) — so a green result
   would be meaningless. The proof fails instead of reporting a vacuous pass. ✗
 
-Everything runs inside a transaction that is rolled back, and each `UPDATE`/`DELETE`
-write probe is additionally wrapped in its own `SAVEPOINT` that is rolled back —
-nothing is ever committed. (Triggers still fire inside the rolled-back
-transaction; set `"probeWrites": false` to test reads only.)
+Everything runs inside a transaction that is rolled back, and each write probe is
+additionally wrapped in its own `SAVEPOINT` that is rolled back — nothing is ever
+committed. (Triggers still fire inside the rolled-back transaction; set
+`"probeWrites": false` to test reads only.)
+
+## The other runtime guards
+
+`prove` covers base tables. The rest of the database has surfaces it cannot see,
+and each has its own command — all of them **inherit the `role` / `becomeTenant` /
+`claim` config above**, so you write it once:
+
+| Command | What it proves |
+|---|---|
+| `tenant-guard views` | a **view** runs with its owner's rights unless `security_invoker` is set, and RLS never applies to a **materialized view** at all |
+| `tenant-guard identity` | whether the caller can **forge** the identity these policies authorize from, or write the table/column that grants it |
+| `tenant-guard storage` | Supabase Storage — tenancy lives in the object **path**, and the client picks that path on upload |
+| `tenant-guard realtime` | Supabase Realtime — tenancy lives in the channel **topic**, and joining a channel is a write |
+| `tenant-guard oracles` | a globally `UNIQUE` key that reveals whether a value exists in another tenant |
+| `tenant-guard anon-reads` / `anon-writes` | what the **unauthenticated** public key can read or write |
+| `tenant-guard drift` | RLS that exists in the database but that no migration declares |
+
+`tenant-guard all` runs every one of them, in order.

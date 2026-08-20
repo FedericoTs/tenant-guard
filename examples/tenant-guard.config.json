@@ -1,16 +1,92 @@
 {
+  "//": "Annotated tenant-guard config. `npx tenant-guard init` generates one for your repo, autodetecting the paths. Every guard is opt-in and SKIPS when it doesn't apply to your stack — a skip is never a pass, and the CLI says so. Keys prefixed with // are comments (JSON has none); tenant-guard ignores unknown keys.",
+
   "migrations": {
+    "//": "Static. Shared by migration-collisions and definer-grants. Autodetected from supabase/migrations, migrations, db/migrations, drizzle, prisma/migrations.",
     "dir": "supabase/migrations",
     "grandfather": ["031", "101"]
   },
+
   "definerGrants": {
+    "//": "Static. A mutating SECURITY DEFINER function whose FINAL definition isn't revoked from PUBLIC/anon. Judged on the net state of history, so a fix in a later repair migration counts. `baseline` lets you adopt on a legacy repo without fixing everything on day one.",
     "baseline": 189,
     "allowlist": ["record_login_attempt", "check_login_rate_limit", "validate_public_token"]
   },
+
   "routeOrgScoping": {
+    "//": "Static. Authenticated route + filters by bare id + never mentions a tenant column. Bare-id patterns ship for Supabase, Prisma and Drizzle; raw SQL is left out of the default to avoid false positives on self-loads.",
     "routesDir": "src/app/api",
     "authSignals": ["withApiAuth", "requirePermission", "getUser("],
     "tenantSignals": ["organization_id", "organizationId", "tenant_id", "account_id"],
     "allowlist": ["src/app/api/health/route.ts"]
+  },
+
+  "rlsProof": {
+    "//": "Runtime. The core proof: two tenants, your real app role, reads AND the full write path (UPDATE/DELETE, tenant-hop, INSERT, omitted-tenant). Runs only when the URL env var is set, so it stays skipped until you opt in.",
+    "urlEnv": "TENANT_GUARD_DATABASE_URL",
+    "role": "authenticated",
+    "claim": "org_id",
+    "//claim": "Supabase shortcut: builds the request.jwt.claims impersonation and sets role=authenticated, so CI never needs your JWT secret. Use `becomeTenant` instead if your policies resolve the tenant some other way — an explicit becomeTenant always wins over claim.",
+    "//becomeTenant": ["select set_config('app.current_tenant', $1, true)"],
+    "//seed": {
+      "//": "Optional. Manufactures two synthetic tenants inside the rolled-back transaction, so the proof works on an EMPTY CI database and on policies that read a memberships table (a bare claim can't satisfy those). Each statement runs privileged, once per tenant, with $1 = the tenant id, in dependency order.",
+      "setup": [
+        "insert into organizations (id) values ($1)",
+        "insert into memberships (user_id, organization_id) values (gen_random_uuid(), $1)",
+        "insert into invoices (organization_id, amount) values ($1, 100)"
+      ]
+    },
+    "tenantColumns": ["organization_id", "tenant_id"],
+    "grandfather": ["shared_lookup"]
+  },
+
+  "rlsDrift": {
+    "//": "Runtime. Policies/RLS that exist in the database but that no migration declares — the hand-edit in the dashboard that never reached a pull request.",
+    "schemas": ["public"],
+    "allowlist": ["public.some_supabase_managed_table"]
+  },
+
+  "anonReads": {
+    "//": "Runtime. The CVE-2025-48757 class: can the public anon key SELECT tenant data with no login? Covers tables, views and materialized views. Probed as anon, so a safe `TO public USING (auth.uid() = ...)` policy is proven safe rather than false-flagged.",
+    "role": "anon",
+    "schemas": ["public"],
+    "allowlist": ["public.published_posts"]
+  },
+
+  "anonWrites": {
+    "//": "Runtime. The cache-poisoning class: a table with no tenant column that anon can write, so anyone can rewrite what every user reads.",
+    "role": "anon",
+    "schemas": ["public"],
+    "allowlist": []
+  },
+
+  "identityTrust": {
+    "//": "Runtime. Can the caller FORGE the identity your policies authorize from? Flags user_metadata used for authorization, a callable SECURITY DEFINER that sets the tenant GUC from an argument, a membership table the caller can write, and authorization columns writable on your own row. Inherits role/becomeTenant/claim from rlsProof.",
+    "schemas": ["public"],
+    "allowlist": []
+  },
+
+  "viewIsolation": {
+    "//": "Runtime. A view runs with its OWNER's rights unless security_invoker is set, and RLS never applies to a materialized view at all — so a perfectly-RLS'd table can still be handed out wholesale by the view beside it. Inherits identity from rlsProof.",
+    "schemas": ["public"],
+    "allowlist": ["public.admin_reporting_view"]
+  },
+
+  "storageIsolation": {
+    "//": "Runtime, Supabase only (skips cleanly otherwise). Storage keys tenancy off the object PATH (org_A/invoices/q1.pdf) and the CLIENT chooses that path on upload. Also flags public buckets holding more than one tenant's objects, since those are served with no auth and no RLS at all.",
+    "pathSegment": 1,
+    "allowlist": ["brand-assets"]
+  },
+
+  "realtimeIsolation": {
+    "//": "Runtime, Supabase only (skips cleanly otherwise). Broadcast/Presence authorize channels through RLS on realtime.messages, and the tenant lives in the TOPIC (org_A:notifications). Joining a channel is a write, so an unpinned INSERT policy lets anyone publish into another tenant's channel.",
+    "topicSeparator": ":",
+    "allowlist": []
+  },
+
+  "constraintOracles": {
+    "//": "Catalog-only, no probing. RLS hides rows, not constraints: a globally UNIQUE natural key on a tenant table lets anyone test whether a value exists in another tenant. Allowlist keys that are global by design (a public slug, a billing id).",
+    "schemas": ["public"],
+    "allowlist": ["public.orgs"]
   }
 }

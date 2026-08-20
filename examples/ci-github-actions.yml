@@ -1,11 +1,51 @@
-# Drop into .github/workflows/. One job, no npm install — tenant-guard has zero deps.
+# Drop into .github/workflows/.
+#
+# Two jobs on purpose:
+#   • `static`  — zero dependencies, no database, no npm install. Runs on every
+#     push in seconds and blocks the merge on the obvious leaks.
+#   • `runtime` — the proofs that need a real Postgres. Point it at a SEEDED
+#     TEST database, never production: these guards write (inside a rolled-back
+#     transaction, but they write).
+#
+# A guard with nothing to check SKIPS rather than failing — and a skip is never
+# reported as a pass.
 name: tenant-guard
 on: [push, pull_request]
+
 jobs:
-  tenant-guard:
+  static:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
       - run: npx tenant-guard run
+
+  runtime:
+    runs-on: ubuntu-latest
+    # Drop this `services` block if you already have a seeded staging database
+    # and pass its URL through secrets instead.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready --health-interval 10s
+          --health-timeout 5s --health-retries 5
+        ports: ['5432:5432']
+    env:
+      TENANT_GUARD_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+
+      # Apply your migrations here, then seed at least two tenants — the proofs
+      # need two to compare. If seeding is awkward, set `rlsProof.seed` in your
+      # config and tenant-guard will manufacture two synthetic tenants itself,
+      # inside the transaction it rolls back.
+      # - run: supabase db push   # or psql -f, or your migration tool
+
+      - run: npm i -D pg
+      - run: npx tenant-guard all

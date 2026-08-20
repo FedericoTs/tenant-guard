@@ -16,22 +16,16 @@
 Not a scanner you run and then ignore. These are checks that live in your repo,
 run in `npm test` and your CI, and **block the merge** — so the cross-tenant
 leak never ships. The static guards have **zero dependencies** and run in CI
-without `npm ci`; the runtime proof adds a real Postgres check when you opt in.
+without `npm ci`; the runtime guards add real Postgres proofs when you opt in.
 
 ```bash
 npx tenant-guard init     # detects your migrations + API routes, writes a config
 npx tenant-guard run      # static guards — exit 1 if anything can leak
-npx tenant-guard prove    # runtime proof — exit 1 if a tenant can read/write another tenant
-npx tenant-guard drift    # exit 1 if the DB has RLS/policies no migration declares
-npx tenant-guard anon-writes  # exit 1 if the anonymous role can write any table
-npx tenant-guard anon-reads   # exit 1 if the anonymous role can read any tenant table
-npx tenant-guard views        # exit 1 if a view/materialized view leaks across tenants
-npx tenant-guard identity     # exit 1 if the identity your policies trust is forgeable
-npx tenant-guard storage      # exit 1 if Supabase Storage leaks across tenant folders
-npx tenant-guard oracles      # exit 1 if a UNIQUE key reveals another tenant’s rows
-npx tenant-guard realtime     # exit 1 if Realtime channels leak across tenants
-npx tenant-guard all          # run every guard above, in order
+npx tenant-guard all      # everything: static guards + every runtime proof
 ```
+
+Or run one at a time: `prove`, `drift`, `anon-reads`, `anon-writes`, `identity`,
+`views`, `storage`, `realtime`, `oracles`. `npx tenant-guard list` describes each.
 
 ---
 
@@ -78,22 +72,42 @@ tenant-guard  — guard tests for multi-tenant isolation
 
 ## The guards
 
+**Static** — read files on disk, zero dependencies, no database:
+
 | Guard | Fails when… | Why a scanner misses it |
 |---|---|---|
 | `route-org-scoping` | an authenticated route filters by a bare `id` and never mentions a tenant column | catches the *shape* of the IDOR (auth + bare-id + no-tenant), and it lives in your CI so it blocks the merge instead of adding one more report |
 | `definer-grants` | a mutating `SECURITY DEFINER` function's **final** definition isn't revoked from `PUBLIC`/`anon` | requires knowing Postgres default grants + PostgREST exposure interact — *revoking from `anon` alone is a no-op*; judged on the net state of history, so a fix in a later repair migration counts |
 | `migration-collisions` | two migrations share a numeric prefix | a project-specific CI invariant (your numbering scheme), not a code smell |
-| `rls-proof` *(runtime)* | a tenant's session can actually read **or write** another tenant's rows | it isn't reading source at all — it runs real queries as your app role (SELECT, plus `UPDATE`/`DELETE`/tenant-hop/`INSERT` probes) and measures the leak; nothing static can prove isolation *holds*, and RLS is per-command so reads passing says nothing about writes |
-| `rls-drift` *(runtime)* | the database has RLS enabled or a policy that **no migration declares** | catches security posture applied by hand in the dashboard/psql — invisible to code review, absent from CI, changeable with no diff or history |
-| `anon-writes` *(runtime)* | the **anonymous** role can INSERT/UPDATE/DELETE a table | a table with no tenant column, writable by `anon`, is neither a tenant leak nor drift — it's the cache-poisoning class; it proves the real `USING`/`WITH CHECK` by probing, so it doesn't false-flag `TO public USING (auth.uid()…)` policies |
-| `anon-reads` *(runtime)* | the **anonymous** role can SELECT a **tenant** table, view, or materialized view | the CVE-2025-48757 class — the public anon key reads every tenant's data with no login; scoped to objects with a tenant column so public content isn't flagged, and it *probes* as `anon` so it evaluates the real policy, not just the grant |
-| `identity-trust` *(runtime)* | the caller can **forge the identity** your policies authorize from, or **write the table that grants it** | every other guard asks "given a correct identity, is the data scoped?" — this asks whether the identity itself is controllable: a policy reading `user_metadata` (which the *user* can rewrite) is defeated by forging that claim; a callable `SECURITY DEFINER` that sets your tenant GUC from an argument is a "become any tenant" primitive; a `memberships` table the caller can write makes a *flawless* policy bypassable — insert yourself into any org and the policy hands over that org's data, legitimately; and because **RLS is row-level and cannot restrict columns**, a correct `USING (id = auth.uid())` self-update policy still lets a user set their own `role` or re-parent their `organization_id` |
-| `storage-isolation` *(runtime)* | Supabase **Storage** leaks across tenant folders | storage has no tenant *column* — tenancy lives in the object **path**, so the tenant is an expression over `name`. Two things follow that a column-based check cannot see: the **client picks the path on upload**, so a perfect read policy still lets a user write into another tenant's folder; and a **public bucket** is served with no auth and no RLS at all, making "the path is unguessable" the whole boundary |
-| `constraint-oracles` *(catalog)* | a constraint answers questions **across** tenants | RLS hides rows, not constraints — and constraints are enforced *below* it. `users.email UNIQUE` on a tenant table means inserting `victim@corp.com` raises a duplicate-key error even though RLS hides the row that caused it, so anyone can test whether a value exists in another tenant (and `ON CONFLICT DO NOTHING` asks the same question with no error at all). Nothing about the policies is wrong; the *schema* is the leak |
-| `realtime-isolation` *(runtime)* | Supabase **Realtime** channels leak across tenants | Realtime is a second way out of the database, and it is easy to forget once REST looks locked down. Broadcast and Presence authorize channels through RLS on `realtime.messages` — with none, any client joins any tenant's channel, reads every payload on it, and (since joining is a write) **publishes into it**. The tenant lives in the *topic*, not a column |
-| `view-isolation` *(runtime)* | a **view** or **materialized view** leaks across tenants | a view runs with its **owner's** rights unless `security_invoker` is set, and RLS **never applies to a materialized view at all** — so a perfectly-RLS'd table can still be handed out wholesale by the view beside it, and every table-only checker (including `rls-proof`) sees nothing wrong |
 
-`npx tenant-guard list` describes each.
+**Runtime — the core proof**, against a seeded test database:
+
+| Guard | Fails when… | Why a scanner misses it |
+|---|---|---|
+| `rls-proof` | a tenant's session can actually read **or write** another tenant's rows | it isn't reading source at all — it runs real queries as your app role (SELECT, plus `UPDATE`/`DELETE`/tenant-hop/`INSERT`/omitted-tenant probes) and measures the leak; nothing static can prove isolation *holds*, and RLS is per-command so reads passing says nothing about writes |
+| `rls-drift` | the database has RLS enabled or a policy that **no migration declares** | catches security posture applied by hand in the dashboard/psql — invisible to code review, absent from CI, changeable with no diff or history |
+
+**Runtime — who can reach your data:**
+
+| Guard | Fails when… | Why a scanner misses it |
+|---|---|---|
+| `anon-reads` | the **anonymous** role can SELECT a **tenant** table, view, or materialized view | the CVE-2025-48757 class — the public anon key reads every tenant's data with no login; scoped to objects with a tenant column so public content isn't flagged, and it *probes* as `anon` so it evaluates the real policy, not just the grant |
+| `anon-writes` | the **anonymous** role can INSERT/UPDATE/DELETE a table | a table with no tenant column, writable by `anon`, is neither a tenant leak nor drift — it's the cache-poisoning class; it proves the real `USING`/`WITH CHECK` by probing, so it doesn't false-flag `TO public USING (auth.uid()…)` policies |
+| `identity-trust` | the caller can **forge the identity** your policies authorize from, or **write the thing that grants it** | every other guard asks "given a correct identity, is the data scoped?" — this asks whether the identity itself is controllable. A policy reading `user_metadata` (which the *user* can rewrite) is defeated by forging that claim; a callable `SECURITY DEFINER` that sets your tenant GUC from an argument is a "become any tenant" primitive; a `memberships` table the caller can write makes a *flawless* policy bypassable; and because **RLS is row-level and cannot restrict columns**, a correct `USING (id = auth.uid())` self-update policy still lets a user set their own `role` or re-parent their `organization_id` |
+
+**Runtime — the surfaces that aren't base tables:**
+
+| Guard | Fails when… | Why a scanner misses it |
+|---|---|---|
+| `view-isolation` | a **view** or **materialized view** leaks across tenants | a view runs with its **owner's** rights unless `security_invoker` is set, and RLS **never applies to a materialized view at all** — so a perfectly-RLS'd table can still be handed out wholesale by the view beside it, and every table-only checker (including `rls-proof`) sees nothing wrong |
+| `storage-isolation` | Supabase **Storage** leaks across tenant folders | storage has no tenant *column* — tenancy lives in the object **path**. Two things follow that a column-based check cannot see: the **client picks the path on upload**, so a perfect read policy still lets a user write into another tenant's folder; and a **public bucket** is served with no auth and no RLS at all, making "the path is unguessable" the whole boundary |
+| `realtime-isolation` | Supabase **Realtime** channels leak across tenants | Realtime is a second way out of the database, easy to forget once REST looks locked down. Broadcast and Presence authorize channels through RLS on `realtime.messages` — with none, any client joins any tenant's channel, reads every payload on it, and (since joining is a write) **publishes into it**. The tenant lives in the *topic*, not a column |
+
+**Catalog** — the schema's shape rather than its behaviour:
+
+| Guard | Fails when… | Why a scanner misses it |
+|---|---|---|
+| `constraint-oracles` | a constraint answers questions **across** tenants | RLS hides rows, not constraints — and constraints are enforced *below* it. `users.email UNIQUE` on a tenant table means inserting `victim@corp.com` raises a duplicate-key error even though RLS hides the row that caused it, so anyone can test whether a value exists in another tenant (and `ON CONFLICT DO NOTHING` asks the same question with no error at all). Nothing about the policies is wrong; the *schema* is the leak |
 
 ## How it fits your project
 
@@ -101,18 +115,19 @@ tenant-guard runs **inside your repository**, against the files already on disk.
 It is **not** a scanner you point at a URL or a website, and there is no hosted
 service — you run it where your code is (locally or in CI). The only thing you
 ever "point it at" is a **test database connection string**, and only for the
-optional runtime proof.
+runtime guards.
 
 | Part | What it reads | What you provide |
 |---|---|---|
 | static guards (`run`) | your API-route and SQL-migration **files** in the current directory | nothing — it reads the folder |
-| runtime proof (`prove`) | a live **Postgres** database | a connection string to a *test/staging* DB (never a URL, never prod) |
+| runtime guards (`prove`, `drift`, `anon-*`, `identity`, `views`, `storage`, `realtime`, `oracles`) | a live **Postgres** database | a connection string to a *test/staging* DB (never a URL, never prod) |
+| everything (`all`) | both of the above, in order | as above — anything without a database **skips**, and a skip is never a pass |
 
 Three places it runs, all inside the repo:
 
 - **Locally** — `cd your-project && npx tenant-guard run` scans that folder.
-- **In CI** — your pipeline checks out the repo and runs `npx tenant-guard run`,
-  so a leak **blocks the merge** (that's the CI badge at the top).
+- **In CI** — your pipeline checks out the repo and runs `npx tenant-guard run`
+  (or `all`, with a test database), so a leak **blocks the merge**.
 - **In your test suite** — `import { runAll, prove } from 'tenant-guard'` and
   assert no violations, so it runs with `npm test`.
 
@@ -127,11 +142,12 @@ run as a SaaS.
 
 ## Prove it at runtime — the part no scanner can do
 
-The three guards above read source text: they catch the obvious leak cheaply,
-but they can't *prove* isolation holds. `tenant-guard prove` can. Against a
-seeded test database it:
+The static guards read source text: they catch the obvious leak cheaply, but they
+can't *prove* isolation holds. `tenant-guard prove` can. Against a seeded test
+database it:
 
-1. finds every table with a tenant column, noting whether RLS is even on;
+1. finds every table with a tenant column — including **partitioned** tables and
+   each of their partitions — noting whether RLS is even on;
 2. as the privileged role (which bypasses RLS, like Supabase `service_role`)
    picks two real tenant ids that already have data;
 3. drops to your **non-superuser app role** (e.g. `authenticated`), assumes
@@ -148,6 +164,12 @@ does not cover `UPDATE`/`DELETE`, and `USING` does not cover `INSERT` or where a
 update *lands*; those need `WITH CHECK`), or **RLS is on with no policy at all** (a
 deny-all that only *looks* isolated), the proof names it and **fails your build**.
 
+**Before trusting any pass it runs a negative control**: it drops to your app role
+and asserts that role *cannot* read a deliberately deny-all table. If it can, RLS
+isn't being enforced for it — a superuser, a `BYPASSRLS` role, a table owner — so
+every "isolated" result would be a vacuous pass, and the run fails instead of
+reporting one. A check you can't falsify is worthless.
+
 See it catch a real leak with zero infrastructure:
 
 ```bash
@@ -163,57 +185,56 @@ export TENANT_GUARD_DATABASE_URL="postgres://…/your_test_db"
 npx tenant-guard prove
 ```
 
-It runs read probes plus `UPDATE`/`DELETE` write probes, each inside a `SAVEPOINT`
-that is rolled back, and the whole run is one transaction that is rolled back —
-non-destructive by construction (set `probeWrites: false` to test reads only). A
-skip (no database, or `pg` not installed) is **not** a pass, and the CLI says so.
-Full setup — including the Supabase JWT-claim config — is in
+Every write probe runs inside a `SAVEPOINT` that is rolled back, and the whole run
+is one transaction that is rolled back — non-destructive by construction (set
+`probeWrites: false` to test reads only). A skip (no database, or `pg` not
+installed) is **not** a pass, and the CLI says so. Full setup — including the
+Supabase JWT-claim config and seeding mode for an empty CI database — is in
 [`examples/rls-proof/`](examples/rls-proof/README.md).
 
-## Prove your RLS is in version control
+## The rest of the surface
 
-RLS can be turned on and given policies **by hand in the Supabase dashboard** (or
-a psql one-off) and never captured in a migration. When that happens, the table's
-real security posture is invisible to code review, absent from every fresh / CI
-database, and editable in the UI with no diff and no history. A permissive policy
-that lets `anon` write a shared table can live in production for months and never
-appear in a single pull request. (That's not hypothetical — it's how a real
-cache-poisoning bug hid in a Supabase app we ran this against.)
+Each of these is one command, inherits the same identity config, and skips cleanly
+when it doesn't apply to your stack.
 
-```bash
-export TENANT_GUARD_DATABASE_URL="postgres://…/your_test_db"
-npx tenant-guard drift
-```
+**`drift` — prove your RLS is in version control.** RLS can be enabled and given
+policies **by hand in the Supabase dashboard** and never captured in a migration.
+When that happens the table's real posture is invisible to code review, absent
+from every fresh/CI database, and editable in the UI with no diff and no history.
+A permissive policy letting `anon` write a shared table can live in production for
+months without appearing in a single pull request. (Not hypothetical — it's how a
+real cache-poisoning bug hid in a Supabase app we ran this against.) `drift` diffs
+every `ENABLE ROW LEVEL SECURITY` / `CREATE POLICY` in your migrations (net of
+`DROP`/`DISABLE`) against the live catalog; anything in the database that no
+migration declares fails the build.
 
-`drift` reads every `ENABLE ROW LEVEL SECURITY` and `CREATE POLICY` in your
-migrations (net of `DROP`/`DISABLE`) and compares it to what the database actually
-has (`pg_policies` + `pg_class.relrowsecurity`). Anything present in the database
-but declared in **no** migration fails the build — so a hand-edited policy can't
-stay invisible. It's read-only (two catalog queries, no transaction needed), and
-it skips cleanly with no database. Allowlist anything you intentionally manage
-outside migrations (e.g. Supabase-managed policies) in `rlsDrift.allowlist`.
-
-## Catch the unauthenticated write surface
-
-The tenant guards ask "can tenant A touch tenant B?" — but a table with **no
-tenant column**, writable by `anon`, is neither a tenant leak nor drift. It's how
-a shared cache gets poisoned: the public anon key ships in every browser bundle,
-so if `anon` can write the table, anyone can rewrite what every user reads. Almost
-no table should accept unauthenticated writes.
-
-```bash
-export TENANT_GUARD_DATABASE_URL="postgres://…/your_test_db"
-npx tenant-guard anon-writes
-```
-
-The reliability is the point. Well-secured Supabase apps write policies
+**`anon-reads` / `anon-writes` — the unauthenticated surface.** The public anon key
+ships in every browser bundle. `anon-reads` proves it can't SELECT tenant data
+(the CVE-2025-48757 class); `anon-writes` proves it can't write a shared table (the
+cache-poisoning class). Reliability is the point: well-secured Supabase apps write
 `TO public USING (auth.uid() = …)`, which a catalog-only check can't evaluate and
-would false-flag. So `anon-writes` is a hybrid: the unambiguous **RLS-off + grant**
-case from the catalog, and for **RLS-on** tables it drops to `anon` and *actually
-attempts* `UPDATE`/`DELETE` (each in a rolled-back savepoint) — evaluating the real
-`USING`/`WITH CHECK`, no guessing. It shares `rls-proof`'s negative control
-(aborts if `anon` bypasses RLS), and `anonWrites.allowlist` covers tables that are
-public-write by design.
+would false-flag — so both **probe as `anon`** and evaluate the real
+`USING`/`WITH CHECK` rather than guessing from grants.
+
+**`identity` — can the caller forge the identity itself?** Everything above assumes
+the identity is honest. This asks whether it is: a policy authorizing from
+`user_metadata` (user-writable, unlike `app_metadata`) is *proven* forgeable by
+forging exactly that claim; a callable `SECURITY DEFINER` that sets your tenant GUC
+from an argument is a "become any tenant" primitive; a membership table you can
+write makes a correct policy bypassable; and a self-update policy still lets you
+rewrite the `role` column that grants your access, because **RLS cannot restrict
+columns** — only a column-level `GRANT` can.
+
+**`views`, `storage`, `realtime` — the surfaces that aren't base tables.** A view
+runs with its *owner's* rights unless `security_invoker` is set; a materialized
+view ignores RLS entirely; Storage and Realtime key tenancy off an object **path**
+and a channel **topic** rather than a column, and in both the *client* chooses that
+string when it writes. Each is invisible to a table-only check — there is a test
+asserting `rls-proof` passes while `view-isolation` fails on the same database.
+
+**`oracles` — the schema itself.** RLS hides rows, not constraints. A globally
+`UNIQUE` natural key on a tenant table lets anyone test whether a value exists in
+another tenant, through an error message they were never meant to see.
 
 ## Why not just a SAST scanner?
 
@@ -237,14 +258,27 @@ npx tenant-guard init          # writes tenant-guard.config.json
 npx tenant-guard run           # allowlist any legacy finding you can't fix yet
 ```
 
-Then wire it into CI (GitHub Actions example ships in
-`examples/ci-github-actions.yml`) — one job, no install:
+Then wire it into CI (a full example ships in
+`examples/ci-github-actions.yml`). The static guards need no install and no
+database:
 
 ```yaml
 - uses: actions/setup-node@v4
   with: { node-version: '20' }
 - run: npx tenant-guard run
 ```
+
+Add the runtime proofs in a job that has a seeded test database:
+
+```yaml
+- run: npm i -D pg
+- run: npx tenant-guard all
+  env:
+    TENANT_GUARD_DATABASE_URL: ${{ secrets.TEST_DATABASE_URL }}
+```
+
+> **Never point the runtime guards at production.** They write — inside a
+> rolled-back transaction, but they write. Use a seeded test or staging database.
 
 Or import the guards into your existing vitest/jest suite:
 
@@ -256,12 +290,12 @@ test('no cross-tenant leaks (static)', () => {
 });
 ```
 
-The runtime proof drops straight into your suite too — hand it any Postgres
+The runtime guards drop straight into your suite too — hand any of them a Postgres
 client whose `query(text, values)` returns `{ rows }` (node-postgres, or an
 embedded pglite in tests):
 
 ```js
-import { prove } from 'tenant-guard';
+import { prove, checkViews, checkIdentity } from 'tenant-guard';
 test('RLS actually isolates tenants', async () => {
   const res = await prove({ query: (t, v) => pool.query(t, v) });
   expect(res.violations).toEqual([]);
@@ -271,23 +305,40 @@ test('RLS actually isolates tenants', async () => {
 ## Config
 
 `tenant-guard.config.json` (see `examples/tenant-guard.config.json` for the
-annotated version). Every guard is opt-in and autodetects its paths; a guard
-that doesn't apply to your stack **skips**, it never fails you.
+annotated version, or run `tenant-guard init` to generate it). Every guard is
+opt-in and autodetects its paths; a guard that doesn't apply to your stack
+**skips**, it never fails you.
 
 ```json
 {
-  "migrations":     { "dir": "supabase/migrations", "grandfather": ["031", "101"] },
-  "definerGrants":  { "baseline": 189, "allowlist": ["validate_public_token"] },
-  "routeOrgScoping":{ "routesDir": "src/app/api", "allowlist": [] },
-  "rlsProof":       { "role": "authenticated", "tenantColumns": ["organization_id"], "grandfather": ["shared_lookup"] },
-  "rlsDrift":       { "schemas": ["public"], "allowlist": ["public.some_supabase_managed_table"] }
+  "migrations":        { "dir": "supabase/migrations", "grandfather": ["031", "101"] },
+  "definerGrants":     { "baseline": 189, "allowlist": ["validate_public_token"] },
+  "routeOrgScoping":   { "routesDir": "src/app/api", "allowlist": [] },
+  "rlsProof":          { "role": "authenticated", "claim": "org_id", "tenantColumns": ["organization_id"], "grandfather": ["shared_lookup"] },
+  "rlsDrift":          { "schemas": ["public"], "allowlist": ["public.some_supabase_managed_table"] },
+  "anonReads":         { "role": "anon", "allowlist": ["public.published_posts"] },
+  "anonWrites":        { "role": "anon", "allowlist": [] },
+  "identityTrust":     { "allowlist": [] },
+  "viewIsolation":     { "allowlist": ["public.admin_reporting_view"] },
+  "storageIsolation":  { "pathSegment": 1, "allowlist": ["brand-assets"] },
+  "realtimeIsolation": { "topicSeparator": ":", "allowlist": [] },
+  "constraintOracles": { "allowlist": ["public.orgs"] }
 }
 ```
 
-`rlsProof` runs only when `TENANT_GUARD_DATABASE_URL` (or `DATABASE_URL`) is set,
-so it stays skipped until you opt in. `becomeTenant` (how a session assumes a
-tenant identity) defaults to the canonical Postgres GUC pattern; override it for
-Supabase JWT policies — see [`examples/rls-proof/`](examples/rls-proof/README.md).
+The runtime guards run only when `TENANT_GUARD_DATABASE_URL` (or `DATABASE_URL`)
+is set, so they stay skipped until you opt in. **Identity is configured once**:
+`viewIsolation`, `identityTrust`, `storageIsolation` and `realtimeIsolation`
+inherit `role` / `becomeTenant` / `claim` from `rlsProof` unless you override them.
+
+**Assuming a tenant's identity.** `becomeTenant` defaults to the canonical
+Postgres GUC pattern. For Supabase JWT policies the `claim` shortcut is usually all
+you need — `"claim": "org_id"` builds the `request.jwt.claims` impersonation and
+sets `role` to `authenticated`, so **CI never needs your JWT secret**. Apps that
+resolve the tenant through a memberships table use an explicit `becomeTenant`
+(arbitrary SQL) plus `rlsProof.seed`, which manufactures two synthetic tenants
+inside the rolled-back transaction so the proof works on an **empty CI database**.
+Details in [`examples/rls-proof/`](examples/rls-proof/README.md).
 
 **Per-user apps** (the tenant is a *user*, not an org). The defaults key off
 `organization_id`/`tenant_id` and deliberately **don't** treat `user_id` as a
@@ -319,27 +370,46 @@ apps.
 
 ## Honest limits
 
-The three static guards are **heuristics on source text**, deliberately
-conservative — they catch a bug *shape*, not every instance. The real defence
-for tenant isolation is **row-level security enforced in the database**, which is
-exactly why `rls-proof` exists: it doesn't guess from source, it runs a query as
-your app role and measures whether the isolation actually holds.
-
 **The full map is [`THREAT-MODEL.md`](THREAT-MODEL.md)** — every way tenant
-isolation is known to break, each tagged covered / partial / planned / out-of-scope
-(with *why*). It's the coverage target this project builds against, and the honest
-statement of what a green run does and doesn't prove.
+isolation is known to break, each tagged covered / partial / out-of-scope, with
+*why* for the ones that are out of scope. It is the coverage target this project
+builds against, and the honest statement of what a green run does and doesn't
+prove. Read it before trusting one.
 
-`rls-proof` has honest limits of its own. It proves isolation for the tables it
-can reach with the tenant identity you configure; it can only test tables that
-already hold two tenants' data (it reports the rest as *not proven*, never as
-passing); and it's only as good as the `becomeTenant` config matching how your
-app assumes a tenant — a mismatch shows up as "sees none of its own rows either",
-not a false pass. It reads and writes on a **tenant column** (SELECT + UPDATE /
-DELETE / tenant-hop / INSERT), so tables whose tenancy lives somewhere other than
-a column — notably Supabase's `storage.objects`, keyed by object path or `owner`
-— aren't covered by default yet (on the roadmap). It is a strong proof on every
-commit, not a substitute for a pen test.
+The **static** guards are heuristics on source text, deliberately conservative:
+they catch a bug *shape*, not every instance. The real defence is row-level
+security enforced in the database, which is exactly why the runtime guards exist —
+they don't guess from source, they run queries as your app role and measure
+whether isolation actually holds.
+
+The **runtime** guards have limits of their own, and report them rather than
+papering over them:
+
+- They prove isolation for what they can reach with the tenant identity you
+  configure. A mismatch between `becomeTenant` and your real policies shows up as
+  *"sees none of its own rows either"* — **not** as a false pass.
+- A table holding one tenant's data can often still be proven, by impersonating a
+  tenant that exists elsewhere. When it genuinely can't be, it is reported as
+  **not proven**, never as passing.
+- Some findings are deliberately **notes rather than build failures** — a
+  client-settable tenant GUC, `TRUNCATE` privilege, single-column foreign keys —
+  because whether they are exploitable depends on architecture SQL cannot see.
+  Failing the build on an unfalsifiable finding is how a security tool becomes
+  ignorable.
+
+And four classes are **out of scope by construction**, because "run SQL as the app
+role" cannot see them. They need a different instrument, and they stay listed in
+the threat model rather than being quietly omitted:
+
+- **App-layer IDOR** through a service-role/admin connection that forgets
+  `.eq('organization_id', …)`. The database serves it correctly; the bug is in the
+  application. (`route-org-scoping` covers the shape of this, statically.)
+- **A leaked `service_role` key** in a client bundle — needs a secret scan.
+- **Connection-pooler state bleed** (`SET` instead of `SET LOCAL` on a
+  transaction-pooled connection) — invisible from inside a single session.
+- **A weak or leaked JWT secret** — key management, not RLS.
+
+It is a strong proof on every commit, not a substitute for a pen test.
 
 ## Background
 
@@ -347,6 +417,11 @@ These guards were extracted from a production multi-tenant EU SaaS (now retired)
 where they ran green on every push. The interesting finding from that codebase
 is written up in [`METHODOLOGY.md`](METHODOLOGY.md): **the descriptive docs
 written for the AI agent all rotted, while every executable guard survived.**
+
+Since then the project stopped growing one reported bug at a time and started
+building down [`THREAT-MODEL.md`](THREAT-MODEL.md) instead — which promptly
+surfaced a **false negative in the flagship guard** (partitioned tables reporting
+green while leaking) that no amount of waiting for bug reports had found.
 
 ## Licence
 

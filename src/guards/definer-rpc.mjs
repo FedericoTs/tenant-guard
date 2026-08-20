@@ -47,6 +47,7 @@ import {
   distinctTenantsSql,
   DEFAULTS as PROOF_DEFAULTS,
 } from './rls-proof.mjs';
+import { parameterNames } from './identity-trust.mjs';
 
 export const meta = {
   id: 'definer-rpc',
@@ -87,6 +88,7 @@ export function definerRpcSql(schemas, role) {
            p.provolatile as volatility,
            p.pronargs::int as nargs,
            p.prosrc as body,
+           p.proconfig as config,
            pg_catalog.has_function_privilege($2::text, p.oid, 'EXECUTE') as can_execute,
            (select array_agg(pg_catalog.format_type(t, null) order by ord)
               from unnest(p.proargtypes) with ordinality as u(t, ord)) as arg_types
@@ -100,6 +102,70 @@ export function definerRpcSql(schemas, role) {
 }
 
 /** Postgres guarantees a non-volatile function cannot modify the database. */
+/**
+ * Does the app role hold CREATE on any schema? That is the precondition for
+ * exploiting an unpinned `search_path` — you can only shadow an object if you can
+ * create one. Without it, an unpinned search_path is untidy rather than dangerous.
+ */
+export function schemaCreateSql(role) {
+  return {
+    text: `select n.nspname as schema
+             from pg_catalog.pg_namespace n
+            where n.nspname not like 'pg\\_%' and n.nspname <> 'information_schema'
+              and pg_catalog.has_schema_privilege($1::text, n.oid, 'CREATE')`,
+    values: [role],
+  };
+}
+
+/**
+ * SQL **injection inside a `SECURITY DEFINER` function** — dynamic SQL built by
+ * concatenating a caller-supplied parameter.
+ *
+ * This is not generic SAST, and it is not in scope because "injection is bad". It
+ * is here because in this specific shape injection *is* a tenant-isolation
+ * failure: the injected SQL executes as the function's **owner**, so it bypasses
+ * RLS completely. A verified example — the table's policy is perfect, and
+ * `search_notes("%' or true --")` returns every tenant's rows.
+ *
+ * Deliberately narrow, so a finding is never a guess. Two unambiguous shapes:
+ *   • the parameter is `||`-concatenated into the string given to `EXECUTE`;
+ *   • it is passed to `format()` through **`%s`**, which does no escaping at all.
+ * `quote_literal()`, `quote_ident()`, `format('%L'/'%I')` and `EXECUTE … USING`
+ * are all correct and produce no finding. Anything this can't read confidently
+ * produces no finding either — silence beats a guess.
+ *
+ * @returns {{param:string, via:'concat'|'format-%s', snippet:string}|null}
+ */
+export function dynamicSqlInjection(body, params = []) {
+  const s = String(body || '');
+  if (!/\bexecute\b/i.test(s) || params.length === 0) return null;
+  // Each EXECUTE's SQL expression: everything up to USING / end of statement.
+  const stmts = [...s.matchAll(/\bexecute\b([\s\S]*?)(?:\busing\b|;|$)/gi)].map((m) => m[1]);
+  for (const stmt of stmts) {
+    for (const p of params) {
+      if (!new RegExp(`\\b${p}\\b`).test(stmt)) continue;
+      // Correctly quoted => not a finding.
+      if (new RegExp(`(quote_literal|quote_ident)\\s*\\(\\s*${p}\\b`, 'i').test(stmt)) continue;
+      const fmt = stmt.match(/\bformat\s*\(\s*'((?:[^']|'')*)'/i);
+      if (fmt) {
+        // format() is only unsafe through %s; %L and %I escape properly.
+        if (/%s/.test(fmt[1])) return { param: p, via: 'format-%s', snippet: stmt.trim().slice(0, 140) };
+        continue;
+      }
+      // Bare concatenation of the parameter into the SQL string.
+      if (new RegExp(`\\|\\|[^;]*\\b${p}\\b|\\b${p}\\b[^;]*\\|\\|`).test(stmt)) {
+        return { param: p, via: 'concat', snippet: stmt.trim().slice(0, 140) };
+      }
+    }
+  }
+  return null;
+}
+
+/** Is `search_path` pinned on this function? (`proconfig` holds `SET` clauses.) */
+export function searchPathPinned(config) {
+  return Array.isArray(config) && config.some((c) => /^search_path=/i.test(String(c)));
+}
+
 export function isReadOnlyVolatility(volatility) {
   return volatility === 's' || volatility === 'i';
 }
@@ -241,6 +307,15 @@ export async function check({ query, config = {} }) {
   let scanned = 0;
   let proven = 0;
 
+  // Precondition for the search_path hijack: you can only shadow an object if
+  // you can create one. Without CREATE anywhere, an unpinned path is untidy, not
+  // dangerous — and saying so is the difference between a finding and noise.
+  let writableSchemas = [];
+  try {
+    const sc = schemaCreateSql(role);
+    writableSchemas = (await q(sc.text, sc.values)).map((r) => r.schema);
+  } catch { /* optional */ }
+
   await query('begin', []);
   try {
     // Negative control: the app role must actually be subject to RLS.
@@ -278,6 +353,43 @@ export async function check({ query, config = {} }) {
         consultsIdentity: bodyConsultsIdentity(fn.body),
         touchesTenantTable: bodyTouchesTenantTable(fn.body, tenantTables),
       };
+      const fqn = `${fn.schema}.${fn.name}(${fn.args || ''})`;
+
+      // ── body checks: these read the source, so unlike the probe they apply to
+      // VOLATILE functions too — which matters, because plpgsql defaults to
+      // VOLATILE and that is exactly where dynamic SQL lives.
+      if (canExecute) {
+        const inj = dynamicSqlInjection(fn.body, parameterNames(fn.args));
+        if (inj) {
+          violations.push({
+            where: fqn,
+            kind: 'sql-injection',
+            message:
+              `SQL INJECTION in a SECURITY DEFINER function: the "${inj.param}" argument is ${inj.via === 'concat' ? 'concatenated straight into' : 'passed through format() with %s into'} the SQL given to EXECUTE, and "${role}" may call it. ` +
+              `Injected SQL runs as the function's OWNER, so it bypasses RLS entirely — a caller can append "or true --" and read every tenant's rows however correct the table's policies are. ` +
+              `Near: ${inj.snippet}`,
+            fix:
+              `Bind the value instead of building SQL out of it:\n` +
+              `        EXECUTE 'select … where note like $1' USING ${inj.param};\n` +
+              `      If it must be interpolated, escape it explicitly — quote_literal(${inj.param}) for a value, quote_ident(${inj.param}) for an identifier, or format('… %L …', ${inj.param}). Note that format's %s does NO escaping at all.`,
+          });
+        }
+        if (!searchPathPinned(fn.config) && writableSchemas.length > 0) {
+          violations.push({
+            where: fqn,
+            kind: 'search-path',
+            message:
+              `SECURITY DEFINER function with no pinned search_path, and "${role}" can CREATE objects in ${writableSchemas.slice(0, 3).map((s) => `"${s}"`).join(', ')}. ` +
+              `Unqualified names inside the function resolve through the CALLER's search_path, so a caller who creates a table or function earlier on that path makes this function operate on THEIR object — executing as the definer's owner, with RLS bypassed.`,
+            fix:
+              `Pin it, so the body always resolves the objects you meant:\n` +
+              `        ALTER FUNCTION ${fn.schema}.${fn.name}(${fn.args || ''}) SET search_path = pg_catalog, ${fn.schema};\n` +
+              `      And revoke the ability to create objects on the shared path: REVOKE CREATE ON SCHEMA public FROM ${role};`,
+          });
+        } else if (!searchPathPinned(fn.config)) {
+          notes.push({ where: fqn, message: `SECURITY DEFINER function with no pinned search_path. Not exploitable here — "${role}" cannot CREATE objects in any schema, so it has nowhere to plant a shadowing object — but pinning it (SET search_path = pg_catalog, ${fn.schema}) keeps it that way.` });
+        }
+      }
 
       // VOLATILE and unreachable functions never get called.
       if (!canExecute || !isReadOnlyVolatility(fn.volatility)) {

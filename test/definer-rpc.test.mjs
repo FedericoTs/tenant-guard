@@ -14,6 +14,9 @@ import {
   noArgProbeSql,
   tenantArgProbeSql,
   classifyRpc,
+  dynamicSqlInjection,
+  searchPathPinned,
+  schemaCreateSql,
 } from '../src/guards/definer-rpc.mjs';
 
 test('definerRpcSql: only SECURITY DEFINER, excludes triggers, reads volatility + EXECUTE grant', () => {
@@ -115,4 +118,50 @@ test('classify: no EXECUTE grant -> skipped, never a finding', () => {
 
 test('classify: zero foreign rows -> safe', () => {
   assert.equal(classifyRpc({ schema: 'public', name: 'f', volatility: 's', canExecute: true, mode: 'no-args', foreignRows: 0 }).status, 'safe');
+});
+
+// ── injection + search_path (0.17.0) ─────────────────────────────────
+
+test('dynamicSqlInjection: bare concatenation of a parameter into EXECUTE -> flagged', () => {
+  const hit = dynamicSqlInjection(
+    `begin return query execute 'select * from t where n like ''%' || q || '%'''; end`,
+    ['q'],
+  );
+  assert.ok(hit);
+  assert.equal(hit.param, 'q');
+  assert.equal(hit.via, 'concat');
+});
+
+test('dynamicSqlInjection: format() with %s is flagged; %L and %I are not', () => {
+  assert.equal(dynamicSqlInjection(`execute format('select * from t where a = %s', q);`, ['q']).via, 'format-%s');
+  assert.equal(dynamicSqlInjection(`execute format('select * from t where a = %L', q);`, ['q']), null);
+  assert.equal(dynamicSqlInjection(`execute format('select * from %I', q);`, ['q']), null);
+});
+
+test('dynamicSqlInjection: EXECUTE … USING and quote_literal are the correct forms', () => {
+  assert.equal(dynamicSqlInjection(`execute 'select * from t where a = $1' using q;`, ['q']), null);
+  assert.equal(dynamicSqlInjection(`execute 'select * from t where a = ' || quote_literal(q);`, ['q']), null);
+  assert.equal(dynamicSqlInjection(`execute 'select * from ' || quote_ident(q);`, ['q']), null);
+});
+
+test('dynamicSqlInjection: silent when there is no EXECUTE, no params, or nothing it can read', () => {
+  assert.equal(dynamicSqlInjection(`select * from t where a = q`, ['q']), null); // no dynamic SQL
+  assert.equal(dynamicSqlInjection(`execute 'select 1';`, []), null);            // no parameters
+  assert.equal(dynamicSqlInjection(null, ['q']), null);
+  // a parameter merely mentioned outside the EXECUTE string is not a finding
+  assert.equal(dynamicSqlInjection(`if q is null then return; end if; execute 'select 1';`, ['q']), null);
+});
+
+test('searchPathPinned: reads proconfig, tolerating null and unrelated settings', () => {
+  assert.equal(searchPathPinned(['search_path=pg_catalog, public']), true);
+  assert.equal(searchPathPinned(['SEARCH_PATH=public']), true);
+  assert.equal(searchPathPinned(['statement_timeout=5s']), false);
+  assert.equal(searchPathPinned(null), false);
+  assert.equal(searchPathPinned([]), false);
+});
+
+test('schemaCreateSql: asks which schemas the role can CREATE in (the exploit precondition)', () => {
+  const { text, values } = schemaCreateSql('authenticated');
+  assert.match(text, /has_schema_privilege\(\$1::text, n\.oid, 'CREATE'\)/);
+  assert.deepEqual(values, ['authenticated']);
 });

@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.17.0
+
+Still in 4.3's neighbourhood, and the answer to "should this do SQL-injection
+checks too?" — which is **yes, for exactly one shape, and no for the rest**.
+
+- **feat(definer-rpc): SQL injection inside a `SECURITY DEFINER` function.**
+  Generic injection scanning belongs in semgrep/CodeQL, and bolting it on here
+  would produce precisely the alert fatigue this project argues against. But in
+  *this* shape injection isn't a generic bug — it is a **tenant-isolation
+  failure**, because the injected SQL executes as the function's **owner** and so
+  bypasses RLS wholesale. Verified before building: a table with a flawless policy
+  returns 1 row to its tenant, while `search_notes` with a payload of
+  `%' or true --` returns every tenant's rows. Both existing guards reported green.
+  - Read from the **body**, so unlike the call-probe it also covers `VOLATILE`
+    functions — which matters, because plpgsql defaults to VOLATILE and that is
+    exactly where dynamic SQL lives.
+  - Deliberately narrow, so a finding is never a guess: `||`-concatenation of a
+    parameter into `EXECUTE`, and `format()`'s **`%s`** (which escapes nothing).
+    `EXECUTE … USING`, `quote_literal`, `quote_ident`, `%L` and `%I` are correct
+    and produce nothing. Anything it cannot read confidently produces nothing
+    either — silence beats a guess.
+- **feat(definer-rpc): unpinned `search_path` (threat-model 4.4).** Unqualified
+  names inside a definer function resolve through the **caller's** `search_path`,
+  so a caller who can create objects can make the function operate on theirs —
+  executing as the owner. Fails **only when that precondition holds**: the role
+  must hold `CREATE` somewhere to plant the shadowing object. Otherwise it is a
+  note, because you cannot exploit what you cannot create.
+- Threat model **4.4 covered**, and **4.10 added** — the first row the map gained
+  from someone asking a question it had no entry for.
+- 303 tests (was 292).
+
 ## 0.16.0
 
 A Reddit reviewer asked for "RPCs where SECURITY DEFINER + grants can quietly

@@ -1,7 +1,7 @@
 {
   "name": "tenant-guard",
-  "version": "0.23.0",
-  "description": "Guard tests that fail your CI when multi-tenant code can leak across tenants. 19 guards: static ones run zero-dependency, runtime ones prove one tenant can't read OR write another \u2014 reads, writes, tenant-hop, INSERT, views, materialized views, partitions, SECURITY DEFINER RPCs, Storage paths, Realtime channels, schema-per-tenant, connection-scoped tenant GUCs that bleed across pooled requests, what a table created tomorrow will inherit, foreign keys letting one tenant delete another tenant's rows, the anon surface, and whether the identity your policies trust can be forged. GitHub Action + SARIF + JSON output. Checks that live in your repo and block the merge.",
+  "version": "0.24.0",
+  "description": "Guard tests that fail your CI when multi-tenant code can leak across tenants. 20 guards: static ones run zero-dependency, runtime ones prove one tenant can't read OR write another \u2014 reads, writes, tenant-hop, INSERT, views, materialized views, partitions, SECURITY DEFINER RPCs, Storage paths, Realtime channels, schema-per-tenant, connection-scoped tenant GUCs that bleed across pooled requests, what a table created tomorrow will inherit, foreign keys letting one tenant delete another tenant's rows, the anon surface, and whether the identity your policies trust can be forged. GitHub Action + SARIF + JSON output. Checks that live in your repo and block the merge.",
   "type": "module",
   "license": "MIT",
   "author": "Federico Sciuca",
@@ -31,7 +31,8 @@
     "./output/markdown": "./src/output/markdown.mjs",
     "./guards/pooler-bleed": "./src/guards/pooler-bleed.mjs",
     "./guards/default-privileges": "./src/guards/default-privileges.mjs",
-    "./guards/cross-tenant-fk": "./src/guards/cross-tenant-fk.mjs"
+    "./guards/cross-tenant-fk": "./src/guards/cross-tenant-fk.mjs",
+    "./guards/create-grants": "./src/guards/create-grants.mjs"
   },
   "files": [
     "bin",

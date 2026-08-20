@@ -105,7 +105,7 @@ The highest-severity blind spot of any table-only scanner.
 | 4.1 | **View without `security_invoker`** — runs as its owner, so base-table RLS is evaluated as the owner and returns every tenant | ✅ | `view-isolation` probes every tenant-column view as the app role; the catalog (owner, `security_invoker`, kind) is used only to explain *why* and pick the right fix |
 | 4.2 | **Materialized view** — RLS *never* applies; it's an RLS-free snapshot of every tenant | ✅ | `view-isolation` (cross-tenant) and `anon-reads` (unauthenticated). The fix text never suggests `security_invoker` here — no policy can scope a matview |
 | 4.3 | `SECURITY DEFINER` **function** that doesn't re-filter by tenant, or trusts a tenant argument | ✅ | `definer-rpc` **calls them and measures the leak**. The safety objection that kept this unbuilt has a catalog answer: Postgres enforces that a non-`VOLATILE` function cannot write (*"INSERT is not allowed in a non-volatile function"*), so `STABLE`/`IMMUTABLE` definer functions are safe to invoke and are probed; `VOLATILE` ones are **never called** and are reported from their body as an explicitly-unproven note. Zero-arg and single-tenant-arg functions are probed; anything else is skipped rather than guessed at. `definer-grants` still covers the static grant side |
-| 4.4 | Definer function with **mutable `search_path`** → object-shadowing escalation | ✅ | `definer-rpc`. **Fails only when the precondition holds** — the app role must be able to CREATE somewhere to plant a shadowing object; without that it is a note, because you cannot exploit what you cannot create |
+| 4.4 | Definer function with **mutable `search_path`** → object-shadowing escalation | ✅ | `definer-rpc`. **Fails only when the precondition holds** — the app role must be able to CREATE somewhere to plant a shadowing object; without that it is a note, because you cannot exploit what you cannot create. The grant itself is §7.3's, which reports it even when no definer function exists yet |
 | 4.10 | **SQL injection inside a `SECURITY DEFINER` function** — dynamic SQL built by concatenating a caller-supplied parameter | ✅ | `definer-rpc`, from the body (so it works on `VOLATILE` functions the probe cannot call). Injected SQL executes as the function's **owner**, so it bypasses RLS wholesale — a verified example returns every tenant's rows through a table whose policy is perfect. Narrow by design: `||`-concatenation and `format()`'s `%s` are flagged; `USING`, `quote_literal`, `quote_ident`, `%L` and `%I` are not, and anything it cannot read confidently produces no finding |
 | 4.5 | Definer **helper used inside a policy** (the recursion-avoidance idiom) inherits any flaw | ✅ | shows up behaviourally: the helper is a definer function (4.3) *and* the policy that calls it is proven by `rls-proof`, so a flaw surfaces from either side |
 | 4.6 | View/function over `auth.users` exposing every tenant's email | 🟡 | a *view* over `auth.users` is covered by 4.1 **if it exposes a tenant column**; one keyed only by user id isn't yet |
@@ -138,7 +138,7 @@ The highest-severity blind spot of any table-only scanner.
 |---|---|---|---|
 | 7.1 | Over-broad `GRANT ALL` / `TO PUBLIC` amplifying any RLS gap | 🟡 | the *effect* is proven by the probes; the grant itself is a catalog read (and `GRANT ALL` is what makes 3.9 possible) |
 | 7.2 | `ALTER DEFAULT PRIVILEGES` auto-granting every *future* table | ✅ | `default-privileges`, the only guard about the database as it **will be**. Every other check here answers a question about the tables that exist; this one is about the one added next week, which arrives already granted, with no policy, and with **no migration diff showing a security change**. It **proves rather than infers**: reading `pg_default_acl` and reasoning about what it implies gets the interaction with schema grants, role membership and `FOR ROLE` wrong in exactly the cases that matter, so instead it creates a table inside a rolled-back transaction and reads what that table actually inherited. Calibrated deliberately: the condition is latent, and granting to `anon`/`authenticated` in `public` is the **stock Supabase configuration**, so failing on it would fire on essentially every user of the platform this tool targets. The default fails only on **PUBLIC** — every role that exists or ever will, and nobody's platform default — and reports the rest as a note that says what the next table inherits. `failRoles` escalates. An enabled `ddl_command_end` event trigger that enables RLS is detected and downgrades the finding |
-| 7.3 | `CREATE` on `public` granted to `anon`/`authenticated` (feeds 4.4) | 🔜 | catalog or probe |
+| 7.3 | `CREATE` on `public` granted to `anon`/`authenticated` (feeds 4.4) | ✅ | `create-grants`, catalog-only. `CREATE` is not a leak by itself — it is the **precondition** that turns §4.4 into privilege escalation, since you can only shadow an object if you can create one. That is CVE-2018-1058's shape, and why **Postgres 15 stopped granting `CREATE` on `public` to `PUBLIC`**. Deliberately **not** a duplicate of §4.4: that guard fails on the *function* (fix: pin the path), this one on the *grant* (fix: revoke it), and it covers the three things §4.4 structurally cannot see — the grant when **no definer function exists yet** (the latent state that arms the next one, invisible to a guard that has nothing to evaluate), **`anon`** (§4.4 only evaluates the configured app role), and **`CREATE` on the database** (the right to create whole schemas, a strictly stronger primitive than writing into an existing one). Calibrated: `PUBLIC` and unauthenticated roles fail; the app role is a **note**, because running migrations as it is legitimate and SQL cannot tell which it is |
 | 7.4 | Mutating `SECURITY DEFINER` function not revoked from `PUBLIC`/`anon` | ✅ | `definer-grants`, judged on the **net state** of migration history |
 
 ## 8. Structurally out of scope (documented so the coverage claim stays honest)
@@ -160,14 +160,13 @@ listed so nobody reads a green run as more than it is.
 ## What this means for the roadmap
 
 Every failure mode above that is **both** coverable by this tool's method **and**
-worth the noise it would add now has a guard behind it. Five rows are still
-🔜. None is high-value — they are listed rather than summarised away, ordered by
-(severity × prevalence) ÷ build cost:
+worth the noise it would add now has a guard behind it. Four rows are still
+🔜. None is high-value, and none is a gap this method could close cheaply — they
+are listed rather than summarised away, ordered by (severity × prevalence) ÷ cost:
 
 | # | Why it hasn't been built |
 |---|---|
-| 7.3 `CREATE` on `public` granted to `anon`/`authenticated` | The best of what is left, and already checked *as a precondition* inside `definer-rpc` (§4.4); standalone it is a small catalog read |
-| 3.10 `MERGE` per-arm policies | PG15+, and rare in the app shapes this targets |
+| 3.10 `MERGE` per-arm policies | The best of what is left. PG15+, and rare in the app shapes this targets |
 | 4.8 legacy `INHERITS` children | Same enumeration as partitions, far rarer |
 | 3.7 UPSERT conflict path | Its permissive-`UPDATE`-policy case is already caught by the existing write probes, so a dedicated check would mostly re-report an existing finding |
 | 2.12 `pg_stat_activity` query text | Small; worth doing when someone hits it |
@@ -192,7 +191,7 @@ callable GUC-setting definer functions, 4.7 partitions, 3.9 TRUNCATE (0.10.0);
 5.3/5.4 Realtime channels (0.15.0); 4.3/4.4/4.10 definer RPCs and SQL injection
 inside them (0.16.0–0.17.0); 4.9 shadow tables, 7.1 role capabilities (0.18.0);
 2.14 schema-per-tenant (0.19.0); 6.1 session-scoped tenant GUCs (0.21.0);
-7.2 inherited default privileges (0.22.0); 3.11 cross-tenant foreign keys (0.23.0).*
+7.2 inherited default privileges (0.22.0); 3.11 cross-tenant foreign keys (0.23.0); 7.3 CREATE grants (0.24.0).*
 
 *Three of these are worth learning from. **4.7** was a false NEGATIVE in the
 flagship guard, found by writing the failure surface down rather than by waiting

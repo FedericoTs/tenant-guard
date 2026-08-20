@@ -25,7 +25,7 @@ npx tenant-guard all      # everything: static guards + every runtime proof
 ```
 
 Or run one at a time: `prove`, `drift`, `anon-reads`, `anon-writes`, `identity`,
-`rpc`, `views`, `storage`, `realtime`, `oracles`, `shadows`, `caps`, `schemas`, `pooler`, `defaults`, `fks`.
+`rpc`, `views`, `storage`, `realtime`, `oracles`, `shadows`, `caps`, `schemas`, `pooler`, `defaults`, `fks`, `creates`.
 `npx tenant-guard list` describes each, and `--help` documents the rest.
 
 Every command also speaks machine: `--json` for anything downstream, `--sarif`
@@ -119,6 +119,7 @@ tenant-guard  — guard tests for multi-tenant isolation
 | `schema-tenancy` | one role can read **more than one tenant schema** | the other multi-tenant architecture — a schema per tenant — where the boundary is **GRANTs and nothing else**. `search_path` is not a control: it doesn't stop anyone writing `tenant_b.docs` directly, and the client can reset it. Every column-based check is blind here: point `rls-proof` at such a database and it reports "1/1 proven isolated" while the app role reads both tenants |
 | `default-privileges` | a table created **tomorrow** arrives granted and unprotected | the only guard about the database as it *will be*. `ALTER DEFAULT PRIVILEGES` grants on every table created after it, and Postgres never enables RLS by default — so a green run says nothing about the table somebody adds next week: it arrives already granted, with no policy, exposed the instant it exists, and **no migration diff shows a security change**. It proves rather than infers, by creating a table inside a rolled-back transaction and reading what that table actually inherited |
 | `cross-tenant-fk` | a foreign key lets one tenant reach — and **destroy** — another tenant's rows | the only finding here where a tenant *deletes* another tenant's data rather than reading it. **Referential integrity checks always bypass RLS** — they must, or a constraint could be defeated by hiding a row. So a key carrying an id but not the tenant lets tenant A point their row at tenant B's (the FK confirms a row A cannot see; the `WITH CHECK` governs the tenant column, not the reference), and then **`ON DELETE CASCADE` means B deleting their own row deletes A's**. Verified end to end, on a database `rls-proof` calls isolated |
+| `create-grants` | someone who is not your migration role can **plant objects** in your database | `CREATE` is the quietest privilege in Postgres — nothing about it looks like data access — and it is the precondition that turns an unpinned `SECURITY DEFINER` `search_path` into escalation: you can only shadow an object if you can create one. That is CVE-2018-1058's shape, and why **Postgres 15 stopped granting it on `public` to `PUBLIC`**. Reported **even when no definer function exists yet**, because the grant arms the next one somebody writes — the one state a function-by-function check has nothing to evaluate in |
 
 **Catalog** — the schema's shape rather than its behaviour:
 

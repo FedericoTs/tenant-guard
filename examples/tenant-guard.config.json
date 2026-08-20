@@ -83,6 +83,12 @@
     "allowlist": []
   },
 
+  "createGrants": {
+    "//": "Catalog-only, nothing executed. Threat-model 7.3 — CREATE on a schema is not a tenant leak by itself, it is the PRECONDITION that turns an unpinned SECURITY DEFINER search_path into privilege escalation: you can only shadow an object if you can create one (CVE-2018-1058's shape, and why Postgres 15 stopped granting CREATE on public to PUBLIC). Fails on PUBLIC and on unauthenticated roles; the app role is a note, because running migrations as it is legitimate and SQL cannot tell. Deliberately does NOT re-report the exploitable combination — definer-rpc owns that from the function side.",
+    "schemas": ["public"],
+    "allowlist": []
+  },
+
   "crossTenantFk": {
     "//": "Runtime. Threat-model 3.11 — the only guard where one tenant DESTROYS another tenant's data rather than reading it. Referential-integrity checks always bypass row security (they must, or a constraint could be defeated by hiding a row), so a foreign key carrying an id but not the tenant lets tenant A point their row at tenant B's, and ON DELETE CASCADE then means B deleting their own row deletes A's. Flags rows that ALREADY cross tenants (conclusive, no probe) and proves reachability with a re-point probe in a rolled-back transaction. Skips when every FK already carries the tenant, since the bad row is then unrepresentable. Identity is inherited from rlsProof.",
     "schemas": ["public"],

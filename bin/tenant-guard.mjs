@@ -17,12 +17,12 @@ import { join, dirname, resolve } from 'node:path';
 import {
   GUARDS, runAll, runProof, runDrift, runAnonWrites, runAnonReads, runViews, runIdentity,
   runStorage, runOracles, runRealtime, runDefinerRpc, runShadowTables, runCapabilities,
-  runSchemaTenancy, runPoolerBleed, runDefaultPrivileges, runCrossTenantFk, runEverything,
+  runSchemaTenancy, runPoolerBleed, runDefaultPrivileges, runCrossTenantFk, runCreateGrants, runEverything,
 } from '../src/index.mjs';
 import {
   rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation,
   constraintOracles, realtimeIsolation, definerRpc, shadowTables, roleCapabilities, schemaTenancy,
-  poolerBleed, defaultPrivileges, crossTenantFk,
+  poolerBleed, defaultPrivileges, crossTenantFk, createGrants,
 } from '../src/index.mjs';
 import { CONFIG_FILENAME, autodetect, loadConfig } from '../src/config.mjs';
 import { report, bold, dim, green, yellow, red } from '../src/runner.mjs';
@@ -35,6 +35,7 @@ const ALL_GUARDS = [
   ...GUARDS, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust,
   storageIsolation, constraintOracles, realtimeIsolation, definerRpc, shadowTables,
   roleCapabilities, schemaTenancy, poolerBleed, defaultPrivileges, crossTenantFk,
+  createGrants,
 ];
 
 /**
@@ -59,6 +60,7 @@ const RUNTIME_COMMANDS = {
   pooler: { fn: runPoolerBleed, needs: 'migrated' },
   defaults: { fn: runDefaultPrivileges, needs: 'migrated' },
   fks: { fn: runCrossTenantFk, needs: 'seeded' },
+  creates: { fn: runCreateGrants, needs: 'migrated' },
   all: { fn: runEverything, needs: 'seeded', many: true },
 };
 
@@ -151,6 +153,7 @@ ${bold('COMMANDS')}
   pooler         a tenant identity outlives the request that set it
   defaults       what a table created TOMORROW will inherit
   fks            a foreign key lets one tenant reach another's rows
+  creates        who can plant objects a definer function would run as owner
   shadows        a trigger copies tenant data somewhere unprotected
   oracles        a UNIQUE key reveals another tenant's rows
   caps           the app role holds an RLS-bypassing capability
@@ -329,6 +332,14 @@ if (cmd === 'init') {
       // a column-tenancy database.
       //"schemaPattern": "^tenant_",
       allowlist: [], // schema names shared on purpose
+    },
+    createGrants: {
+      // Who can plant objects in your database. CREATE is not a leak by itself —
+      // it is the precondition for shadowing an object that a SECURITY DEFINER
+      // function then runs as its OWNER. Reported even when no such function
+      // exists yet, because the grant arms the next one. Catalog-only.
+      schemas: ['public'],
+      allowlist: [], // "schema:role" or "database:role" granted on purpose
     },
     crossTenantFk: {
       // Foreign keys that reach across tenants. Referential-integrity checks

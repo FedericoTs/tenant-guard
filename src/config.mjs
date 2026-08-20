@@ -290,6 +290,18 @@ export function resolveCrossTenantFkConfig(config) {
   return out;
 }
 
+/** Resolve the create-grants config from the user's `createGrants` block. */
+export function resolveCreateGrantsConfig(config) {
+  const c = config.createGrants ?? {};
+  const out = {};
+  for (const k of ['url', 'urlEnv', 'role', 'schemas', 'unauthenticatedRoles', 'allowlist']) {
+    if (c[k] !== undefined) out[k] = c[k];
+  }
+  const p = config.rlsProof ?? {};
+  if (out.role === undefined && p.role !== undefined) out.role = p.role;
+  return out;
+}
+
 export function autodetect(cwd = process.cwd()) {
   return {
     migrationsDir: firstExisting(cwd, CANDIDATE_MIGRATION_DIRS),

@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.24.0
+
+New guard `create-grants` (`tenant-guard creates`) — threat-model §7.3, and the
+last row on the map worth building. Catalog-only: nothing is created and nothing
+is executed.
+
+- **`CREATE` is the quietest privilege in Postgres.** Nothing about it looks like
+  data access, and it is not a tenant leak by itself — it is the **precondition**
+  that turns other things into escalations. A `SECURITY DEFINER` function with an
+  unpinned `search_path` resolves unqualified names through the *caller's* path,
+  so a caller who can CREATE plants an object earlier on that path and the
+  function operates on **theirs**, executing as its owner with RLS bypassed. That
+  is CVE-2018-1058's shape, and why **Postgres 15 stopped granting `CREATE` on
+  `public` to `PUBLIC` by default**.
+
+- **Deliberately not a duplicate of §4.4.** `definer-rpc` already fails when an
+  unpinned definer function exists *and* the app role can CREATE. It reports the
+  **function** and the fix is to pin the path; this reports the **grant** and the
+  fix is to revoke it. What it adds are the three things §4.4 structurally cannot
+  see:
+  1. the grant when there is **no definer function yet** — verified in the tests:
+     `definer-rpc` reports clean because it has nothing to evaluate, while the
+     precondition sits armed for the next function somebody writes without
+     `SET search_path`, and no diff will show a security change when they do
+  2. **`anon`** — §4.4 only ever evaluates the configured app role
+  3. **`CREATE` on the database**, the right to create whole schemas, which is
+     strictly stronger than writing into an existing one
+
+- **Calibration.** `PUBLIC` fails (every role, including ones that do not exist
+  yet) and unauthenticated roles fail (an anonymous client creating objects in
+  your database is not a legitimate configuration under any architecture). The
+  **app role is a note**: running migrations as it is legitimate, and SQL cannot
+  tell which it is. Findings state whether they are exploitable *now* or latent,
+  and point at `tenant-guard rpc` rather than re-reporting it.
+
+- On Postgres below 15 the `PUBLIC` finding names itself as the pre-15 default,
+  so it reads as context rather than pedantry.
+- A grant to `PUBLIC` is reported once per schema, not once per role — it is one
+  grant.
+- **docs: THREAT-MODEL 7.3 closed** — 42 rows covered, 4 planned, none of them
+  high-value or cheap, and §4.4 now carries the reciprocal pointer.
+- 516 tests (was 495), 20 guards.
+
 ## 0.23.0
 
 New guard `cross-tenant-fk` (`tenant-guard fks`) — threat-model §3.11, and the

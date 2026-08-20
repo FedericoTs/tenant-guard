@@ -41,6 +41,13 @@ export { check as checkDefinerRpc } from './guards/definer-rpc.mjs';
 export { check as checkShadowTables } from './guards/shadow-tables.mjs';
 export { check as checkCapabilities } from './guards/role-capabilities.mjs';
 export { check as checkSchemaTenancy } from './guards/schema-tenancy.mjs';
+// Output serialisers — so a programmatic caller gets the same JSON/SARIF the
+// CLI emits instead of re-deriving the shape. Documented in docs/OUTPUT.md.
+export { toJson, toJsonString, summarise, statusOf, SCHEMA_VERSION } from './output/json.mjs';
+export { toSarif, toSarifString } from './output/sarif.mjs';
+export { toMarkdown } from './output/markdown.mjs';
+export { VERSION } from './version.mjs';
+
 export { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig, resolveStorageConfig, resolveOraclesConfig, resolveRealtimeConfig, resolveDefinerRpcConfig, resolveShadowConfig, resolveCapabilitiesConfig, resolveSchemaTenancyConfig } from './config.mjs';
 
 /** Run every static guard against a resolved per-guard config map. Returns results[]. */

@@ -15,3 +15,63 @@ jobs:
       # dogfood: the static guards must pass against this repo's own tree.
       # (examples/leaky-demo is MEANT to fail, so it is not the target here.)
       - run: node bin/tenant-guard.mjs run
+
+  # The composite action can only be verified by actually running it on a
+  # runner — none of the unit tests exercise the YAML, the shell, or the
+  # step wiring. `uses: ./` runs the action from this checkout.
+  action:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: guard
+        uses: ./
+        with:
+          command: run
+
+      - name: The action must report its results through its outputs
+        run: |
+          set -euo pipefail
+          echo "result=${{ steps.guard.outputs.result }}"
+          echo "exit-code=${{ steps.guard.outputs.exit-code }}"
+          test "${{ steps.guard.outputs.result }}" = "pass"
+          test "${{ steps.guard.outputs.exit-code }}" = "0"
+          # Both artifacts must exist and be parseable, or the SARIF upload and
+          # anything downstream is silently working with nothing.
+          test -s "${{ steps.guard.outputs.sarif-file }}"
+          test -s "${{ steps.guard.outputs.json-file }}"
+          node -e "
+            const fs = require('fs');
+            const s = JSON.parse(fs.readFileSync(process.argv[1], 'utf8'));
+            if (s.version !== '2.1.0') throw new Error('bad SARIF version: ' + s.version);
+            const j = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+            if (j.schemaVersion !== 1) throw new Error('bad JSON schemaVersion: ' + j.schemaVersion);
+            // This repo has no migrations or API routes, so every static guard
+            // skips — and the run must say so rather than claim a pass.
+            if (j.summary.skipped === 0) throw new Error('expected skips to be reported');
+            console.log('artifacts OK:', j.summary.skipped, 'skips recorded');
+          " "${{ steps.guard.outputs.sarif-file }}" "${{ steps.guard.outputs.json-file }}"
+
+      # A guard failure must NOT abort the step — the SARIF and summary still
+      # have to be produced. Proven against examples/leaky-demo, which leaks.
+      - id: leaky
+        uses: ./
+        with:
+          command: run
+          working-directory: examples/leaky-demo
+          fail-on-error: false
+          upload-sarif: false
+
+      - name: A failing run still reports, and still says it failed
+        run: |
+          set -euo pipefail
+          test "${{ steps.leaky.outputs.result }}" = "fail"
+          test "${{ steps.leaky.outputs.exit-code }}" = "1"
+          node -e "
+            const j = JSON.parse(require('fs').readFileSync(process.argv[1], 'utf8'));
+            if (j.summary.failed !== 2) throw new Error('expected 2 failed guards, got ' + j.summary.failed);
+            console.log('leaky demo reported', j.summary.failed, 'failures as expected');
+          " "${{ steps.leaky.outputs.json-file }}"

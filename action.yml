@@ -1,0 +1,179 @@
+name: 'tenant-guard'
+description: 'Fail the build when multi-tenant code can leak across tenants. Static guards need nothing; runtime guards prove isolation against a test database.'
+author: 'Federico Sciuca'
+
+branding:
+  icon: 'shield'
+  color: 'green'
+
+inputs:
+  command:
+    description: >-
+      Which guards to run. "run" = the static guards (no database, no install).
+      "all" = static plus every runtime proof. Or name one: prove, drift,
+      anon-reads, anon-writes, identity, rpc, views, storage, realtime, schemas,
+      shadows, oracles, caps.
+    required: false
+    default: 'run'
+
+  database-url:
+    description: >-
+      Postgres connection string for the runtime guards. Leave empty to run the
+      static guards only. MUST be a test/staging database — the runtime guards
+      perform write probes (INSERT/UPDATE/DELETE inside a rolled-back
+      transaction). Never point this at production. Pass it from a secret.
+    required: false
+    default: ''
+
+  working-directory:
+    description: 'Directory to run in, relative to the repository root.'
+    required: false
+    default: '.'
+
+  version:
+    description: >-
+      Version of the tenant-guard npm package to run. Defaults to the version of
+      this action, so pinning the action pins the tool. Use "latest" to float.
+    required: false
+    default: ''
+
+  fail-on-error:
+    description: >-
+      Fail the job when a guard fails. Set to "false" to report findings without
+      blocking — useful for the first run on an existing codebase.
+    required: false
+    default: 'true'
+
+  upload-sarif:
+    description: >-
+      Upload results to GitHub code scanning, so findings appear in the Security
+      tab and as annotations on the pull request diff.
+      Requires `permissions: security-events: write` on the job.
+    required: false
+    default: 'true'
+
+  job-summary:
+    description: 'Write a result table to the run summary page.'
+    required: false
+    default: 'true'
+
+  install-pg:
+    description: >-
+      Install the `pg` driver, which the runtime guards need. "auto" installs it
+      only when a database-url is given and pg is not already resolvable.
+    required: false
+    default: 'auto'
+
+outputs:
+  result:
+    description: '"pass" or "fail".'
+    value: ${{ steps.tenant-guard.outputs.result }}
+  exit-code:
+    description: 'The CLI exit code: 0 pass, 1 a guard failed, 2 bad usage.'
+    value: ${{ steps.tenant-guard.outputs.exit-code }}
+  sarif-file:
+    description: 'Path to the generated SARIF file.'
+    value: ${{ steps.tenant-guard.outputs.sarif-file }}
+  json-file:
+    description: 'Path to the generated JSON results file.'
+    value: ${{ steps.tenant-guard.outputs.json-file }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Resolve tenant-guard version
+      id: resolve
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        VERSION="$INPUT_VERSION"
+        if [ -z "$VERSION" ]; then
+          # Default to this action's own version, so `uses: ...@v0.20.0` runs
+          # tenant-guard 0.20.0 rather than whatever is newest today.
+          VERSION="$(P="$ACTION_PATH" node -e "const fs=require('fs');console.log(JSON.parse(fs.readFileSync(process.env.P+'/package.json','utf8')).version)" 2>/dev/null || echo latest)"
+        fi
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+        echo "Using tenant-guard@$VERSION"
+
+    - name: Install the pg driver
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        DATABASE_URL_SET: ${{ inputs.database-url != '' }}
+        INSTALL_PG: ${{ inputs.install-pg }}
+      run: |
+        set -euo pipefail
+        if [ "$INSTALL_PG" = "false" ]; then echo "install-pg=false — skipping"; exit 0; fi
+        if [ "$INSTALL_PG" = "auto" ] && [ "$DATABASE_URL_SET" != "true" ]; then
+          echo "No database-url — the static guards need no driver."; exit 0
+        fi
+        if node -e "require.resolve('pg')" 2>/dev/null; then
+          echo "pg is already resolvable."; exit 0
+        fi
+        echo "Installing pg (not saved to package.json)…"
+        npm install --no-save --no-audit --no-fund pg
+
+    - name: Run tenant-guard
+      id: tenant-guard
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        TENANT_GUARD_DATABASE_URL: ${{ inputs.database-url }}
+        TG_VERSION: ${{ steps.resolve.outputs.version }}
+        TG_COMMAND: ${{ inputs.command }}
+        TG_SUMMARY: ${{ inputs.job-summary }}
+      run: |
+        set -uo pipefail
+        # Namespaced by the action instance ("__self", "__self_2", …) so two
+        # invocations in the same job don't overwrite each other's artifacts.
+        SLUG="$(printf '%s' "${GITHUB_ACTION:-tenant-guard}" | tr -c 'a-zA-Z0-9_-' '-')"
+        SARIF="${RUNNER_TEMP}/tenant-guard-${SLUG}.sarif"
+        JSON="${RUNNER_TEMP}/tenant-guard-${SLUG}.json"
+
+        ARGS=("$TG_COMMAND" "--sarif=$SARIF" "--json=$JSON" "--no-color")
+        if [ "$TG_SUMMARY" = "true" ]; then ARGS+=("--markdown=$GITHUB_STEP_SUMMARY"); fi
+
+        # Deliberately NOT `set -e` around this: a guard failure is an expected
+        # outcome that still has to reach the SARIF upload and the summary.
+        npx -y "tenant-guard@${TG_VERSION}" "${ARGS[@]}"
+        CODE=$?
+
+        echo "exit-code=$CODE" >> "$GITHUB_OUTPUT"
+        echo "sarif-file=$SARIF" >> "$GITHUB_OUTPUT"
+        echo "json-file=$JSON" >> "$GITHUB_OUTPUT"
+        if [ "$CODE" -eq 0 ]; then echo "result=pass" >> "$GITHUB_OUTPUT"; else echo "result=fail" >> "$GITHUB_OUTPUT"; fi
+
+        # hashFiles() only sees inside the workspace, and the SARIF is in
+        # RUNNER_TEMP — so the upload step is gated on this output instead.
+        if [ -s "$SARIF" ]; then
+          echo "sarif-exists=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "sarif-exists=false" >> "$GITHUB_OUTPUT"
+        fi
+
+        # Exit 2 is bad usage (unknown command/option) — a configuration error in
+        # the workflow, not a finding, so it fails immediately either way.
+        if [ "$CODE" -eq 2 ]; then
+          echo "::error title=tenant-guard::Bad usage - check the command input."
+          exit 2
+        fi
+
+    - name: Upload SARIF to code scanning
+      if: ${{ inputs.upload-sarif == 'true' && steps.tenant-guard.outputs.sarif-exists == 'true' }}
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ steps.tenant-guard.outputs.sarif-file }}
+        # Our SARIF paths are relative to the working directory, so tell the
+        # uploader where that is or the file links resolve against the repo root.
+        checkout_path: ${{ github.workspace }}/${{ inputs.working-directory }}
+        category: tenant-guard
+
+    - name: Fail the job on a guard failure
+      if: ${{ inputs.fail-on-error == 'true' && steps.tenant-guard.outputs.exit-code != '0' }}
+      shell: bash
+      run: |
+        echo "::error title=tenant-guard::A guard failed — multi-tenant isolation could not be proven. See the job summary and the Security tab."
+        exit 1

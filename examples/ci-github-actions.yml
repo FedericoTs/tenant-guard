@@ -8,21 +8,32 @@
 #     transaction, but they write).
 #
 # A guard with nothing to check SKIPS rather than failing — and a skip is never
-# reported as a pass.
+# reported as a pass. Every skip is listed, with its reason, in the job summary.
+#
+# Full guide: https://github.com/FedericoTs/tenant-guard/blob/main/docs/CI.md
 name: tenant-guard
 on: [push, pull_request]
 
 jobs:
+  # ── the whole thing, in one step ────────────────────────────────────
   static:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # findings appear in the Security tab + on the diff
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: '20' }
-      - run: npx tenant-guard run
+      - uses: FedericoTs/tenant-guard@v0
+        # Defaults: command=run, fails the build on a finding, uploads SARIF,
+        # writes a summary table. Nothing else to configure.
 
+  # ── the runtime proofs, against a throwaway Postgres ────────────────
   runtime:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
     # Drop this `services` block if you already have a seeded staging database
     # and pass its URL through secrets instead.
     services:
@@ -34,18 +45,51 @@ jobs:
           --health-cmd pg_isready --health-interval 10s
           --health-timeout 5s --health-retries 5
         ports: ['5432:5432']
+
     env:
-      TENANT_GUARD_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      DB_URL: postgres://postgres:postgres@localhost:5432/postgres
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: '20' }
+        with: { node-version: '22' }
 
-      # Apply your migrations here, then seed at least two tenants — the proofs
-      # need two to compare. If seeding is awkward, set `rlsProof.seed` in your
-      # config and tenant-guard will manufacture two synthetic tenants itself,
-      # inside the transaction it rolls back.
-      # - run: supabase db push   # or psql -f, or your migration tool
+      # Build the schema however you build it anywhere else — supabase db push,
+      # prisma migrate deploy, dbmate, plain psql. Whatever gets your migrations
+      # and two tenants' worth of rows in there is the right answer. If the
+      # database starts empty, use rlsProof.seed in tenant-guard.config.json.
+      - name: Apply migrations
+        run: |
+          for f in supabase/migrations/*.sql; do psql "$DB_URL" -f "$f"; done
 
-      - run: npm i -D pg
-      - run: npx tenant-guard all
+      - uses: FedericoTs/tenant-guard@v0
+        with:
+          command: all
+          database-url: ${{ env.DB_URL }}
+
+  # ── the same thing without the Action, if you prefer the raw CLI ────
+  runtime-plain-cli:
+    if: false # illustrative — flip to `true` to use this instead of `runtime`
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+
+      - run: npm install --no-save pg
+
+      # --sarif writes the file; the CLI still exits 1 on a finding, so the
+      # `always()` on the upload below is what keeps results visible when it does.
+      - name: Run tenant-guard
+        run: npx tenant-guard all --sarif=tenant-guard.sarif --markdown=$GITHUB_STEP_SUMMARY
+        env:
+          TENANT_GUARD_DATABASE_URL: ${{ secrets.TEST_DATABASE_URL }}
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: tenant-guard.sarif
+          category: tenant-guard

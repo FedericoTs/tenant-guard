@@ -25,7 +25,12 @@ npx tenant-guard all      # everything: static guards + every runtime proof
 ```
 
 Or run one at a time: `prove`, `drift`, `anon-reads`, `anon-writes`, `identity`,
-`rpc`, `views`, `storage`, `realtime`, `oracles`, `shadows`, `caps`, `schemas`. `npx tenant-guard list` describes each.
+`rpc`, `views`, `storage`, `realtime`, `oracles`, `shadows`, `caps`, `schemas`.
+`npx tenant-guard list` describes each, and `--help` documents the rest.
+
+Every command also speaks machine: `--json` for anything downstream, `--sarif`
+for GitHub code scanning, `--markdown=$GITHUB_STEP_SUMMARY` for the run page.
+The exit code is identical in all of them.
 
 ---
 
@@ -307,32 +312,55 @@ executable tests — pointed at tenant isolation, which nobody had done.
 
 ## Adopt it
 
-```bash
-npx tenant-guard init          # writes tenant-guard.config.json
-npx tenant-guard run           # allowlist any legacy finding you can't fix yet
-```
-
-Then wire it into CI (a full example ships in
-`examples/ci-github-actions.yml`). The static guards need no install and no
-database:
+**GitHub Actions** — one step, no config, no install:
 
 ```yaml
-- uses: actions/setup-node@v4
-  with: { node-version: '20' }
-- run: npx tenant-guard run
+# .github/workflows/tenant-guard.yml
+name: tenant-guard
+on: [pull_request]
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write     # so findings reach the Security tab
+    steps:
+      - uses: actions/checkout@v4
+      - uses: FedericoTs/tenant-guard@v0
 ```
 
-Add the runtime proofs in a job that has a seeded test database:
+That runs the static guards, **blocks the merge** on a finding, writes a result
+table to the run summary page, and annotates each finding on the pull-request
+diff. Add a database to turn on the runtime proofs:
 
 ```yaml
-- run: npm i -D pg
-- run: npx tenant-guard all
-  env:
-    TENANT_GUARD_DATABASE_URL: ${{ secrets.TEST_DATABASE_URL }}
+      - uses: FedericoTs/tenant-guard@v0
+        with:
+          command: all
+          database-url: ${{ secrets.TEST_DATABASE_URL }}
 ```
 
 > **Never point the runtime guards at production.** They write — inside a
 > rolled-back transaction, but they write. Use a seeded test or staging database.
+
+Locally, or on any other CI:
+
+```bash
+npx tenant-guard init          # writes tenant-guard.config.json
+npx tenant-guard run           # allowlist any legacy finding you can't fix yet
+npx tenant-guard all --json    # results as data, for anything downstream
+```
+
+Adopting on a codebase that will light up on day one? Set `fail-on-error: false`
+so findings appear without blocking, or allowlist the debt you can't fix today —
+from then on the guard can only ratchet in your favour.
+
+📘 **[docs/CI.md](docs/CI.md)** — inputs and outputs, a Postgres service
+container, seeding two tenants on an empty CI database, GitLab and other CI,
+troubleshooting.
+📗 **[docs/OUTPUT.md](docs/OUTPUT.md)** — `--json`, `--sarif`, `--markdown`, and
+the exit-code contract.
 
 Or import the guards into your existing vitest/jest suite:
 
@@ -476,6 +504,16 @@ Since then the project stopped growing one reported bug at a time and started
 building down [`THREAT-MODEL.md`](THREAT-MODEL.md) instead — which promptly
 surfaced a **false negative in the flagship guard** (partitioned tables reporting
 green while leaking) that no amount of waiting for bug reports had found.
+
+## Documentation
+
+| | |
+|---|---|
+| [`docs/CI.md`](docs/CI.md) | Wiring it into CI — the GitHub Action's inputs and outputs, a Postgres service container, seeding two tenants on an empty CI database, GitLab and other CI, troubleshooting |
+| [`docs/OUTPUT.md`](docs/OUTPUT.md) | `--json`, `--sarif`, `--markdown`, the exit-code contract, and programmatic use |
+| [`THREAT-MODEL.md`](THREAT-MODEL.md) | Every way tenant isolation breaks, what is covered, and what this method **cannot** see |
+| [`METHODOLOGY.md`](METHODOLOGY.md) | Where these guards came from, and why the executable ones outlived the written ones |
+| [`examples/`](examples/) | An annotated config, a CI workflow, a runtime-proof walkthrough, and `leaky-demo` — a repo that fails on purpose |
 
 ## Licence
 

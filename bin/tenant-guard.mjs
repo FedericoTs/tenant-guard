@@ -2,189 +2,253 @@
 /**
  * tenant-guard CLI.
  *
- *   tenant-guard run     run every static guard; exit 1 on any violation
- *   tenant-guard prove   runtime RLS proof against a database; exit 1 on a leak
- *   tenant-guard drift   compare migrations vs the database's RLS; exit 1 on drift
- *   tenant-guard anon-writes  exit 1 if the anon role can write any table
- *   tenant-guard anon-reads   exit 1 if the anon role can read any tenant table
- *   tenant-guard views   exit 1 if a view/matview leaks across tenants
- *   tenant-guard identity exit 1 if the identity your policies trust is forgeable
- *   tenant-guard storage  exit 1 if Supabase Storage leaks across tenant folders
- *   tenant-guard oracles  exit 1 if a UNIQUE key reveals another tenant’s rows
- *   tenant-guard realtime exit 1 if Realtime channels leak across tenants
- *   tenant-guard rpc      exit 1 if a SECURITY DEFINER RPC routes around RLS
- *   tenant-guard shadows  exit 1 if a trigger copies tenant data somewhere unprotected
- *   tenant-guard caps     exit 1 if the app role holds an RLS-bypassing capability
- *   tenant-guard schemas  exit 1 if one role reaches more than one tenant SCHEMA
- *   tenant-guard all      run every guard above, in order
- *   tenant-guard init    write a tenant-guard.config.json, seeded from this repo
- *   tenant-guard list    list the available guards and what each prevents
+ *   tenant-guard <command> [--json[=file]] [--sarif[=file]] [--quiet]
+ *
+ * Run `tenant-guard --help` for the full list. Every command exits 0 when it
+ * passes and 1 when a guard fails, whatever the output format — the exit code
+ * is the contract, the formats are for whoever reads it afterwards.
  *
  * `run`, `init`, `list` are zero-dependency and run in CI without `npm ci`.
- * `prove`, `drift`, `anon-writes`, `anon-reads`, `views` additionally need a
- * database URL and the `pg` driver; without them they skip (a skip is not a pass
- * — it says so).
+ * The runtime commands additionally need a database URL and the `pg` driver;
+ * without them they skip (a skip is not a pass — it says so).
  */
-import { writeFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
-import { GUARDS, runAll, runProof, runDrift, runAnonWrites, runAnonReads, runViews, runIdentity, runStorage, runOracles, runRealtime, runDefinerRpc, runShadowTables, runCapabilities, runSchemaTenancy, runEverything } from '../src/index.mjs';
-import { rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation, definerRpc, shadowTables, roleCapabilities, schemaTenancy } from '../src/index.mjs';
-import { CONFIG_FILENAME, autodetect } from '../src/config.mjs';
-import { report, bold, dim, green, yellow } from '../src/runner.mjs';
+import { writeFileSync, appendFileSync, existsSync, mkdirSync } from 'node:fs';
+import { join, dirname, resolve } from 'node:path';
+import {
+  GUARDS, runAll, runProof, runDrift, runAnonWrites, runAnonReads, runViews, runIdentity,
+  runStorage, runOracles, runRealtime, runDefinerRpc, runShadowTables, runCapabilities,
+  runSchemaTenancy, runEverything,
+} from '../src/index.mjs';
+import {
+  rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation,
+  constraintOracles, realtimeIsolation, definerRpc, shadowTables, roleCapabilities, schemaTenancy,
+} from '../src/index.mjs';
+import { CONFIG_FILENAME, autodetect, loadConfig } from '../src/config.mjs';
+import { report, bold, dim, green, yellow, red } from '../src/runner.mjs';
+import { toJsonString, summarise } from '../src/output/json.mjs';
+import { toSarifString } from '../src/output/sarif.mjs';
+import { toMarkdown } from '../src/output/markdown.mjs';
+import { VERSION } from '../src/version.mjs';
 
-const SKIP_HINT = (c) =>
-  '  (A skip is not a pass. Point it at a seeded test/staging database:\n' +
-  `   export TENANT_GUARD_DATABASE_URL=postgres://…  &&  npm i -D pg  &&  tenant-guard ${c})\n`;
+const ALL_GUARDS = [
+  ...GUARDS, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust,
+  storageIsolation, constraintOracles, realtimeIsolation, definerRpc, shadowTables,
+  roleCapabilities, schemaTenancy,
+];
 
-const cmd = process.argv[2] ?? 'run';
+/**
+ * Every command that needs a database, with the flavour of database it needs.
+ * `seeded` = needs two tenants' worth of rows to compare; `migrated` = only
+ * needs the schema; `any` = a connection is enough.
+ */
+const RUNTIME_COMMANDS = {
+  prove: { fn: runProof, needs: 'seeded' },
+  drift: { fn: runDrift, needs: 'migrated' },
+  'anon-writes': { fn: runAnonWrites, needs: 'any' },
+  'anon-reads': { fn: runAnonReads, needs: 'any' },
+  views: { fn: runViews, needs: 'seeded' },
+  identity: { fn: runIdentity, needs: 'seeded' },
+  storage: { fn: runStorage, needs: 'seeded' },
+  oracles: { fn: runOracles, needs: 'migrated' },
+  realtime: { fn: runRealtime, needs: 'seeded' },
+  rpc: { fn: runDefinerRpc, needs: 'seeded' },
+  shadows: { fn: runShadowTables, needs: 'migrated' },
+  caps: { fn: runCapabilities, needs: 'migrated' },
+  schemas: { fn: runSchemaTenancy, needs: 'seeded' },
+  all: { fn: runEverything, needs: 'seeded', many: true },
+};
+
+const DB_FLAVOUR = {
+  seeded: 'a seeded test/staging database',
+  migrated: 'a migrated test/staging database',
+  any: 'a test/staging database',
+};
+
+const skipHint = (cmd, needs) =>
+  '  (A skip is not a pass. Point it at ' + DB_FLAVOUR[needs] + ':\n' +
+  `   export TENANT_GUARD_DATABASE_URL=postgres://…  &&  npm i -D pg  &&  tenant-guard ${cmd})\n`;
+
+// ── argument parsing ─────────────────────────────────────────────────
+// One positional (the command) plus long flags. `--flag=value` only — no
+// space-separated values, so nothing is ambiguous when a value is omitted.
+
+const argv = process.argv.slice(2);
+const flags = { json: null, sarif: null, markdown: null, quiet: false, help: false, version: false };
+const positionals = [];
+
+for (const arg of argv) {
+  if (!arg.startsWith('-')) { positionals.push(arg); continue; }
+  const [name, ...rest] = arg.split('=');
+  const value = rest.length > 0 ? rest.join('=') : null;
+  switch (name) {
+    case '--json': flags.json = value ?? 'stdout'; break;
+    case '--sarif': flags.sarif = value ?? 'stdout'; break;
+    case '--markdown': case '--md': flags.markdown = value ?? 'stdout'; break;
+    case '--quiet': case '-q': flags.quiet = true; break;
+    case '--help': case '-h': flags.help = true; break;
+    case '--version': case '-v': flags.version = true; break;
+    case '--no-color': process.env.NO_COLOR = '1'; break;
+    default:
+      console.error(`Unknown option: ${name}\nRun \`tenant-guard --help\` for the supported flags.`);
+      process.exit(2);
+  }
+}
+
+const cmd = positionals[0] ?? 'run';
 const cwd = process.cwd();
 
+if (flags.version) { console.log(VERSION); process.exit(0); }
+
+// Two documents cannot share one stdout.
+const toStdout = ['json', 'sarif', 'markdown'].filter((f) => flags[f] === 'stdout');
+if (toStdout.length > 1) {
+  const names = toStdout.map((f) => `--${f}`);
+  const listed = names.length === 2
+    ? names.join(' and ')
+    : `${names.slice(0, -1).join(', ')} and ${names.at(-1)}`;
+  console.error(
+    `${listed} cannot ${names.length === 2 ? 'both' : 'all'} write to stdout.\n` +
+    'Give all but one a file, e.g. --sarif=tenant-guard.sarif',
+  );
+  process.exit(2);
+}
+
+// Anything written to stdout as data means the human report has to get out of
+// the way, or the "JSON" a script reads starts with a banner.
+const quiet = flags.quiet || toStdout.length > 0;
+
+// ── help ─────────────────────────────────────────────────────────────
+
+const HELP = `
+${bold('tenant-guard')} ${dim('— guard tests that fail CI when multi-tenant code can leak across tenants')}
+
+${bold('USAGE')}
+  tenant-guard <command> [options]
+
+${bold('COMMANDS')}
+  ${bold('run')}            every static guard — no database, no npm ci ${dim('(default)')}
+  ${bold('all')}            everything: the static guards plus every runtime proof
+
+  ${dim('Static (files on disk):')}
+  init           write a tenant-guard.config.json, seeded from this repo
+  list           describe every guard and what it prevents
+
+  ${dim('Runtime (needs TENANT_GUARD_DATABASE_URL + the pg driver):')}
+  prove          one tenant cannot read OR write another's rows
+  drift          RLS in the database that no migration declares
+  anon-reads     the anonymous role can read tenant data
+  anon-writes    the anonymous role can write
+  identity       the identity your policies trust can be forged
+  rpc            a SECURITY DEFINER function routes around RLS
+  views          a view or materialized view leaks across tenants
+  storage        Supabase Storage paths leak across tenant folders
+  realtime       Realtime channels leak across tenants
+  schemas        one role reaches more than one tenant SCHEMA
+  shadows        a trigger copies tenant data somewhere unprotected
+  oracles        a UNIQUE key reveals another tenant's rows
+  caps           the app role holds an RLS-bypassing capability
+
+${bold('OPTIONS')}
+  --json[=FILE]    machine-readable results ${dim('(stdout if FILE is omitted)')}
+  --sarif[=FILE]   SARIF 2.1.0 for GitHub code scanning ${dim('(stdout if FILE is omitted)')}
+  --markdown[=FILE] a job summary ${dim('(appends; use --markdown=$GITHUB_STEP_SUMMARY)')}
+  -q, --quiet      suppress the human-readable report
+  --no-color       disable ANSI colour ${dim('(NO_COLOR is also honoured)')}
+  -h, --help       this text
+  -v, --version    print the version
+
+${bold('EXIT CODES')}
+  0  every guard that ran passed        ${dim('(a skip is not a pass)')}
+  1  at least one guard failed
+  2  bad usage — unknown command or option
+
+  ${dim('The exit code is identical in every output format.')}
+
+${bold('EXAMPLES')}
+  npx tenant-guard init                        ${dim('# detect paths, write a config')}
+  npx tenant-guard run                         ${dim('# static guards, zero dependencies')}
+  npx tenant-guard all --sarif=tg.sarif        ${dim('# everything + upload-ready SARIF')}
+  npx tenant-guard all --json | jq .summary    ${dim('# pipe the results anywhere')}
+  npx tenant-guard all --markdown=\$GITHUB_STEP_SUMMARY  ${dim('# render on the run page')}
+
+${dim('Docs: https://github.com/FedericoTs/tenant-guard')}
+${dim('Output formats: https://github.com/FedericoTs/tenant-guard/blob/main/docs/OUTPUT.md')}
+`;
+
+if (flags.help || cmd === 'help') { console.log(HELP); process.exit(0); }
+
+// ── output ───────────────────────────────────────────────────────────
+
+/** Resolve the SARIF file-anchoring context from the repo's own config. */
+function sarifContext() {
+  let migrationsDir;
+  try {
+    migrationsDir = loadConfig(cwd)?.migrations?.dir;
+  } catch {
+    /* a broken config must not stop the report being written */
+  }
+  return {
+    cwd,
+    migrationsDir: migrationsDir ?? autodetect(cwd).migrationsDir ?? 'supabase/migrations',
+    anchorCandidates: [CONFIG_FILENAME, 'package.json'],
+    metaById: new Map(ALL_GUARDS.map((g) => [g.meta.id, g.meta])),
+  };
+}
+
+function writeOut(target, body, label, { append = false } = {}) {
+  if (target === 'stdout') { process.stdout.write(body); return; }
+  // resolve, not join: CI runners hand out absolute scratch paths
+  // ($RUNNER_TEMP/tg.sarif), and join would glue them onto the cwd.
+  const path = resolve(cwd, target);
+  mkdirSync(dirname(path), { recursive: true });
+  // Markdown appends, because its destination is usually $GITHUB_STEP_SUMMARY —
+  // a shared file that other steps also write to. Data formats overwrite.
+  if (append) appendFileSync(path, body);
+  else writeFileSync(path, body);
+  if (!quiet) console.log(dim(`  → wrote ${label} to ${target}`));
+}
+
+/**
+ * The single exit path for every command that produces results: emit whichever
+ * formats were asked for, then return the exit code.
+ *
+ * The code comes from `summarise`, not from `report`, so that suppressing the
+ * human output cannot change the verdict.
+ */
+function emit(results, { command, hint }) {
+  if (!quiet) report(results, { emptyHint: command === 'run' });
+  if (flags.json) writeOut(flags.json, toJsonString(results, { command }), 'JSON');
+  if (flags.sarif) writeOut(flags.sarif, toSarifString(results, { command, ...sarifContext() }), 'SARIF');
+  if (flags.markdown) writeOut(flags.markdown, toMarkdown(results, { command }), 'summary', { append: true });
+  if (!quiet && hint && results.some((r) => r.skipped)) console.log(dim(hint));
+  return summarise(results).exitCode;
+}
+
+// ── commands ─────────────────────────────────────────────────────────
+
 if (cmd === 'run') {
-  const code = report(runAll(cwd));
-  process.exit(code);
+  process.exit(emit(runAll(cwd), { command: 'run' }));
 }
 
-if (cmd === 'prove') {
-  // Runtime RLS proof. Async — needs a database. Exit 1 only on a proven leak.
-  const result = await runProof(cwd);
-  const code = report([result], { emptyHint: false });
-  if (result.skipped) {
-    console.log(
-      dim(
-        '  (A skip is not a pass. Point it at a seeded test/staging database:\n' +
-          `   export TENANT_GUARD_DATABASE_URL=postgres://…  &&  npm i -D pg  &&  tenant-guard prove)\n`,
-      ),
-    );
-  }
-  process.exit(code);
-}
-
-if (cmd === 'drift') {
-  // Compare migration-declared RLS against the live catalog. Async — needs a DB.
-  const result = await runDrift(cwd);
-  const code = report([result], { emptyHint: false });
-  if (result.skipped) {
-    console.log(
-      dim(
-        '  (A skip is not a pass. Point it at a migrated test/staging database:\n' +
-          `   export TENANT_GUARD_DATABASE_URL=postgres://…  &&  npm i -D pg  &&  tenant-guard drift)\n`,
-      ),
-    );
-  }
-  process.exit(code);
-}
-
-if (cmd === 'anon-writes') {
-  // Flag tables the unauthenticated role can write. Async — needs a DB.
-  const result = await runAnonWrites(cwd);
-  const code = report([result], { emptyHint: false });
-  if (result.skipped) {
-    console.log(dim('  (A skip is not a pass. Point it at a test/staging database:\n   export TENANT_GUARD_DATABASE_URL=postgres://…  &&  npm i -D pg  &&  tenant-guard anon-writes)\n'));
-  }
-  process.exit(code);
-}
-
-if (cmd === 'anon-reads') {
-  // Prove the unauthenticated role cannot read tenant tables. Async — needs a DB.
-  const result = await runAnonReads(cwd);
-  const code = report([result], { emptyHint: false });
-  if (result.skipped) {
-    console.log(dim('  (A skip is not a pass. Point it at a test/staging database:\n   export TENANT_GUARD_DATABASE_URL=postgres://…  &&  npm i -D pg  &&  tenant-guard anon-reads)\n'));
-  }
-  process.exit(code);
-}
-
-if (cmd === 'views') {
-  // Prove views/matviews don't leak across tenants. Async — needs a DB.
-  const result = await runViews(cwd);
-  const code = report([result], { emptyHint: false });
-  if (result.skipped) {
-    console.log(dim('  (A skip is not a pass. Point it at a seeded test/staging database:\n   export TENANT_GUARD_DATABASE_URL=postgres://…  &&  npm i -D pg  &&  tenant-guard views)\n'));
-  }
-  process.exit(code);
-}
-
-if (cmd === 'identity') {
-  // Can the caller FORGE the identity the policies authorize from? Async — needs a DB.
-  const result = await runIdentity(cwd);
-  const code = report([result], { emptyHint: false });
-  if (result.skipped) {
-    console.log(dim('  (A skip is not a pass. Point it at a seeded test/staging database:\n   export TENANT_GUARD_DATABASE_URL=postgres://…  &&  npm i -D pg  &&  tenant-guard identity)\n'));
-  }
-  process.exit(code);
-}
-
-if (cmd === 'storage') {
-  // Supabase Storage: object paths, not columns. Async — needs a DB.
-  const result = await runStorage(cwd);
-  const code = report([result], { emptyHint: false });
-  if (result.skipped) {
-    console.log(dim('  (A skip is not a pass. Point it at a seeded test/staging database:\n   export TENANT_GUARD_DATABASE_URL=postgres://…  &&  npm i -D pg  &&  tenant-guard storage)\n'));
-  }
-  process.exit(code);
-}
-
-if (cmd === 'oracles') {
-  // Constraints enforced below RLS. Catalog-only. Async — needs a DB.
-  const result = await runOracles(cwd);
-  const code = report([result], { emptyHint: false });
-  if (result.skipped) {
-    console.log(dim(SKIP_HINT('oracles')));
-  }
-  process.exit(code);
-}
-
-if (cmd === 'realtime') {
-  // Broadcast channels: the tenant is in the topic. Async — needs a DB.
-  const result = await runRealtime(cwd);
-  const code = report([result], { emptyHint: false });
-  if (result.skipped) console.log(dim(SKIP_HINT('realtime')));
-  process.exit(code);
-}
-
-if (cmd === 'all') {
-  // Everything, in order. Runtime guards without a database skip (never a pass).
-  const results = await runEverything(cwd);
-  const code = report(results, { emptyHint: false });
-  if (results.some((r) => r.skipped)) console.log(dim(SKIP_HINT('all')));
-  process.exit(code);
-}
-
-if (cmd === 'rpc') {
-  // SECURITY DEFINER functions that bypass RLS. Async — needs a DB.
-  const result = await runDefinerRpc(cwd);
-  const code = report([result], { emptyHint: false });
-  if (result.skipped) console.log(dim(SKIP_HINT('rpc')));
-  process.exit(code);
-}
-
-if (cmd === 'shadows') {
-  // Tenant data copied into an unprotected table. Async — needs a DB.
-  const result = await runShadowTables(cwd);
-  const code = report([result], { emptyHint: false });
-  if (result.skipped) console.log(dim(SKIP_HINT('shadows')));
-  process.exit(code);
-}
-
-if (cmd === 'caps') {
-  // Capabilities the app role holds beyond your tables. Catalog-only.
-  const result = await runCapabilities(cwd);
-  const code = report([result], { emptyHint: false });
-  if (result.skipped) console.log(dim(SKIP_HINT('caps')));
-  process.exit(code);
-}
-
-if (cmd === 'schemas') {
-  // Schema-per-tenant: how many tenant schemas can one role read? Needs a DB.
-  const result = await runSchemaTenancy(cwd);
-  const code = report([result], { emptyHint: false });
-  if (result.skipped) console.log(dim(SKIP_HINT('schemas')));
-  process.exit(code);
+if (RUNTIME_COMMANDS[cmd]) {
+  const { fn, needs, many } = RUNTIME_COMMANDS[cmd];
+  const out = await fn(cwd);
+  const results = many ? out : [out];
+  process.exit(emit(results, { command: cmd, hint: skipHint(cmd, needs) }));
 }
 
 if (cmd === 'list') {
+  if (flags.json) {
+    // The guard catalogue as data — enough to generate a docs table from.
+    const body = JSON.stringify(
+      { tool: { name: 'tenant-guard', version: VERSION }, guards: ALL_GUARDS.map((g) => ({ ...g.meta })) },
+      null, 2,
+    ) + '\n';
+    writeOut(flags.json, body, 'JSON');
+    process.exit(0);
+  }
   console.log(bold('\ntenant-guard guards\n'));
-  for (const g of [...GUARDS, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation, definerRpc, shadowTables, roleCapabilities, schemaTenancy]) {
+  for (const g of ALL_GUARDS) {
     console.log(`  ${bold(g.meta.id)}`);
     console.log(dim(`    ${g.meta.title}`));
     console.log(dim(`    ${g.meta.why}\n`));
@@ -332,5 +396,5 @@ if (cmd === 'init') {
   process.exit(0);
 }
 
-console.error(`Unknown command: ${cmd}\nUsage: tenant-guard [run|prove|drift|anon-writes|all|anon-reads|views|identity|storage|oracles|realtime|rpc|shadows|caps|schemas|init|list]`);
+console.error(red(`Unknown command: ${cmd}`) + '\nRun `tenant-guard --help` for the full list.');
 process.exit(2);

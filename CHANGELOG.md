@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.20.0
+
+CI plumbing. Sixteen guards protect nobody while the tool isn't in anyone's
+pipeline, and until now wiring it in meant writing your own workflow YAML and
+parsing terminal text. No new guards in this release — on purpose.
+
+- **feat: a GitHub Action.** The whole thing is now one step:
+
+  ```yaml
+  - uses: actions/checkout@v4
+  - uses: FedericoTs/tenant-guard@v0
+  ```
+
+  It runs the guards, blocks the merge on a finding, uploads SARIF, and writes a
+  result table to the run summary. `command: all` plus `database-url:` turns on
+  the runtime proofs. The Action defaults to **its own version** of the CLI, so
+  pinning the Action pins the tool.
+  - `fail-on-error: false` reports findings without blocking — the honest way to
+    adopt this on a codebase that will light up on day one.
+  - A guard failure does **not** abort the step: the exit code is captured so the
+    SARIF upload and the summary still run. Only exit 2 (bad usage) aborts early.
+- **feat: `--sarif[=FILE]`** — SARIF 2.1.0, so findings land in the GitHub
+  Security tab and as annotations on the pull-request diff, instead of in a log
+  nobody reads twice.
+  - The honest problem this had to solve: SARIF wants a file and a line, and most
+    of these guards find things in a **database**. Nothing here invents one.
+    Static findings point at the real file; runtime findings are anchored at
+    `tenant-guard.config.json` — the file you would actually edit to allowlist
+    them — with the database object carried in `logicalLocations`, which is the
+    field SARIF has for exactly that. A path that isn't on disk yields **no**
+    location rather than a broken pointer, because GitHub silently discards
+    results pointing at missing files, which would turn a real finding green.
+  - Every **skip** becomes a tool notification. A green upload still has to say
+    what it didn't check.
+- **feat: `--json[=FILE]`** — the results as data, and a documented contract with
+  a `schemaVersion`. Deterministic on purpose: no timestamps, no durations, no
+  absolute paths, so you can commit a baseline and diff against it.
+  `tenant-guard list --json` emits the guard catalogue.
+- **feat: `--markdown[=FILE]`** — a job summary for `$GITHUB_STEP_SUMMARY`.
+  Findings carry their fix; notes are collapsed; the **skip list never is**.
+- **feat: `--help`, `--version`, `--quiet`, `--no-color`.** The CLI previously
+  took a command and nothing else — `tenant-guard --version` didn't work.
+  - Unknown commands and options now exit **2**, distinct from 1 (a guard
+    failed), so a typo in a workflow can't read as a clean run.
+  - Writing a machine format to stdout suppresses the human report, so `--json`
+    output is parseable. Two formats can't share stdout; that's an exit 2.
+- **docs: [`docs/CI.md`](docs/CI.md)** — the full wiring guide: inputs, outputs,
+  a Postgres service container, seeding two tenants on an empty CI database,
+  GitLab and other CI, pre-commit, and troubleshooting (including the
+  `security-events: write` permission everyone hits first).
+- **docs: [`docs/OUTPUT.md`](docs/OUTPUT.md)** — the format reference and the
+  exit-code contract.
+- fix: an absolute output path (`--sarif=$RUNNER_TEMP/tg.sarif`) was joined onto
+  the cwd instead of used — which is the normal case in the environment the flag
+  exists for. Found while writing the test for it.
+- 403 tests (was 352), 16 guards — no new guards in this release.
+
 ## 0.19.0
 
 The other multi-tenant architecture, and an honest answer to "which databases is

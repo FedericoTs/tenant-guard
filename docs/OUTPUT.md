@@ -123,7 +123,7 @@ with:
 
 ```yaml
       - run: npx tenant-guard all --sarif=tg.sarif
-      - uses: github/codeql-action/upload-sarif@v3
+      - uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: tg.sarif
           category: tenant-guard

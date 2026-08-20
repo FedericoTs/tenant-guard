@@ -88,7 +88,7 @@ jobs:
         env:
           TENANT_GUARD_DATABASE_URL: ${{ secrets.TEST_DATABASE_URL }}
 
-      - uses: github/codeql-action/upload-sarif@v3
+      - uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: tenant-guard.sarif

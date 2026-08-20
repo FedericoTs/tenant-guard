@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.20.3
+
+- **fix: upload SARIF with `github/codeql-action/upload-sarif@v4`.** v3 is
+  deprecated in December 2026, and an action that pins a dependency past its
+  end of life breaks its users on a date they did not choose.
+- The SARIF itself is confirmed good, not assumed: GitHub's own validator
+  accepted it in CI — *"Validating … Successfully uploaded results … Analysis
+  upload status is complete."*
+- chore: the repo's own workflow moves to `checkout@v5` / `setup-node@v5`.
+
 ## 0.20.2
 
 The second half of the Action fix, and a regression test so this class of bug

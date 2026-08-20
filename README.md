@@ -10,7 +10,13 @@
 </p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/FedericoTs/tenant-guard/main/assets/demo.gif" alt="tenant-guard failing CI on two cross-tenant leaks: a SECURITY DEFINER function callable by anon, and an API route that filters by bare id with no tenant scope" width="760">
+  <img src="https://raw.githubusercontent.com/FedericoTs/tenant-guard/main/assets/demo.gif" alt="tenant-guard running against a small multi-tenant app whose main table has correct RLS. Five guards fail anyway: an unprotected table readable across tenants and by anon, a materialized view RLS can never scope, a foreign key that lets one tenant delete another tenant's rows, and a CREATE grant that arms the next SECURITY DEFINER function. Each finding comes with the exact fix." width="820">
+</p>
+
+<p align="center">
+  <sub>Real output, not a mockup — that's <code>npm run demo</code>, which stands up a throwaway
+  Postgres and runs the actual guards. The RLS on the main table is <em>correct</em>;
+  every leak is somewhere else.</sub>
 </p>
 
 Not a scanner you run and then ignore. These are checks that live in your repo,

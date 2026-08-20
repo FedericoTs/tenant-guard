@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.24.1
+
+Housekeeping the README hero, which had been showing 0.5.0-era output — three
+static guards — long after the tool grew to twenty.
+
+- **feat: `npm run demo`** (`examples/demo/demo.mjs`). A throwaway Postgres,
+  in-process via pglite, shaped like a small SaaS built quickly: the RLS on the
+  main table is genuinely **correct**, and six other things around it are not.
+  It runs the real guards through the real reporter, so it makes the tool's
+  actual point — *every leak is somewhere other than the policy everybody
+  checks*: an unprotected table, a materialized view RLS can never scope, a
+  foreign key that lets one tenant delete another tenant's rows, and a CREATE
+  grant that arms the next definer function.
+- **docs: a new README GIF, generated from that demo's real output.**
+  `scripts/make-demo-gif.py` parses the ANSI the demo actually printed and
+  animates it — so the hero image cannot drift from what the tool does, and
+  anyone can reproduce it with one command. Not shipped in the package.
+- **feat: `FORCE_COLOR`.** Colour was previously tied to `stdout.isTTY`, so any
+  piped capture lost it. `NO_COLOR` still wins — an accessibility opt-out should
+  not be overridable by a convenience one, and there is a test for that order.
+- **fix: a copy bug in `cross-tenant-fk`** — the message read "…not the
+  reference. and `ON DELETE CASCADE` means…", a conjunction opening a sentence.
+  Found by reading the demo's output rather than by a test, which is the point
+  of having a demo.
+- 518 tests (was 516), 20 guards.
+
 ## 0.24.0
 
 New guard `create-grants` (`tenant-guard creates`) — threat-model §7.3, and the

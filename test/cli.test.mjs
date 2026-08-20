@@ -151,6 +151,24 @@ test('--quiet writes the file and prints nothing at all', () => {
   }
 });
 
+// ── colour ───────────────────────────────────────────────────────────
+
+test('FORCE_COLOR emits ANSI even when stdout is a pipe', () => {
+  const r = spawnSync(process.execPath, [BIN, 'run'], {
+    cwd: DEMO, encoding: 'utf8',
+    env: { ...process.env, NO_COLOR: '', FORCE_COLOR: '1' },
+  });
+  assert.match(r.stdout, /\u001b\[3[12]m/); // red or green
+});
+
+test('NO_COLOR beats FORCE_COLOR — the accessibility opt-out wins', () => {
+  const r = spawnSync(process.execPath, [BIN, 'run'], {
+    cwd: DEMO, encoding: 'utf8',
+    env: { ...process.env, NO_COLOR: '1', FORCE_COLOR: '1' },
+  });
+  assert.doesNotMatch(r.stdout, /\u001b\[/);
+});
+
 // ── catalogue ────────────────────────────────────────────────────────
 
 test('list --json emits the guard catalogue as data', () => {

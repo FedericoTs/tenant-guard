@@ -228,8 +228,8 @@ export function repointProbeSql(fk) {
 export function classifyFk({ fk, existingCrossTenant = 0, probe = 'unknown', probeReason = '' }) {
   const action = describeAction(fk.on_delete);
   const consequence = isDestructive(fk.on_delete)
-    ? `and \`ON DELETE ${action}\` means the other tenant deleting their own row ${fk.on_delete === 'c' ? 'DELETES' : 'silently rewrites'} these rows — one tenant destroying another tenant's data, with no policy consulted`
-    : `and \`ON DELETE ${action}\` means the reference PINS the other tenant's row, so they can no longer delete their own data`;
+    ? `\`ON DELETE ${action}\` means the other tenant deleting their own row ${fk.on_delete === 'c' ? 'DELETES' : 'silently rewrites'} these rows — one tenant destroying another tenant's data, with no policy consulted`
+    : `\`ON DELETE ${action}\` means the reference PINS the other tenant's row, so they can no longer delete their own data`;
 
   const fix =
     `Carry the tenant in the key so a cross-tenant row cannot be represented:\n` +
@@ -246,7 +246,7 @@ export function classifyFk({ fk, existingCrossTenant = 0, probe = 'unknown', pro
       message:
         `${existingCrossTenant} row(s) in ${fk.childId} ALREADY reference a ${fk.parentId} row belonging to a ` +
         `different tenant, through "${fk.name}". This is not a hypothetical — it is in the data now, ` +
-        `${consequence}.`,
+        `and ${consequence}.`,
       fix,
     };
   }
@@ -274,7 +274,7 @@ export function classifyFk({ fk, existingCrossTenant = 0, probe = 'unknown', pro
     message:
       `"${fk.name}" links ${fk.childId} to ${fk.parentId} on ${fk.childColumn ?? 'a composite key'} without ` +
       `carrying the tenant, so a cross-tenant reference is representable — but it could not be proven here ` +
-      `(${probeReason || 'not probed'}). Referential checks bypass RLS, ${consequence}.`,
+      `(${probeReason || 'not probed'}). Referential checks bypass RLS, and ${consequence}.`,
   };
 }
 

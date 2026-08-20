@@ -1,8 +1,15 @@
 /**
  * Result formatting for the CLI. Zero dependencies, no colour libs — a couple
  * of ANSI escapes, disabled when NO_COLOR is set or output is not a TTY.
+ *
+ * `FORCE_COLOR` overrides the TTY check, for the cases where output is piped but
+ * colour is still wanted — a CI runner that renders ANSI in its log viewer, or
+ * capturing a recording. `NO_COLOR` always wins: it is the opt-out, and an
+ * accessibility setting should not be overridable by a convenience one.
  */
-const useColor = !process.env.NO_COLOR && process.stdout.isTTY;
+const useColor = process.env.NO_COLOR
+  ? false
+  : Boolean(process.env.FORCE_COLOR || process.stdout.isTTY);
 const c = (code, s) => (useColor ? `[${code}m${s}[0m` : s);
 export const green = (s) => c('32', s);
 export const red = (s) => c('31', s);

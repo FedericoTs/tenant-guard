@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.20.1
+
+Fixes the Action, which 0.20.0 shipped broken. Caught by the self-test added in
+the same release — the repo's own CI runs the action via `uses: ./`, and it
+failed on the first invocation with `sh: 1: tenant-guard: not found` (exit 127).
+
+- **fix: install the CLI into a dedicated prefix instead of going through
+  `npx`.** `npx` resolves a locally-provided bin *before* fetching from the
+  registry, so in any repository whose `package.json` declares a `tenant-guard`
+  bin it tried to run a `node_modules/.bin` shim that need not exist. An
+  explicit `npm install --prefix "$RUNNER_TEMP/tenant-guard-cli"` plus a direct
+  `node <path>/bin/tenant-guard.mjs` has no such heuristics.
+- **fix: `pg` is installed into that same prefix**, so `await import('pg')`
+  resolves upward from the installed guard modules. As a side effect the Action
+  **no longer writes to your `node_modules`** at all, which it previously did
+  via `npm install --no-save pg`.
+- The install step now verifies the CLI is actually on disk and fails with a
+  named error rather than letting a missing binary surface as exit 127.
+
 ## 0.20.0
 
 CI plumbing. Sixteen guards protect nobody while the tool isn't in anyone's

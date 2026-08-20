@@ -55,7 +55,7 @@ every skipped guard is listed with its reason, in the summary and in the SARIF.
 | `fail-on-error` | `true` | `false` reports findings without blocking — see [adoption](#adopting-on-an-existing-codebase) |
 | `upload-sarif` | `true` | Upload to GitHub code scanning. Needs `security-events: write` |
 | `job-summary` | `true` | Write the result table to the run summary page |
-| `install-pg` | `auto` | Installs the `pg` driver when `database-url` is set and `pg` isn't already resolvable |
+| `install-pg` | `auto` | Installs the `pg` driver when `database-url` is set. Both it and the CLI go into the action's own prefix under `RUNNER_TEMP` — **your `node_modules` is never touched** |
 
 ### Outputs
 
@@ -244,8 +244,9 @@ skip list in the job summary: it names every guard that did not run and why.
 
 **`Cannot find package 'pg'`**
 A runtime guard was asked for without the driver. The Action installs it
-automatically when `database-url` is set; if you set `install-pg: false`, add
-`pg` to your own devDependencies.
+automatically when `database-url` is set — into its own prefix, not your
+`node_modules`. If you set `install-pg: false`, install `pg` yourself. Running
+the CLI directly? `npm i -D pg`.
 
 **A guard fails and I believe it is wrong**
 Read the `fix` line — it names the exact allowlist entry. If the finding is a

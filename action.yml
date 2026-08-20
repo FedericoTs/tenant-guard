@@ -60,7 +60,8 @@ inputs:
   install-pg:
     description: >-
       Install the `pg` driver, which the runtime guards need. "auto" installs it
-      only when a database-url is given and pg is not already resolvable.
+      only when a database-url is given. It goes into the action's own install
+      prefix, never into your node_modules.
     required: false
     default: 'auto'
 
@@ -98,23 +99,35 @@ runs:
         echo "version=$VERSION" >> "$GITHUB_OUTPUT"
         echo "Using tenant-guard@$VERSION"
 
-    - name: Install the pg driver
+    - name: Install tenant-guard
       shell: bash
-      working-directory: ${{ inputs.working-directory }}
       env:
+        TG_VERSION: ${{ steps.resolve.outputs.version }}
         DATABASE_URL_SET: ${{ inputs.database-url != '' }}
         INSTALL_PG: ${{ inputs.install-pg }}
       run: |
         set -euo pipefail
-        if [ "$INSTALL_PG" = "false" ]; then echo "install-pg=false — skipping"; exit 0; fi
-        if [ "$INSTALL_PG" = "auto" ] && [ "$DATABASE_URL_SET" != "true" ]; then
-          echo "No database-url — the static guards need no driver."; exit 0
+        # Installed into its own prefix rather than run through `npx`, and never
+        # into the caller's node_modules. npx resolves a locally-provided bin
+        # before fetching, so in a repo that happens to declare a `tenant-guard`
+        # bin it runs a shim that may not exist (exit 127). An explicit prefix
+        # has no such heuristics and leaves the caller's tree untouched.
+        TG_HOME="${RUNNER_TEMP}/tenant-guard-cli"
+        mkdir -p "$TG_HOME"
+
+        PKGS=("tenant-guard@${TG_VERSION}")
+        # The runtime guards need the pg driver. It goes in the SAME prefix, so
+        # `await import('pg')` resolves upward from the installed guard modules.
+        if [ "$INSTALL_PG" = "true" ] || { [ "$INSTALL_PG" = "auto" ] && [ "$DATABASE_URL_SET" = "true" ]; }; then
+          PKGS+=("pg@8")
         fi
-        if node -e "require.resolve('pg')" 2>/dev/null; then
-          echo "pg is already resolvable."; exit 0
-        fi
-        echo "Installing pg (not saved to package.json)…"
-        npm install --no-save --no-audit --no-fund pg
+
+        echo "Installing ${PKGS[*]} into $TG_HOME"
+        npm install --prefix "$TG_HOME" --no-audit --no-fund --loglevel=error "${PKGS[@]}"
+
+        CLI="$TG_HOME/node_modules/tenant-guard/bin/tenant-guard.mjs"
+        test -f "$CLI" || { echo "::error title=tenant-guard::install failed — $CLI is missing"; exit 1; }
+        echo "TG_CLI=$CLI" >> "$GITHUB_ENV"
 
     - name: Run tenant-guard
       id: tenant-guard
@@ -122,7 +135,6 @@ runs:
       working-directory: ${{ inputs.working-directory }}
       env:
         TENANT_GUARD_DATABASE_URL: ${{ inputs.database-url }}
-        TG_VERSION: ${{ steps.resolve.outputs.version }}
         TG_COMMAND: ${{ inputs.command }}
         TG_SUMMARY: ${{ inputs.job-summary }}
       run: |
@@ -138,7 +150,7 @@ runs:
 
         # Deliberately NOT `set -e` around this: a guard failure is an expected
         # outcome that still has to reach the SARIF upload and the summary.
-        npx -y "tenant-guard@${TG_VERSION}" "${ARGS[@]}"
+        node "$TG_CLI" "${ARGS[@]}"
         CODE=$?
 
         echo "exit-code=$CODE" >> "$GITHUB_OUTPUT"

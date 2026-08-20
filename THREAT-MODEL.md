@@ -71,7 +71,7 @@ These are checked *before* any isolation claim.
 | 2.8 | Policy trusts a **client-settable GUC** (`current_setting('app.tenant')`) — the client just sets it | 🟡 | `identity-trust`. The *concrete* form is a hard failure: a callable `SECURITY DEFINER` function that sets that GUC from an **argument** (a "become any tenant" primitive). Bare dependence on a settable GUC is a **note, never a build failure** — whether it is exploitable depends on architecture SQL cannot see, and it is also how this tool impersonates |
 | 2.9 | Policy trusts a **user-writable JWT claim** (`user_metadata`) rather than `app_metadata` | ✅ | `identity-trust` detects it in the policy text (conclusive on its own) and then **proves** it: forge `user_metadata.<key>` as the victim and re-read. A control arm forging a nonexistent tenant keeps an already-open table from being blamed on the claim |
 | 2.10 | Policy subquery reads a **user-writable membership table** → self-grant into another tenant | ✅ | `identity-trust`. Dependencies come from `pg_depend` (exact, not a regex over policy text). Fails when the authority table has RLS off with a write grant, or an INSERT/UPDATE policy whose check never constrains its **tenant column** — the `WITH CHECK (user_id = auth.uid())` near-miss that pins WHO you are and leaves WHICH TENANT open. No tenant column on the authority table → a note, never a silent pass |
-| 2.11 | Existence oracles: global `UNIQUE` key, single-column FK, `ON CONFLICT DO NOTHING` reveal another tenant's hidden rows | 🔜 | probe returns `23505`/FK error where a row is invisible → enumeration leak |
+| 2.11 | Existence oracles: global `UNIQUE` key, single-column FK, `ON CONFLICT DO NOTHING` reveal another tenant's hidden rows | ✅ | `constraint-oracles`, catalog-only. **UNIQUE omitting the tenant column → fails** (conclusive: the constraint either carries the tenant or it doesn't). Skips primary keys and single-UUID columns — unguessable values answer nothing. Expression indexes are skipped rather than guessed at. **Single-column FKs between tenant tables → an aggregated note**, since composite tenant FKs are rare and exploiting one needs a guessable parent id *and* an insert that passes `WITH CHECK` |
 | 2.12 | `pg_stat_activity` exposes other tenants' live query text (all users share one DB role) | 🔜 | read it as the app role |
 | 2.13 | Planner/statistics side channels (`pg_stats`, non-`LEAKPROOF` functions) | ⛔ | needs adversarial query construction; low yield, high noise |
 
@@ -158,19 +158,22 @@ listed so nobody reads a green run as more than it is.
 ## What this means for the roadmap
 
 Ordered by (severity × prevalence in real AI-generated apps) ÷ build cost, the
-next builds are **2.11 (existence oracles: a global `UNIQUE` key or
-single-column FK that answers "does this row exist in another tenant?" — real, but
-enumeration rather than bulk read)** and **5.4 (Realtime broadcast authorization,
-an RLS-guarded table with the same probe shape)**. **3.7 (the UPSERT conflict path)**
-stays low: the permissive-`UPDATE`-policy case it depends on is already caught by the
-existing write probes, so it buys less than its position suggests. What remains after
-that is mostly ⛔ by construction — leaked keys, pooler state, app-layer IDOR — and is
-listed as such rather than quietly omitted.
+the only planned item left is **5.4 (Realtime broadcast authorization —
+`realtime.messages` is an RLS-guarded table, so it is the same probe shape as
+everything else)**. **3.7 (the UPSERT conflict path)** stays low: the
+permissive-`UPDATE`-policy case it depends on is already caught by the existing write
+probes, so it buys less than its position suggests. **2.12 (`pg_stat_activity` query
+text)** and **1.8 (naming a claim-shape mismatch explicitly)** are small polish.
+
+Everything else still open is ⛔ **by construction** — leaked service keys, pooler
+GUC bleed, app-layer IDOR through a service-role connection — and stays listed
+rather than quietly dropped, because the honest statement of what a tool cannot see
+is part of what makes the rest of it trustworthy.
 
 *Done: 4.1/4.2 views & materialized views (0.9.0); 2.9 user-writable claims, 2.8
 callable GUC-setting definer functions, 4.7 partitions, 3.9 TRUNCATE (0.10.0);
-2.10 user-writable policy authority (0.11.0); 3.8 self-row escalation and
-5.1/5.2 storage paths + public buckets (0.13.0).
+2.10 user-writable policy authority (0.11.0); 3.8 self-row escalation (0.12.0);
+5.1/5.2 storage paths + public buckets (0.13.0); 2.11 constraint oracles (0.14.0).
 4.7 is the one to learn from — it was a false NEGATIVE in the flagship guard,
 found by writing the failure surface down rather than by waiting for a bug report.
 2.10 and 3.8 are the pair to learn from: in both, the policy is correct and the

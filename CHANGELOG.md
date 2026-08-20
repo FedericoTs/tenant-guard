@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.14.0
+
+Threat-model **2.11**, and the last planned read-path item: **RLS hides rows, not
+constraints** — and constraints are enforced *below* it.
+
+- **feat: new guard `constraint-oracles`** (`tenant-guard oracles`). Catalog-only,
+  no probing, no transaction.
+  - **A globally UNIQUE natural key on a tenant-scoped table fails the build.**
+    `users.email UNIQUE` means inserting `victim@corp.com` raises `duplicate key
+    value violates unique constraint` **even though RLS hides the row that caused
+    it** — so anyone who can attempt an insert can test whether a value exists in
+    another tenant, and `ON CONFLICT DO NOTHING` asks the same question silently,
+    with no error at all. Nothing about the policies is wrong here; the schema is
+    the leak. Fix: `UNIQUE (organization_id, email)`.
+  - Deliberately quiet where it should be: **primary keys** are skipped (globally
+    unique by design), **single-UUID** unique columns are skipped (you cannot
+    enumerate random UUIDs, so the answer is worthless), **expression indexes** are
+    skipped rather than guessed at, and tables with no tenant column are ignored
+    entirely.
+  - **Single-column foreign keys between tenant tables are an aggregated note, not
+    a failure.** Referential-integrity checks run with RLS not applied, so a child
+    row can confirm a parent in another tenant — but composite tenant FKs are rare
+    enough that failing on them would flag nearly every schema, and exploiting one
+    needs both a guessable parent id and an insert that passes `WITH CHECK`.
+  - An integration test **proves the premise** rather than asserting it: as tenant
+    A, `SELECT` returns 0 rows while the duplicate insert still raises `23505`.
+- 251 tests (was 231).
+
 ## 0.13.0
 
 The last surface on the threat model this tool could not reach: **Supabase

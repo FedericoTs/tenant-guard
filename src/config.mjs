@@ -169,6 +169,20 @@ export function resolveStorageConfig(config) {
   return out;
 }
 
+/** Resolve the constraint-oracles config from the user's `constraintOracles` block. */
+export function resolveOraclesConfig(config) {
+  const o = config.constraintOracles ?? {};
+  const out = {};
+  for (const k of ['url', 'urlEnv', 'schemas', 'tenantColumns', 'allowlist', 'unguessableTypes']) {
+    if (o[k] !== undefined) out[k] = o[k];
+  }
+  const p = config.rlsProof ?? {};
+  for (const k of ['tenantColumns', 'schemas']) {
+    if (out[k] === undefined && p[k] !== undefined) out[k] = p[k];
+  }
+  return out;
+}
+
 export function autodetect(cwd = process.cwd()) {
   return {
     migrationsDir: firstExisting(cwd, CANDIDATE_MIGRATION_DIRS),

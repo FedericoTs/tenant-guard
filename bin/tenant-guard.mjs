@@ -10,6 +10,7 @@
  *   tenant-guard views   exit 1 if a view/matview leaks across tenants
  *   tenant-guard identity exit 1 if the identity your policies trust is forgeable
  *   tenant-guard storage  exit 1 if Supabase Storage leaks across tenant folders
+ *   tenant-guard oracles  exit 1 if a UNIQUE key reveals another tenant’s rows
  *   tenant-guard init    write a tenant-guard.config.json, seeded from this repo
  *   tenant-guard list    list the available guards and what each prevents
  *
@@ -20,10 +21,14 @@
  */
 import { writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { GUARDS, runAll, runProof, runDrift, runAnonWrites, runAnonReads, runViews, runIdentity, runStorage } from '../src/index.mjs';
-import { rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation } from '../src/index.mjs';
+import { GUARDS, runAll, runProof, runDrift, runAnonWrites, runAnonReads, runViews, runIdentity, runStorage, runOracles } from '../src/index.mjs';
+import { rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles } from '../src/index.mjs';
 import { CONFIG_FILENAME, autodetect } from '../src/config.mjs';
 import { report, bold, dim, green, yellow } from '../src/runner.mjs';
+
+const SKIP_HINT = (c) =>
+  '  (A skip is not a pass. Point it at a seeded test/staging database:\n' +
+  `   export TENANT_GUARD_DATABASE_URL=postgres://…  &&  npm i -D pg  &&  tenant-guard ${c})\n`;
 
 const cmd = process.argv[2] ?? 'run';
 const cwd = process.cwd();
@@ -113,9 +118,19 @@ if (cmd === 'storage') {
   process.exit(code);
 }
 
+if (cmd === 'oracles') {
+  // Constraints enforced below RLS. Catalog-only. Async — needs a DB.
+  const result = await runOracles(cwd);
+  const code = report([result], { emptyHint: false });
+  if (result.skipped) {
+    console.log(dim(SKIP_HINT('oracles')));
+  }
+  process.exit(code);
+}
+
 if (cmd === 'list') {
   console.log(bold('\ntenant-guard guards\n'));
-  for (const g of [...GUARDS, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation]) {
+  for (const g of [...GUARDS, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles]) {
     console.log(`  ${bold(g.meta.id)}`);
     console.log(dim(`    ${g.meta.title}`));
     console.log(dim(`    ${g.meta.why}\n`));
@@ -181,6 +196,13 @@ if (cmd === 'init') {
       schemas: ['public'],
       allowlist: [], // "schema.table" intentionally readable by anon (published/reference data)
     },
+    constraintOracles: {
+      // RLS hides rows, not constraints — and constraints are enforced below it.
+      // A globally UNIQUE natural key on a tenant table lets anyone test whether
+      // a value exists in another tenant. Catalog-only; no probing.
+      schemas: ['public'],
+      allowlist: [], // "schema.table" / "schema.index" that is intentionally global (a public slug)
+    },
     storageIsolation: {
       // Supabase Storage keys tenancy off the object PATH (org_A/file.pdf), not a
       // column — and the client chooses that path on upload. Skips cleanly if
@@ -220,5 +242,5 @@ if (cmd === 'init') {
   process.exit(0);
 }
 
-console.error(`Unknown command: ${cmd}\nUsage: tenant-guard [run|prove|drift|anon-writes|anon-reads|views|identity|storage|init|list]`);
+console.error(`Unknown command: ${cmd}\nUsage: tenant-guard [run|prove|drift|anon-writes|anon-reads|views|identity|storage|oracles|init|list]`);
 process.exit(2);

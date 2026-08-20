@@ -15,13 +15,14 @@ import * as anonReads from './guards/anon-reads.mjs';
 import * as viewIsolation from './guards/view-isolation.mjs';
 import * as identityTrust from './guards/identity-trust.mjs';
 import * as storageIsolation from './guards/storage-isolation.mjs';
-import { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig, resolveStorageConfig } from './config.mjs';
+import * as constraintOracles from './guards/constraint-oracles.mjs';
+import { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig, resolveStorageConfig, resolveOraclesConfig } from './config.mjs';
 
 // The static guards: synchronous, zero-dependency, no database. These are what
 // `tenant-guard run` executes and what a project's vitest/jest suite imports.
 export const GUARDS = [migrationCollisions, definerGrants, routeOrgScoping];
 
-export { migrationCollisions, definerGrants, routeOrgScoping, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation };
+export { migrationCollisions, definerGrants, routeOrgScoping, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles };
 export { prove } from './guards/rls-proof.mjs';
 export { drift } from './guards/rls-drift.mjs';
 export { check as checkAnonWrites } from './guards/anon-writes.mjs';
@@ -29,7 +30,8 @@ export { check as checkAnonReads } from './guards/anon-reads.mjs';
 export { check as checkViews } from './guards/view-isolation.mjs';
 export { check as checkIdentity } from './guards/identity-trust.mjs';
 export { check as checkStorage } from './guards/storage-isolation.mjs';
-export { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig, resolveStorageConfig } from './config.mjs';
+export { check as checkOracles } from './guards/constraint-oracles.mjs';
+export { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig, resolveStorageConfig, resolveOraclesConfig } from './config.mjs';
 
 /** Run every static guard against a resolved per-guard config map. Returns results[]. */
 export function runAll(cwd = process.cwd()) {
@@ -108,4 +110,15 @@ export async function runIdentity(cwd = process.cwd()) {
 export async function runStorage(cwd = process.cwd()) {
   const config = loadConfig(cwd);
   return storageIsolation.run(resolveStorageConfig(config));
+}
+
+/**
+ * Run the constraint-oracle check (async; needs a database URL + `pg`). RLS hides
+ * rows but not constraints, and constraints are enforced below it — a globally
+ * UNIQUE natural key lets anyone test whether a value exists in another tenant.
+ * Catalog-only: no probing, no transaction.
+ */
+export async function runOracles(cwd = process.cwd()) {
+  const config = loadConfig(cwd);
+  return constraintOracles.run(resolveOraclesConfig(config));
 }

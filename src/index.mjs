@@ -23,13 +23,14 @@ import * as roleCapabilities from './guards/role-capabilities.mjs';
 import * as schemaTenancy from './guards/schema-tenancy.mjs';
 import * as poolerBleed from './guards/pooler-bleed.mjs';
 import * as defaultPrivileges from './guards/default-privileges.mjs';
-import { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig, resolveStorageConfig, resolveOraclesConfig, resolveRealtimeConfig, resolveDefinerRpcConfig, resolveShadowConfig, resolveCapabilitiesConfig, resolveSchemaTenancyConfig, resolvePoolerBleedConfig, resolveDefaultPrivilegesConfig } from './config.mjs';
+import * as crossTenantFk from './guards/cross-tenant-fk.mjs';
+import { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig, resolveStorageConfig, resolveOraclesConfig, resolveRealtimeConfig, resolveDefinerRpcConfig, resolveShadowConfig, resolveCapabilitiesConfig, resolveSchemaTenancyConfig, resolvePoolerBleedConfig, resolveDefaultPrivilegesConfig, resolveCrossTenantFkConfig } from './config.mjs';
 
 // The static guards: synchronous, zero-dependency, no database. These are what
 // `tenant-guard run` executes and what a project's vitest/jest suite imports.
 export const GUARDS = [migrationCollisions, definerGrants, routeOrgScoping];
 
-export { migrationCollisions, definerGrants, routeOrgScoping, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation, definerRpc, shadowTables, roleCapabilities, schemaTenancy, poolerBleed, defaultPrivileges };
+export { migrationCollisions, definerGrants, routeOrgScoping, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation, definerRpc, shadowTables, roleCapabilities, schemaTenancy, poolerBleed, defaultPrivileges, crossTenantFk };
 export { prove } from './guards/rls-proof.mjs';
 export { drift } from './guards/rls-drift.mjs';
 export { check as checkAnonWrites } from './guards/anon-writes.mjs';
@@ -45,6 +46,7 @@ export { check as checkCapabilities } from './guards/role-capabilities.mjs';
 export { check as checkSchemaTenancy } from './guards/schema-tenancy.mjs';
 export { check as checkPoolerBleed } from './guards/pooler-bleed.mjs';
 export { check as checkDefaultPrivileges } from './guards/default-privileges.mjs';
+export { check as checkCrossTenantFk } from './guards/cross-tenant-fk.mjs';
 // Output serialisers — so a programmatic caller gets the same JSON/SARIF the
 // CLI emits instead of re-deriving the shape. Documented in docs/OUTPUT.md.
 export { toJson, toJsonString, summarise, statusOf, SCHEMA_VERSION } from './output/json.mjs';
@@ -161,7 +163,7 @@ export async function runRealtime(cwd = process.cwd()) {
  */
 export async function runEverything(cwd = process.cwd()) {
   const results = runAll(cwd);
-  for (const fn of [runProof, runDrift, runAnonReads, runAnonWrites, runViews, runIdentity, runDefinerRpc, runShadowTables, runCapabilities, runSchemaTenancy, runPoolerBleed, runDefaultPrivileges, runStorage, runOracles, runRealtime]) {
+  for (const fn of [runProof, runDrift, runAnonReads, runAnonWrites, runViews, runIdentity, runDefinerRpc, runShadowTables, runCapabilities, runSchemaTenancy, runPoolerBleed, runDefaultPrivileges, runCrossTenantFk, runStorage, runOracles, runRealtime]) {
     results.push(await fn(cwd));
   }
   return results;
@@ -231,4 +233,15 @@ export async function runPoolerBleed(cwd = process.cwd()) {
 export async function runDefaultPrivileges(cwd = process.cwd()) {
   const config = loadConfig(cwd);
   return defaultPrivileges.run(resolveDefaultPrivilegesConfig(config));
+}
+
+/**
+ * Run the cross-tenant foreign-key check (async; needs a database URL + `pg`).
+ * Referential integrity checks always bypass RLS, so an FK carrying an id but
+ * not the tenant lets one tenant point at another's row — and ON DELETE CASCADE
+ * turns that into one tenant DELETING another tenant's data.
+ */
+export async function runCrossTenantFk(cwd = process.cwd()) {
+  const config = loadConfig(cwd);
+  return crossTenantFk.run(resolveCrossTenantFkConfig(config));
 }

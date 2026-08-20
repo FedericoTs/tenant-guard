@@ -276,6 +276,20 @@ export function resolveDefaultPrivilegesConfig(config) {
   return out;
 }
 
+/** Resolve the cross-tenant-FK config from the user's `crossTenantFk` block. */
+export function resolveCrossTenantFkConfig(config) {
+  const f = config.crossTenantFk ?? {};
+  const out = {};
+  for (const k of ['url', 'urlEnv', 'role', 'becomeTenant', 'claim', 'schemas', 'tenantColumns', 'allowlist']) {
+    if (f[k] !== undefined) out[k] = f[k];
+  }
+  const p = config.rlsProof ?? {};
+  for (const k of ['role', 'becomeTenant', 'claim', 'tenantColumns']) {
+    if (out[k] === undefined && p[k] !== undefined) out[k] = p[k];
+  }
+  return out;
+}
+
 export function autodetect(cwd = process.cwd()) {
   return {
     migrationsDir: firstExisting(cwd, CANDIDATE_MIGRATION_DIRS),

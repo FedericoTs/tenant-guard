@@ -17,12 +17,12 @@ import { join, dirname, resolve } from 'node:path';
 import {
   GUARDS, runAll, runProof, runDrift, runAnonWrites, runAnonReads, runViews, runIdentity,
   runStorage, runOracles, runRealtime, runDefinerRpc, runShadowTables, runCapabilities,
-  runSchemaTenancy, runPoolerBleed, runDefaultPrivileges, runEverything,
+  runSchemaTenancy, runPoolerBleed, runDefaultPrivileges, runCrossTenantFk, runEverything,
 } from '../src/index.mjs';
 import {
   rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation,
   constraintOracles, realtimeIsolation, definerRpc, shadowTables, roleCapabilities, schemaTenancy,
-  poolerBleed, defaultPrivileges,
+  poolerBleed, defaultPrivileges, crossTenantFk,
 } from '../src/index.mjs';
 import { CONFIG_FILENAME, autodetect, loadConfig } from '../src/config.mjs';
 import { report, bold, dim, green, yellow, red } from '../src/runner.mjs';
@@ -34,7 +34,7 @@ import { VERSION } from '../src/version.mjs';
 const ALL_GUARDS = [
   ...GUARDS, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust,
   storageIsolation, constraintOracles, realtimeIsolation, definerRpc, shadowTables,
-  roleCapabilities, schemaTenancy, poolerBleed, defaultPrivileges,
+  roleCapabilities, schemaTenancy, poolerBleed, defaultPrivileges, crossTenantFk,
 ];
 
 /**
@@ -58,6 +58,7 @@ const RUNTIME_COMMANDS = {
   schemas: { fn: runSchemaTenancy, needs: 'seeded' },
   pooler: { fn: runPoolerBleed, needs: 'migrated' },
   defaults: { fn: runDefaultPrivileges, needs: 'migrated' },
+  fks: { fn: runCrossTenantFk, needs: 'seeded' },
   all: { fn: runEverything, needs: 'seeded', many: true },
 };
 
@@ -149,6 +150,7 @@ ${bold('COMMANDS')}
   schemas        one role reaches more than one tenant SCHEMA
   pooler         a tenant identity outlives the request that set it
   defaults       what a table created TOMORROW will inherit
+  fks            a foreign key lets one tenant reach another's rows
   shadows        a trigger copies tenant data somewhere unprotected
   oracles        a UNIQUE key reveals another tenant's rows
   caps           the app role holds an RLS-bypassing capability
@@ -327,6 +329,15 @@ if (cmd === 'init') {
       // a column-tenancy database.
       //"schemaPattern": "^tenant_",
       allowlist: [], // schema names shared on purpose
+    },
+    crossTenantFk: {
+      // Foreign keys that reach across tenants. Referential-integrity checks
+      // ALWAYS bypass RLS, so an FK carrying an id but not the tenant lets one
+      // tenant point their row at another tenant's — and ON DELETE CASCADE turns
+      // that into one tenant DELETING another tenant's data. Identity is
+      // inherited from rlsProof. Skips when every FK already carries the tenant.
+      schemas: ['public'],
+      allowlist: [], // "schema.table::constraint_name" that spans tenants on purpose
     },
     defaultPrivileges: {
       // What a table created TOMORROW will inherit. ALTER DEFAULT PRIVILEGES

@@ -218,8 +218,8 @@ export async function check({ query, config = {} }) {
       message:
         `${looseFks.length} foreign key(s) between tenant-scoped tables do not carry the tenant column: ${looseFks.slice(0, 3).join('; ')}${looseFks.length > 3 ? `; +${looseFks.length - 3} more` : ''}. ` +
         `Referential-integrity checks run with RLS NOT applied, so a child row can reference — and thereby confirm the existence of — a parent row in another tenant. ` +
-        `The fix is a composite FK that carries the tenant, e.g. FOREIGN KEY (organization_id, parent_id) REFERENCES parent (organization_id, id). ` +
-        `Reported as a note rather than a failure: composite tenant FKs are rare, and exploiting one needs both a guessable parent id and an insert that passes WITH CHECK.`,
+        `Listed here as a catalog fact; \`tenant-guard fks\` (cross-tenant-fk) PROVES whether it is reachable, and covers the worse half — with ON DELETE CASCADE the other tenant deleting their own row deletes these rows. ` +
+        `The fix is a composite FK that carries the tenant, e.g. FOREIGN KEY (organization_id, parent_id) REFERENCES parent (organization_id, id).`,
     });
   }
 

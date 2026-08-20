@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.23.0
+
+New guard `cross-tenant-fk` (`tenant-guard fks`) — threat-model §3.11, and the
+only finding in this tool where one tenant **destroys** another tenant's data
+rather than reading it.
+
+- **The mechanism is documented Postgres behaviour that almost nobody accounts
+  for: referential integrity checks ALWAYS bypass row-level security.** They have
+  to — a constraint that could be defeated by hiding a row would not be a
+  constraint. So when a foreign key carries an id but not the tenant:
+  1. Tenant A points one of their own rows at tenant B's parent. The FK cheerfully
+     confirms that row exists even though RLS hides it, and the child policy's
+     `WITH CHECK` never objects, because it governs the tenant column and not the
+     reference.
+  2. Tenant B later deletes their own row. `ON DELETE CASCADE` **deletes tenant
+     A's rows**, with no policy consulted at any point.
+
+- **Verified end to end before it was built, and demonstrated in the tests.**
+  Tenant A re-pointed a task at a project it could not see; tenant B then ran an
+  ordinary `delete` on their own project and tenant A's task was gone. Neither
+  tenant did anything unusual, and `rls-proof` reports that same database as
+  fully isolated.
+
+- **Two conclusive paths.** Rows that **already** cross tenants are observed
+  corruption — a bad migration, an import, a bug fixed later — and need no probe
+  at all. Where the data is still clean, a re-point probe inside a rolled-back
+  transaction proves whether one can be created. A refused probe is reported as a
+  genuine pass rather than silence.
+
+- **`RESTRICT`/`NO ACTION` inverts the impact rather than removing it**: tenant
+  A's reference **pins** tenant B's row, so tenant B can no longer delete their
+  own data. Still a finding, worded for what it actually does.
+
+- **Quiet by construction.** A key that already carries the tenant is skipped —
+  the bad row is then unrepresentable, which is exactly why the fix is a composite
+  `(organization_id, parent_id) → (organization_id, id)`. References to shared
+  lookup tables (no tenant column) and self-references (a hierarchy inside one
+  tenant) are excluded too.
+
+- **`constraint-oracles` now hands this off instead of duplicating it.** It had
+  been reporting single-column FKs as a note whose wording — "exploiting one needs
+  a guessable parent id" — *understated* what is now proven, and reporting the
+  same key from two guards is one finding twice. It states the catalog fact and
+  points at `tenant-guard fks`.
+
+- **docs: THREAT-MODEL 3.11 closed** — 41 rows covered, 5 planned, none of them
+  high-value, and the counts in the prose match the tables.
+- 495 tests (was 466), 19 guards.
+
 ## 0.22.0
 
 New guard `default-privileges` (`tenant-guard defaults`) — threat-model §7.2.

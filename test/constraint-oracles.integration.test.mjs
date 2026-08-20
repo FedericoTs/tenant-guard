@@ -104,7 +104,11 @@ if (PGlite) {
     assert.ok(n, JSON.stringify(res.notes, null, 2));
     assert.match(n.message, /RLS NOT applied/);
     assert.match(n.message, /composite FK/);
-    assert.match(n.message, /note rather than a failure/);
+    // This guard states the catalog fact and hands off: `cross-tenant-fk` proves
+    // reachability and owns the worse half (CASCADE deleting the other tenant's
+    // rows). Reporting the same FK from both would be one finding twice.
+    assert.match(n.message, /tenant-guard fks/);
+    assert.match(n.message, /ON DELETE CASCADE/);
   });
 
   test('does NOT note the tenant FK itself (organization_id -> orgs is the correct pattern)', async () => {

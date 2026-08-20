@@ -83,6 +83,12 @@
     "allowlist": []
   },
 
+  "crossTenantFk": {
+    "//": "Runtime. Threat-model 3.11 — the only guard where one tenant DESTROYS another tenant's data rather than reading it. Referential-integrity checks always bypass row security (they must, or a constraint could be defeated by hiding a row), so a foreign key carrying an id but not the tenant lets tenant A point their row at tenant B's, and ON DELETE CASCADE then means B deleting their own row deletes A's. Flags rows that ALREADY cross tenants (conclusive, no probe) and proves reachability with a re-point probe in a rolled-back transaction. Skips when every FK already carries the tenant, since the bad row is then unrepresentable. Identity is inherited from rlsProof.",
+    "schemas": ["public"],
+    "allowlist": []
+  },
+
   "defaultPrivileges": {
     "//": "Runtime. Threat-model 7.2 — the only guard about the database as it WILL be. ALTER DEFAULT PRIVILEGES grants on every table created AFTER it, and Postgres never enables RLS by default, so a green run says nothing about the table somebody adds next week: it arrives already granted, with no policy, and no migration diff shows a security change. Proves it by creating a table inside a rolled-back transaction and reading what it inherited. Fails only on PUBLIC by default — granting to anon/authenticated is the stock Supabase shape, so it is reported as a note; add a role to failRoles[] to block the build on it.",
     "schemas": ["public"],

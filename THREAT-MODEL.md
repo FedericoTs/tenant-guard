@@ -71,7 +71,7 @@ These are checked *before* any isolation claim.
 | 2.8 | Policy trusts a **client-settable GUC** (`current_setting('app.tenant')`) — the client just sets it | 🟡 | `identity-trust`. The *concrete* form is a hard failure: a callable `SECURITY DEFINER` function that sets that GUC from an **argument** (a "become any tenant" primitive). Bare dependence on a settable GUC is a **note, never a build failure** — whether it is exploitable depends on architecture SQL cannot see, and it is also how this tool impersonates. That note is **upgraded to a failure by `pooler-bleed` (§6.1)** when the source is found writing the same GUC with connection scope |
 | 2.9 | Policy trusts a **user-writable JWT claim** (`user_metadata`) rather than `app_metadata` | ✅ | `identity-trust` detects it in the policy text (conclusive on its own) and then **proves** it: forge `user_metadata.<key>` as the victim and re-read. A control arm forging a nonexistent tenant keeps an already-open table from being blamed on the claim |
 | 2.10 | Policy subquery reads a **user-writable membership table** → self-grant into another tenant | ✅ | `identity-trust`. Dependencies come from `pg_depend` (exact, not a regex over policy text). Fails when the authority table has RLS off with a write grant, or an INSERT/UPDATE policy whose check never constrains its **tenant column** — the `WITH CHECK (user_id = auth.uid())` near-miss that pins WHO you are and leaves WHICH TENANT open. No tenant column on the authority table → a note, never a silent pass |
-| 2.11 | Existence oracles: global `UNIQUE` key, single-column FK, `ON CONFLICT DO NOTHING` reveal another tenant's hidden rows | ✅ | `constraint-oracles`, catalog-only. **UNIQUE omitting the tenant column → fails** (conclusive: the constraint either carries the tenant or it doesn't). Skips primary keys and single-UUID columns — unguessable values answer nothing. Expression indexes are skipped rather than guessed at. **Single-column FKs between tenant tables → an aggregated note**, since composite tenant FKs are rare and exploiting one needs a guessable parent id *and* an insert that passes `WITH CHECK` |
+| 2.11 | Existence oracles: global `UNIQUE` key, single-column FK, `ON CONFLICT DO NOTHING` reveal another tenant's hidden rows | ✅ | `constraint-oracles`, catalog-only. **UNIQUE omitting the tenant column → fails** (conclusive: the constraint either carries the tenant or it doesn't). Skips primary keys and single-UUID columns — unguessable values answer nothing. Expression indexes are skipped rather than guessed at. **Single-column FKs between tenant tables → an aggregated note** that hands off to §3.11, which proves reachability and owns the worse half (cascade deletion). Reporting the same key from both guards would be one finding twice |
 | 2.12 | `pg_stat_activity` exposes other tenants' live query text (all users share one DB role) | 🔜 | read it as the app role |
 | 2.13 | Planner/statistics side channels (`pg_stats`, non-`LEAKPROOF` functions) | ⛔ | needs adversarial query construction; low yield, high noise |
 | 2.14 | **Schema-per-tenant**: one role reaches more than one tenant schema | ✅ | `schema-tenancy`. A different architecture entirely — the boundary is GRANTs, not policies, and `search_path` is not a control. Was a verified blind spot: `rls-proof` reported "1/1 proven isolated" on a database where the app role read both tenant schemas |
@@ -93,7 +93,7 @@ RLS is **per-command**, and `USING` (which rows you may touch) is separate from
 | 3.8 | Self-row `UPDATE` lets a user set their own `role`/`org_id` → escalation | ✅ | `identity-trust`. **RLS is row-level and cannot restrict columns**, so the textbook-correct `USING (id = auth.uid()) WITH CHECK (id = auth.uid())` still lets you rewrite every field of your own row. Read from `has_column_privilege` per column — the only real control is a column-level GRANT, which is also the fix given. Scoped to columns a dependent policy actually reads, plus tenant columns (re-parenting) |
 | 3.9 | **`TRUNCATE` ignores RLS entirely** — gated only by table privilege (`GRANT ALL` includes it) | 🟡 | `rls-proof` reads the privilege from the catalog and reports one aggregated **note**. Deliberately **not probed**: `TRUNCATE` takes an `ACCESS EXCLUSIVE` lock and is the one statement you must not fire at a database by surprise. Latent (PostgREST exposes no TRUNCATE) rather than directly exploitable, so it is not a build failure |
 | 3.10 | `MERGE` (PG15+) per-arm policy gaps | 🔜 | exercise each arm |
-| 3.11 | Cross-tenant FK reference / cascade reaching another tenant's rows | 🔜 | insert a child pointing at tenant B's parent |
+| 3.11 | Cross-tenant FK reference / cascade reaching another tenant's rows | ✅ | `cross-tenant-fk`, and the only row in this document where one tenant **destroys** another tenant's data rather than reading it. **Referential integrity checks always bypass row security** — they must, or a constraint could be defeated by hiding a row. So an FK carrying an id but not the tenant lets tenant A point their own row at tenant B's, which the FK confirms even though RLS hides it, and the child's `WITH CHECK` never objects because it governs the tenant column rather than the reference. **Verified end to end**: A re-pointed a row at a project it could not see, then B's ordinary `delete` of their own project destroyed A's row via `ON DELETE CASCADE`, with no policy consulted at any point — and `rls-proof` calls that database isolated. Two conclusive paths: rows that **already** cross tenants (observed corruption, no probe needed), and a re-point probe in a rolled-back transaction. `RESTRICT`/`NO ACTION` inverts rather than removes the impact — A's reference **pins** B's row so B can no longer delete their own data. Composite keys carrying the tenant are excluded, since the bad row is then unrepresentable |
 | 3.12 | `anon` INSERT-only surface under RLS | 🟡 | `anon-writes` probes UPDATE/DELETE; pure-INSERT anon surfaces not probed yet |
 
 ## 4. Objects that aren't base tables
@@ -160,14 +160,13 @@ listed so nobody reads a green run as more than it is.
 ## What this means for the roadmap
 
 Every failure mode above that is **both** coverable by this tool's method **and**
-worth the noise it would add now has a guard behind it. Six rows are still
-🔜, and they are listed here rather than summarised away, ordered by
+worth the noise it would add now has a guard behind it. Five rows are still
+🔜. None is high-value — they are listed rather than summarised away, ordered by
 (severity × prevalence) ÷ build cost:
 
 | # | Why it hasn't been built |
 |---|---|
-| 3.11 cross-tenant FK / cascade | The best of the remaining set. Moderate cost: insert a child pointing at another tenant's parent and see whether the reference is allowed |
-| 7.3 `CREATE` on `public` granted to `anon`/`authenticated` | Already checked *as a precondition* inside `definer-rpc` (§4.4); standalone it is a small catalog read |
+| 7.3 `CREATE` on `public` granted to `anon`/`authenticated` | The best of what is left, and already checked *as a precondition* inside `definer-rpc` (§4.4); standalone it is a small catalog read |
 | 3.10 `MERGE` per-arm policies | PG15+, and rare in the app shapes this targets |
 | 4.8 legacy `INHERITS` children | Same enumeration as partitions, far rarer |
 | 3.7 UPSERT conflict path | Its permissive-`UPDATE`-policy case is already caught by the existing write probes, so a dedicated check would mostly re-report an existing finding |
@@ -193,7 +192,7 @@ callable GUC-setting definer functions, 4.7 partitions, 3.9 TRUNCATE (0.10.0);
 5.3/5.4 Realtime channels (0.15.0); 4.3/4.4/4.10 definer RPCs and SQL injection
 inside them (0.16.0–0.17.0); 4.9 shadow tables, 7.1 role capabilities (0.18.0);
 2.14 schema-per-tenant (0.19.0); 6.1 session-scoped tenant GUCs (0.21.0);
-7.2 inherited default privileges (0.22.0).*
+7.2 inherited default privileges (0.22.0); 3.11 cross-tenant foreign keys (0.23.0).*
 
 *Three of these are worth learning from. **4.7** was a false NEGATIVE in the
 flagship guard, found by writing the failure surface down rather than by waiting

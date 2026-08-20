@@ -48,7 +48,7 @@ every skipped guard is listed with its reason, in the summary and in the SARIF.
 
 | Input | Default | What it does |
 |---|---|---|
-| `command` | `run` | `run` = static guards only. `all` = static + every runtime proof. Or one guard: `prove`, `drift`, `anon-reads`, `anon-writes`, `identity`, `rpc`, `views`, `storage`, `realtime`, `schemas`, `pooler`, `defaults`, `shadows`, `oracles`, `caps` |
+| `command` | `run` | `run` = static guards only. `all` = static + every runtime proof. Or one guard: `prove`, `drift`, `anon-reads`, `anon-writes`, `identity`, `rpc`, `views`, `storage`, `realtime`, `schemas`, `pooler`, `defaults`, `fks`, `shadows`, `oracles`, `caps` |
 | `database-url` | `''` | Postgres URL for the runtime guards. **Test/staging only** — see the warning below |
 | `working-directory` | `.` | Run in a subdirectory (monorepos) |
 | `version` | *this action's version* | npm version of the CLI. Pinning the action pins the tool; set `latest` to float |

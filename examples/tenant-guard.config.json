@@ -78,6 +78,17 @@
     "allowlist": ["brand-assets"]
   },
 
+  "shadowTables": {
+    "//": "Runtime. Follows triggers on tenant tables to the tables they WRITE into. An audit log or outbox with no tenant column and no RLS holds every tenant activity record, and the tenant-column guards walk past it. Reads the function body, because plpgsql records no catalog dependency for what it writes.",
+    "schemas": ["public"],
+    "allowlist": []
+  },
+
+  "roleCapabilities": {
+    "//": "Catalog-only, nothing executed. Capabilities that defeat RLS outright (dblink opens a NEW connection as whatever role its string names; pg_read_file never touches the policy layer) and direct grants on the auth schema. Outbound HTTP (pg_net, http) is surfaced as a NOTE: real, but exfiltration rather than a cross-tenant read.",
+    "allowlist": []
+  },
+
   "definerRpc": {
     "//": "Runtime. A SECURITY DEFINER function runs as its OWNER and bypasses RLS on everything it touches, and PostgREST exposes it at /rest/v1/rpc/<name>. Flags ones that don't re-filter by tenant, or that trust a tenant id the caller passes in. Only STABLE/IMMUTABLE functions are ever CALLED — Postgres enforces that those cannot write; VOLATILE ones are reported from their body as explicitly unproven. Inherits identity from rlsProof.",
     "schemas": ["public"],

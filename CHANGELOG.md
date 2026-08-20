@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.18.0
+
+Three candidates from a scope review, built with their severities kept apart
+rather than flattened into one "security finding" bucket.
+
+- **feat: new guard `shadow-tables`** (`tenant-guard shadows`). Follows triggers on
+  tenant tables to the tables they **write into**. A trigger writes an audit row,
+  an outbox event, a denormalised cache — the source has flawless RLS and the
+  destination usually has **no tenant column at all**, so every tenant-aware guard
+  here walks straight past it. Verified: as tenant A, `invoices` correctly returns
+  one row while the `audit_log` its trigger fills returns **both** tenants' rows,
+  and `rls-proof` reports green. Fails only on the conclusive case — the
+  destination is readable by your app role **and** has no RLS.
+  - Detection reads the **function body**, because plpgsql is not parsed at
+    creation time and so records no `pg_depend` entry for what it writes. That is
+    stated as a limitation: a dynamically-assembled target isn't followed, and
+    unresolvable targets are listed rather than dropped.
+  - A destination that already carries a tenant column is still checked, because
+    this finding is **structural** where `rls-proof` is behavioural — an outbox
+    that has been drained reports "cannot prove" there, and the trigger will
+    refill it.
+- **feat: new guard `role-capabilities`** (`tenant-guard caps`). Catalog-only —
+  nothing is executed, since checking whether you *can* call `dblink` by calling
+  it would be a poor idea. Two families, deliberately at different severities:
+  - **Fails the build:** capabilities that defeat RLS outright. `dblink` opens a
+    *new connection* as whatever role its connection string names, so RLS on it
+    has nothing to do with the caller's; `pg_read_file` and friends never touch
+    the policy layer. Plus **direct grants on the `auth` schema**, where every
+    tenant's email and identity lives with no policy of yours in front of it.
+  - **A note, never a failure:** outbound HTTP (`pg_net`, the `http` extension).
+    Real — SSRF into your network, exfiltration of whatever the caller can already
+    see — but it is *not* a cross-tenant read, and this tool doesn't fail builds
+    on findings it can't stand behind as tenant isolation. It says so in the note.
+  - Every `REVOKE` fix names `PUBLIC` as well as the role, because revoking from
+    the role alone is a no-op when the grant lives on `PUBLIC` — which is
+    Postgres's default for every new function.
+- 334 tests (was 303), 15 guards.
+
 ## 0.17.0
 
 Still in 4.3's neighbourhood, and the answer to "should this do SQL-injection

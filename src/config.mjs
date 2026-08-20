@@ -211,6 +211,32 @@ export function resolveDefinerRpcConfig(config) {
   return out;
 }
 
+/** Resolve the shadow-tables config from the user's `shadowTables` block. */
+export function resolveShadowConfig(config) {
+  const s = config.shadowTables ?? {};
+  const out = {};
+  for (const k of ['url', 'urlEnv', 'schemas', 'tenantColumns', 'role', 'allowlist']) {
+    if (s[k] !== undefined) out[k] = s[k];
+  }
+  const p = config.rlsProof ?? {};
+  for (const k of ['role', 'tenantColumns', 'schemas']) {
+    if (out[k] === undefined && p[k] !== undefined) out[k] = p[k];
+  }
+  return out;
+}
+
+/** Resolve the role-capabilities config from the user's `roleCapabilities` block. */
+export function resolveCapabilitiesConfig(config) {
+  const c = config.roleCapabilities ?? {};
+  const out = {};
+  for (const k of ['url', 'urlEnv', 'role', 'allowlist', 'rlsBypassFunctions', 'egressFunctions', 'authTables']) {
+    if (c[k] !== undefined) out[k] = c[k];
+  }
+  const p = config.rlsProof ?? {};
+  if (out.role === undefined && p.role !== undefined) out.role = p.role;
+  return out;
+}
+
 export function autodetect(cwd = process.cwd()) {
   return {
     migrationsDir: firstExisting(cwd, CANDIDATE_MIGRATION_DIRS),

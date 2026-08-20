@@ -25,7 +25,7 @@ npx tenant-guard all      # everything: static guards + every runtime proof
 ```
 
 Or run one at a time: `prove`, `drift`, `anon-reads`, `anon-writes`, `identity`,
-`rpc`, `views`, `storage`, `realtime`, `oracles`. `npx tenant-guard list` describes each.
+`rpc`, `views`, `storage`, `realtime`, `oracles`, `shadows`, `caps`. `npx tenant-guard list` describes each.
 
 ---
 
@@ -103,6 +103,13 @@ tenant-guard  — guard tests for multi-tenant isolation
 | `view-isolation` | a **view** or **materialized view** leaks across tenants | a view runs with its **owner's** rights unless `security_invoker` is set, and RLS **never applies to a materialized view at all** — so a perfectly-RLS'd table can still be handed out wholesale by the view beside it, and every table-only checker (including `rls-proof`) sees nothing wrong |
 | `storage-isolation` | Supabase **Storage** leaks across tenant folders | storage has no tenant *column* — tenancy lives in the object **path**. Two things follow that a column-based check cannot see: the **client picks the path on upload**, so a perfect read policy still lets a user write into another tenant's folder; and a **public bucket** is served with no auth and no RLS at all, making "the path is unguessable" the whole boundary |
 | `realtime-isolation` | Supabase **Realtime** channels leak across tenants | Realtime is a second way out of the database, easy to forget once REST looks locked down. Broadcast and Presence authorize channels through RLS on `realtime.messages` — with none, any client joins any tenant's channel, reads every payload on it, and (since joining is a write) **publishes into it**. The tenant lives in the *topic*, not a column |
+
+**Runtime — where tenant data goes, and what else the role can reach:**
+
+| Guard | Fails when… | Why a scanner misses it |
+|---|---|---|
+| `shadow-tables` | a trigger copies tenant data into a table nothing protects | the source has flawless RLS; the audit log, outbox or cache it feeds usually has **no tenant column at all**, so every tenant-aware check walks past it. Verified: the source returns one row to its tenant while the shadow returns both tenants', and `rls-proof` reports green |
+| `role-capabilities` | the app role holds a capability that defeats RLS, or a direct grant on the `auth` schema | `dblink` opens a **new connection** as whatever role its string names — RLS on it has nothing to do with the caller's; file reads never touch the policy layer; and `auth.users` is every tenant's email in one table with no policy of yours in front of it. Outbound HTTP (`pg_net`) is surfaced as a **note**: real, but exfiltration rather than a cross-tenant read |
 
 **Catalog** — the schema's shape rather than its behaviour:
 
@@ -241,6 +248,12 @@ also where the tool is most careful about its own blast radius: it will only
 **call** a function Postgres has classified `STABLE` or `IMMUTABLE`, because the
 engine enforces that those cannot write. A `VOLATILE` definer function is never
 invoked — it is reported from a read of its body, as a note, saying exactly that.
+
+**`shadows` and `caps` — where the data goes, and what else the role holds.** A
+trigger on a protected table writes to an audit log that nothing protects, and the
+data is out. Separately, some grants make every table-level question moot: `dblink`
+opens a connection RLS knows nothing about, and a direct grant on `auth.users`
+hands over every tenant's email.
 
 **`oracles` — the schema itself.** RLS hides rows, not constraints. A globally
 `UNIQUE` natural key on a tenant table lets anyone test whether a value exists in

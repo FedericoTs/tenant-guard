@@ -110,7 +110,7 @@ The highest-severity blind spot of any table-only scanner.
 | 4.6 | View/function over `auth.users` exposing every tenant's email | 🟡 | a *view* over `auth.users` is covered by 4.1 **if it exposes a tenant column**; one keyed only by user id isn't yet |
 | 4.7 | **Partitions**: RLS on the parent, but a partition queried directly uses *its own* (often unset) RLS; newly attached partitions miss `ENABLE`/`FORCE` | ✅ | `rls-proof`. This was a **false negative in the flagship guard**: partitioned parents are `relkind='p'` (previously skipped entirely) and every partition holds exactly one tenant by construction, so the two-tenant probe never fired and a leaking database reported green. Fixed by scanning parents and adding a **foreign-tenant probe** |
 | 4.8 | Legacy `INHERITS` children don't inherit parent policies | 🔜 | same enumeration |
-| 4.9 | Triggers/rules writing tenant rows into an un-RLS'd audit/outbox table | 🟡 | the audit table is itself scanned *if* it has a tenant column; without one it's invisible → 🔜 |
+| 4.9 | Triggers/rules writing tenant rows into an un-RLS'd audit/outbox table | ✅ | `shadow-tables` follows triggers on tenant tables to their write targets. Detection reads the function **body**, because plpgsql records no `pg_depend` for what it writes — so a dynamically-assembled target isn't followed, and unresolvable ones are listed rather than dropped |
 
 ## 5. Supabase surfaces
 

@@ -13,6 +13,8 @@
  *   tenant-guard oracles  exit 1 if a UNIQUE key reveals another tenant’s rows
  *   tenant-guard realtime exit 1 if Realtime channels leak across tenants
  *   tenant-guard rpc      exit 1 if a SECURITY DEFINER RPC routes around RLS
+ *   tenant-guard shadows  exit 1 if a trigger copies tenant data somewhere unprotected
+ *   tenant-guard caps     exit 1 if the app role holds an RLS-bypassing capability
  *   tenant-guard all      run every guard above, in order
  *   tenant-guard init    write a tenant-guard.config.json, seeded from this repo
  *   tenant-guard list    list the available guards and what each prevents
@@ -24,8 +26,8 @@
  */
 import { writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { GUARDS, runAll, runProof, runDrift, runAnonWrites, runAnonReads, runViews, runIdentity, runStorage, runOracles, runRealtime, runDefinerRpc, runEverything } from '../src/index.mjs';
-import { rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation, definerRpc } from '../src/index.mjs';
+import { GUARDS, runAll, runProof, runDrift, runAnonWrites, runAnonReads, runViews, runIdentity, runStorage, runOracles, runRealtime, runDefinerRpc, runShadowTables, runCapabilities, runEverything } from '../src/index.mjs';
+import { rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation, definerRpc, shadowTables, roleCapabilities } from '../src/index.mjs';
 import { CONFIG_FILENAME, autodetect } from '../src/config.mjs';
 import { report, bold, dim, green, yellow } from '../src/runner.mjs';
 
@@ -155,9 +157,25 @@ if (cmd === 'rpc') {
   process.exit(code);
 }
 
+if (cmd === 'shadows') {
+  // Tenant data copied into an unprotected table. Async — needs a DB.
+  const result = await runShadowTables(cwd);
+  const code = report([result], { emptyHint: false });
+  if (result.skipped) console.log(dim(SKIP_HINT('shadows')));
+  process.exit(code);
+}
+
+if (cmd === 'caps') {
+  // Capabilities the app role holds beyond your tables. Catalog-only.
+  const result = await runCapabilities(cwd);
+  const code = report([result], { emptyHint: false });
+  if (result.skipped) console.log(dim(SKIP_HINT('caps')));
+  process.exit(code);
+}
+
 if (cmd === 'list') {
   console.log(bold('\ntenant-guard guards\n'));
-  for (const g of [...GUARDS, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation, definerRpc]) {
+  for (const g of [...GUARDS, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation, definerRpc, shadowTables, roleCapabilities]) {
     console.log(`  ${bold(g.meta.id)}`);
     console.log(dim(`    ${g.meta.title}`));
     console.log(dim(`    ${g.meta.why}\n`));
@@ -223,6 +241,19 @@ if (cmd === 'init') {
       schemas: ['public'],
       allowlist: [], // "schema.table" intentionally readable by anon (published/reference data)
     },
+    shadowTables: {
+      // Follows triggers on tenant tables to the tables they WRITE into. An audit
+      // log or outbox with no tenant column and no RLS holds every tenant's
+      // activity, and the tenant-column guards walk past it.
+      schemas: ['public'],
+      allowlist: [], // "schema.table" destinations that are unscoped on purpose
+    },
+    roleCapabilities: {
+      // Catalog-only. Capabilities that defeat RLS outright (dblink opens a new
+      // connection as another role; file reads never touch the policy layer) and
+      // direct grants on the auth schema. Outbound HTTP is surfaced as a note.
+      allowlist: [], // "schema.function" or "auth.table" granted on purpose
+    },
     definerRpc: {
       // A SECURITY DEFINER function runs as its OWNER and bypasses RLS, and
       // PostgREST exposes it at /rest/v1/rpc/<name>. Only STABLE/IMMUTABLE
@@ -283,5 +314,5 @@ if (cmd === 'init') {
   process.exit(0);
 }
 
-console.error(`Unknown command: ${cmd}\nUsage: tenant-guard [run|prove|drift|anon-writes|all|anon-reads|views|identity|storage|oracles|realtime|rpc|init|list]`);
+console.error(`Unknown command: ${cmd}\nUsage: tenant-guard [run|prove|drift|anon-writes|all|anon-reads|views|identity|storage|oracles|realtime|rpc|shadows|caps|init|list]`);
 process.exit(2);

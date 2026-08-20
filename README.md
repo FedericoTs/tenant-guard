@@ -29,6 +29,8 @@ npx tenant-guard views        # exit 1 if a view/materialized view leaks across 
 npx tenant-guard identity     # exit 1 if the identity your policies trust is forgeable
 npx tenant-guard storage      # exit 1 if Supabase Storage leaks across tenant folders
 npx tenant-guard oracles      # exit 1 if a UNIQUE key reveals another tenant’s rows
+npx tenant-guard realtime     # exit 1 if Realtime channels leak across tenants
+npx tenant-guard all          # run every guard above, in order
 ```
 
 ---
@@ -88,6 +90,7 @@ tenant-guard  — guard tests for multi-tenant isolation
 | `identity-trust` *(runtime)* | the caller can **forge the identity** your policies authorize from, or **write the table that grants it** | every other guard asks "given a correct identity, is the data scoped?" — this asks whether the identity itself is controllable: a policy reading `user_metadata` (which the *user* can rewrite) is defeated by forging that claim; a callable `SECURITY DEFINER` that sets your tenant GUC from an argument is a "become any tenant" primitive; a `memberships` table the caller can write makes a *flawless* policy bypassable — insert yourself into any org and the policy hands over that org's data, legitimately; and because **RLS is row-level and cannot restrict columns**, a correct `USING (id = auth.uid())` self-update policy still lets a user set their own `role` or re-parent their `organization_id` |
 | `storage-isolation` *(runtime)* | Supabase **Storage** leaks across tenant folders | storage has no tenant *column* — tenancy lives in the object **path**, so the tenant is an expression over `name`. Two things follow that a column-based check cannot see: the **client picks the path on upload**, so a perfect read policy still lets a user write into another tenant's folder; and a **public bucket** is served with no auth and no RLS at all, making "the path is unguessable" the whole boundary |
 | `constraint-oracles` *(catalog)* | a constraint answers questions **across** tenants | RLS hides rows, not constraints — and constraints are enforced *below* it. `users.email UNIQUE` on a tenant table means inserting `victim@corp.com` raises a duplicate-key error even though RLS hides the row that caused it, so anyone can test whether a value exists in another tenant (and `ON CONFLICT DO NOTHING` asks the same question with no error at all). Nothing about the policies is wrong; the *schema* is the leak |
+| `realtime-isolation` *(runtime)* | Supabase **Realtime** channels leak across tenants | Realtime is a second way out of the database, and it is easy to forget once REST looks locked down. Broadcast and Presence authorize channels through RLS on `realtime.messages` — with none, any client joins any tenant's channel, reads every payload on it, and (since joining is a write) **publishes into it**. The tenant lives in the *topic*, not a column |
 | `view-isolation` *(runtime)* | a **view** or **materialized view** leaks across tenants | a view runs with its **owner's** rights unless `security_invoker` is set, and RLS **never applies to a materialized view at all** — so a perfectly-RLS'd table can still be handed out wholesale by the view beside it, and every table-only checker (including `rls-proof`) sees nothing wrong |
 
 `npx tenant-guard list` describes each.

@@ -1,0 +1,380 @@
+/**
+ * Guard: Supabase Realtime tenant isolation.
+ *
+ * Realtime is a second, parallel way out of your database, and it is easy to
+ * forget it exists once the REST surface looks locked down.
+ *
+ *   • **Broadcast / Presence** authorize channel access through **RLS on
+ *     `realtime.messages`**. If that table has no RLS — or a permissive policy —
+ *     any client can join any tenant's channel: read every payload flowing through
+ *     it, and, because joining is a write, **publish into it**. Injecting events
+ *     into another tenant's live channel is the realtime analogue of writing into
+ *     their storage folder.
+ *
+ *   • **`postgres_changes`** streams row changes over a websocket, gated by the
+ *     table's ordinary SELECT policy. That policy is already proven by `rls-proof`,
+ *     so this guard does not re-litigate it — it reports which tenant tables are
+ *     actually in the `supabase_realtime` publication, because a permissive policy
+ *     on a *streaming* table is a live firehose rather than a request-at-a-time
+ *     read, and people rarely know the list.
+ *
+ * The tenant lives in the **topic** (`org_A`, or `org_A:notifications`), not in a
+ * column — the same shape as storage paths, so the same tenant-expression
+ * approach applies. `split_part(topic, ':', 1)` covers both conventions: with no
+ * separator it returns the whole topic.
+ *
+ * Skips cleanly when there is no `realtime` schema, so non-Supabase projects and
+ * older Supabase versions are never punished for a surface they don't have.
+ */
+import {
+  safeRole,
+  buildBecomeTenant,
+  isPermissionDenied,
+  isRlsCheckViolation,
+  applyClaimShortcut,
+  DEFAULTS as PROOF_DEFAULTS,
+} from './rls-proof.mjs';
+
+export const meta = {
+  id: 'realtime-isolation',
+  title: 'Supabase Realtime tenant isolation (broadcast channels)',
+  why: "Realtime is a second way out of the database. Broadcast and Presence authorize channels through RLS on realtime.messages — with no policy there, any client joins any tenant's channel, reads every payload on it, and can publish into it. The tenant lives in the topic, not a column, so a column-based check never sees it.",
+};
+
+export const DEFAULTS = {
+  urlEnv: 'TENANT_GUARD_DATABASE_URL',
+  role: PROOF_DEFAULTS.role,
+  becomeTenant: PROOF_DEFAULTS.becomeTenant,
+  claim: null,
+  tenantColumns: PROOF_DEFAULTS.tenantColumns,
+  // How a topic encodes its tenant: "org_A:notifications" -> separator ':'.
+  // A topic that is just the tenant id works with the same expression.
+  topicSeparator: ':',
+  allowlist: [], // topic prefixes that are intentionally global (a status channel)
+  sampleLimit: 3,
+  probeWrites: true,
+};
+
+/** The topic tenant-guard would broadcast into; never committed. */
+export const PROBE_EVENT = 'tenant-guard-probe';
+
+// ── pure helpers (unit-tested, no I/O) ───────────────────────────────
+
+/** Is Realtime's broadcast table present at all? */
+export function realtimePresentSql() {
+  return {
+    text: `select count(*)::int as n
+             from pg_catalog.pg_class c
+             join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+            where n.nspname = 'realtime' and c.relname = 'messages'`,
+    values: [],
+  };
+}
+
+/**
+ * The tenant EXPRESSION over a channel topic. Like storage paths, Realtime has no
+ * tenant column — the tenant is encoded in `topic`. With no separator present,
+ * `split_part` returns the whole topic, so this covers both the `org_A` and
+ * `org_A:notifications` conventions with one expression.
+ */
+export function topicTenantExpr(separator) {
+  if (typeof separator !== 'string' || separator.length !== 1 || /['\\]/.test(separator)) {
+    throw new Error(`unsafe topic separator: ${JSON.stringify(separator)} (expected a single character, not a quote or backslash)`);
+  }
+  return `split_part(topic, '${separator}', 1)`;
+}
+
+/** RLS status + policy count for realtime.messages (it may be partitioned). */
+export function messagesRlsSql() {
+  return {
+    text: `select c.relrowsecurity as rls_enabled,
+                  c.relkind as kind,
+                  (select count(*) from pg_catalog.pg_policy p where p.polrelid = c.oid)::int as policy_count
+             from pg_catalog.pg_class c
+             join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+            where n.nspname = 'realtime' and c.relname = 'messages'`,
+    values: [],
+  };
+}
+
+/** Distinct tenants seen across channel topics (privileged — sees everything). */
+export function distinctTopicTenantsSql(separator, limit) {
+  const expr = topicTenantExpr(separator);
+  return {
+    text: `select distinct ${expr} as t
+             from realtime.messages
+            where topic is not null and topic <> ''
+            order by 1
+            limit $1`,
+    limit,
+  };
+}
+
+/** How many messages on a given tenant's channels the CURRENT session can see. */
+export function topicMessageCountSql(separator) {
+  const expr = topicTenantExpr(separator);
+  return { text: `select count(*)::int as n from realtime.messages where ${expr} = $1` };
+}
+
+/** Broadcast probe: publish into a channel whose topic the CLIENT chooses. */
+export function broadcastProbeSql() {
+  return { text: `insert into realtime.messages (topic, extension, event) values ($1, 'broadcast', $2)` };
+}
+
+/** Tenant tables that are actually streaming through postgres_changes. */
+export function publicationTablesSql(tenantColumns) {
+  const text = `
+    select pt.schemaname as schema,
+           pt.tablename  as table,
+           c.relrowsecurity as rls_enabled
+    from pg_catalog.pg_publication_tables pt
+    join pg_catalog.pg_class c on c.relname = pt.tablename
+    join pg_catalog.pg_namespace n on n.oid = c.relnamespace and n.nspname = pt.schemaname
+    where pt.pubname = 'supabase_realtime'
+      and exists (
+        select 1 from pg_catalog.pg_attribute a
+         where a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
+           and a.attname = any($1)
+      )
+    order by 1, 2`;
+  return { text, values: [tenantColumns] };
+}
+
+/**
+ * Verdict for the broadcast surface.
+ * @returns {{status:'leak'|'isolated'|'insufficient-data'|'no-access'|'no-policy', kind?:string, message?:string, fix?:string}}
+ */
+export function classifyRealtime({ rlsEnabled, policyCount, tenantCount, crossVisible, broadcastIntoOther, ownBroadcastWorked, noAccess, role = 'authenticated' }) {
+  if (rlsEnabled === false) {
+    return {
+      status: 'leak',
+      kind: 'read',
+      message: `ROW LEVEL SECURITY is not enabled on realtime.messages — Broadcast and Presence authorize channel access through RLS on that table, so with none, any client can join ANY tenant's channel: read every payload flowing through it and publish into it`,
+      fix:
+        `Enable RLS and scope channel access by the topic's tenant segment:\n` +
+        `        ALTER TABLE realtime.messages ENABLE ROW LEVEL SECURITY;\n` +
+        `        CREATE POLICY tenant_channels ON realtime.messages FOR SELECT\n` +
+        `          USING (split_part(topic, ':', 1) = <the caller's tenant>);\n` +
+        `        CREATE POLICY tenant_publish ON realtime.messages FOR INSERT\n` +
+        `          WITH CHECK (split_part(topic, ':', 1) = <the caller's tenant>);`,
+    };
+  }
+  if (policyCount === 0) {
+    return { status: 'no-policy', message: `RLS is enabled on realtime.messages but there is NO policy — Postgres then denies everything, so Broadcast and Presence are effectively switched off rather than secured. Not a leak, but almost certainly not what was intended` };
+  }
+  if (noAccess) return { status: 'no-access', message: `"${role}" cannot read realtime.messages at all — no channel is exposed to it` };
+  if (tenantCount < 2) return { status: 'insufficient-data', message: `channel topics reference ${tenantCount} tenant(s) — cannot prove cross-tenant isolation until two exist` };
+  if (crossVisible > 0) {
+    return {
+      status: 'leak',
+      kind: 'read',
+      message: `a session acting as one tenant read ${crossVisible} message(s) on ANOTHER tenant's channel — the SELECT policy on realtime.messages does not pin the topic's tenant segment, so any client can subscribe to any tenant's broadcast and presence traffic`,
+      fix:
+        `Scope channel reads by the topic:\n` +
+        `        CREATE POLICY tenant_channels ON realtime.messages FOR SELECT\n` +
+        `          USING (split_part(topic, ':', 1) = <the caller's tenant>);`,
+    };
+  }
+  if (broadcastIntoOther) {
+    return {
+      status: 'leak',
+      kind: 'write',
+      message: `a session acting as one tenant PUBLISHED into ANOTHER tenant's channel. The client chooses the topic when it joins, so unless the INSERT policy pins the tenant segment, any user can inject events into anyone's live channel — pushing fabricated updates straight into another tenant's running app. Reads being correctly scoped does not prevent this`,
+      fix:
+        `Pin the topic on publish as well as subscribe — INSERT is governed only by WITH CHECK:\n` +
+        `        CREATE POLICY tenant_publish ON realtime.messages FOR INSERT\n` +
+        `          WITH CHECK (split_part(topic, ':', 1) = <the caller's tenant>);`,
+    };
+  }
+  return { status: 'isolated', ownBroadcastWorked };
+}
+
+// ── async orchestration ──────────────────────────────────────────────
+
+const OK = (extra) => ({ id: meta.id, ok: true, violations: [], scanned: 0, notes: [], ...extra });
+
+export async function check({ query, config = {} }) {
+  const cfg = applyClaimShortcut({ ...DEFAULTS, ...config }, config);
+  const role = safeRole(cfg.role);
+  const q = async (text, values) => (await query(text, values)).rows;
+  const skip = new Set(cfg.allowlist);
+  const sep = cfg.topicSeparator;
+  topicTenantExpr(sep); // validate early, before any I/O
+
+  const present = (await q(realtimePresentSql().text, []))[0];
+  if (!present || present.n < 1) {
+    return OK({ skipped: true, reason: 'no Supabase Realtime broadcast table (realtime.messages)', summary: 'skipped — no realtime schema' });
+  }
+
+  const violations = [];
+  const notes = [];
+
+  // postgres_changes: informational, not re-litigating the SELECT policy that
+  // rls-proof already proves — just naming which tenant tables actually stream.
+  try {
+    const pt = publicationTablesSql(cfg.tenantColumns);
+    const streaming = await q(pt.text, pt.values);
+    if (streaming.length > 0) {
+      const offNames = streaming.filter((r) => !(r.rls_enabled === true || r.rls_enabled === 't')).map((r) => `${r.schema}.${r.table}`);
+      notes.push({
+        where: 'supabase_realtime publication',
+        message:
+          `${streaming.length} tenant table(s) stream row changes over postgres_changes: ${streaming.slice(0, 4).map((r) => `${r.schema}.${r.table}`).join(', ')}${streaming.length > 4 ? `, +${streaming.length - 4} more` : ''}. ` +
+          `Delivery is gated by each table's ordinary SELECT policy, which \`tenant-guard prove\` already proves — but on a streaming table a permissive policy is a live firehose to every subscriber rather than one request at a time, so these are the tables where that policy matters most.` +
+          (offNames.length ? ` ${offNames.length} of them have RLS OFF (${offNames.slice(0, 3).join(', ')}) — every row of every tenant is being broadcast to every subscriber.` : ''),
+      });
+    }
+  } catch (err) {
+    notes.push({ where: 'supabase_realtime publication', message: `could not read the publication: ${err.message}` });
+  }
+
+  const rlsRow = (await q(messagesRlsSql().text, []))[0];
+  const rlsEnabled = rlsRow ? (rlsRow.rls_enabled === true || rlsRow.rls_enabled === 't') : null;
+  const policyCount = rlsRow ? Number(rlsRow.policy_count || 0) : 0;
+
+  if (rlsEnabled === false) {
+    const v = classifyRealtime({ rlsEnabled: false, role });
+    violations.push({ where: 'realtime.messages', kind: v.kind, message: v.message, fix: v.fix });
+    return { id: meta.id, ok: false, violations, notes, scanned: 1, summary: '1 realtime isolation issue (RLS is off on realtime.messages)' };
+  }
+  if (policyCount === 0) {
+    notes.push({ where: 'realtime.messages', message: classifyRealtime({ rlsEnabled: true, policyCount: 0, role }).message });
+    return { id: meta.id, ok: true, violations, notes, scanned: 1, summary: 'realtime.messages has RLS but no policy — broadcast is denied, not secured (see notes)' };
+  }
+
+  let scanned = 1;
+  let proven = 0;
+
+  await query('begin', []);
+  try {
+    const dt = distinctTopicTenantsSql(sep, cfg.sampleLimit);
+    const tenants = (await q(dt.text, [cfg.sampleLimit])).map((r) => r.t).filter((t) => t && !skip.has(t));
+    if (tenants.length < 2) {
+      notes.push({ where: 'realtime.messages', message: classifyRealtime({ rlsEnabled: true, policyCount, tenantCount: tenants.length, role }).message });
+      try { await query('rollback', []); } catch { /* ignore */ }
+      return { id: meta.id, ok: true, violations, notes, scanned, summary: 'realtime.messages not proven — fewer than two tenants have channel traffic (see notes)' };
+    }
+    const [tenantA, tenantB] = tenants;
+
+    // Negative control: the app role must actually be subject to RLS.
+    let canaryReady = false;
+    try {
+      await query('create temp table tg_rt_canary (x int)', []);
+      await query('insert into tg_rt_canary values (1)', []);
+      await query('alter table tg_rt_canary enable row level security', []);
+      await query('alter table tg_rt_canary force row level security', []);
+      await query(`grant select on tg_rt_canary to ${role}`, []);
+      canaryReady = true;
+    } catch (err) {
+      notes.push({ where: '(self-check)', message: `could not set up the RLS self-check canary (${err.message})` });
+    }
+    await query(`set local role ${role}`, []);
+    if (canaryReady) {
+      let seen = null;
+      try { seen = (await q('select count(*)::int as n from tg_rt_canary', []))[0].n; } catch { /* denied => enforced */ }
+      if (seen !== null && seen > 0) {
+        try { await query('rollback', []); } catch { /* ignore */ }
+        return {
+          id: meta.id, ok: false, notes, scanned,
+          violations: [{ where: `role "${role}"`, message: `identity self-check FAILED — "${role}" read a deny-all RLS table, so RLS is NOT enforced for it. Every "isolated" result would be a vacuous pass.`, fix: `Set the role to your non-superuser app role (e.g. "authenticated").` }],
+          summary: 'identity switch is not enforcing RLS — refusing to report a vacuous pass',
+        };
+      }
+    }
+
+    let noAccess = false;
+    let crossVisible = 0;
+    let broadcastIntoOther = false;
+    let ownBroadcastWorked = false;
+    let probeError = null;
+    try {
+      for (const s of buildBecomeTenant(cfg.becomeTenant, tenantA)) await query(s.text, s.values);
+      const cnt = topicMessageCountSql(sep);
+      crossVisible = (await q(cnt.text, [tenantB]))[0].n;
+
+      for (const s of buildBecomeTenant(cfg.becomeTenant, tenantB)) await query(s.text, s.values);
+      crossVisible = Math.max(crossVisible, (await q(cnt.text, [tenantA]))[0].n);
+
+      if (cfg.probeWrites !== false) {
+        // Control arm first: if this session cannot publish into its OWN channel,
+        // a refusal elsewhere proves nothing about tenant scoping.
+        const bp = broadcastProbeSql();
+        ownBroadcastWorked = await probeBroadcast(query, bp.text, [`${tenantB}${sep}tg`, PROBE_EVENT]);
+        if (ownBroadcastWorked) {
+          broadcastIntoOther = await probeBroadcast(query, bp.text, [`${tenantA}${sep}tg`, PROBE_EVENT]);
+        }
+      }
+    } catch (err) {
+      if (isPermissionDenied(err)) noAccess = true;
+      else probeError = err.message;
+    }
+    await query('reset role', []);
+
+    if (probeError) {
+      notes.push({ where: 'realtime.messages', message: `could not probe — check role/becomeTenant: ${probeError}` });
+    } else {
+      const verdict = classifyRealtime({ rlsEnabled: true, policyCount, tenantCount: tenants.length, crossVisible, broadcastIntoOther, ownBroadcastWorked, noAccess, role });
+      if (verdict.status === 'leak') {
+        violations.push({ where: 'realtime.messages', kind: verdict.kind, message: verdict.message, fix: verdict.fix, crossVisible });
+      } else if (verdict.status === 'isolated') {
+        proven++;
+        if (cfg.probeWrites !== false && !ownBroadcastWorked) {
+          notes.push({ where: 'realtime.messages', message: `channel reads are proven isolated, but the publish probe was inconclusive — this session could not insert a message even on its own topic, so the write path was not exercised.` });
+        }
+      } else {
+        notes.push({ where: 'realtime.messages', message: verdict.message });
+      }
+    }
+  } finally {
+    try { await query('rollback', []); } catch { /* ignore */ }
+  }
+
+  return {
+    id: meta.id,
+    ok: violations.length === 0,
+    violations,
+    notes,
+    scanned,
+    summary:
+      violations.length > 0
+        ? `${violations.length} realtime isolation issue(s)`
+        : `${proven}/${scanned} realtime broadcast surface(s) proven isolated`,
+  };
+}
+
+/** One publish attempt in a rolled-back savepoint. True = the message was created. */
+async function probeBroadcast(query, text, values) {
+  await query('savepoint tg_rt', []);
+  try {
+    const res = await query(text, values);
+    const affected = res.rowCount ?? res.affectedRows ?? 0;
+    await query('rollback to savepoint tg_rt', []);
+    await query('release savepoint tg_rt', []);
+    return affected > 0;
+  } catch (err) {
+    try { await query('rollback to savepoint tg_rt', []); await query('release savepoint tg_rt', []); } catch { /* ignore */ }
+    if (isRlsCheckViolation(err) || isPermissionDenied(err)) return false;
+    return false;
+  }
+}
+
+/** CLI/programmatic entry: resolve a connection, import `pg`, run the check. */
+export async function run(config = {}) {
+  const cfg = { ...DEFAULTS, ...config };
+  const url = cfg.url || process.env[cfg.urlEnv] || process.env.DATABASE_URL;
+  if (!url) return OK({ skipped: true, reason: `no database configured — set ${cfg.urlEnv} (or DATABASE_URL)`, summary: 'skipped — no database' });
+  let pg;
+  try {
+    pg = await import('pg');
+  } catch {
+    return OK({ skipped: true, reason: 'Postgres driver not installed — run `npm i -D pg`', summary: 'skipped — pg not installed' });
+  }
+  const Client = pg.default?.Client ?? pg.Client;
+  const client = new Client({ connectionString: url });
+  await client.connect();
+  try {
+    return await check({ query: (text, values) => client.query(text, values), config: cfg });
+  } finally {
+    await client.end();
+  }
+}

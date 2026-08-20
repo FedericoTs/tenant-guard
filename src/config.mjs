@@ -183,6 +183,20 @@ export function resolveOraclesConfig(config) {
   return out;
 }
 
+/** Resolve the realtime-isolation config from the user's `realtimeIsolation` block. */
+export function resolveRealtimeConfig(config) {
+  const r = config.realtimeIsolation ?? {};
+  const out = {};
+  for (const k of ['url', 'urlEnv', 'role', 'becomeTenant', 'claim', 'tenantColumns', 'topicSeparator', 'allowlist', 'sampleLimit', 'probeWrites']) {
+    if (r[k] !== undefined) out[k] = r[k];
+  }
+  const p = config.rlsProof ?? {};
+  for (const k of ['role', 'becomeTenant', 'claim', 'tenantColumns']) {
+    if (out[k] === undefined && p[k] !== undefined) out[k] = p[k];
+  }
+  return out;
+}
+
 export function autodetect(cwd = process.cwd()) {
   return {
     migrationsDir: firstExisting(cwd, CANDIDATE_MIGRATION_DIRS),

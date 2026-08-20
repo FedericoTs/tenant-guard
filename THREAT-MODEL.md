@@ -117,8 +117,8 @@ The highest-severity blind spot of any table-only scanner.
 |---|---|---|---|
 | 5.1 | `storage.objects` — tenancy lives in the **object path** or `owner`, not a column | ✅ | `storage-isolation`. Tenant-**expression** support (`split_part(name,'/',N)` — deliberately not Supabase's `storage.foldername()`, so the same SQL runs on vanilla Postgres). Probes cross-tenant reads AND the **upload path-hop**: the client picks the object name on upload, so an unpinned INSERT policy lets a user write into another tenant's folder. The upload probe has a control arm — it first uploads into its OWN folder, so a refusal elsewhere is never miscredited to tenant scoping |
 | 5.2 | `storage.buckets.public = true` — CDN serves objects with no auth and no RLS | ✅ | `storage-isolation` fails a public bucket that holds objects under **two or more tenant folders**. The flag is a catalog read and the message says so — the public GET is HTTP behaviour in the Storage service, so it is reported as a catalog fact, not claimed as probed. A single-folder public bucket (logos, assets) is not flagged |
-| 5.3 | Realtime `postgres_changes` streams rows to subscribers | 🟡 | delivery is gated by the **SELECT policy**, which §2 already proves; naming it explicitly (publication membership + permissive policy) is 🔜 |
-| 5.4 | Realtime broadcast/presence authorization (`realtime.messages` RLS) | 🔜 | it's an RLS-guarded table — same probe shape |
+| 5.3 | Realtime `postgres_changes` streams rows to subscribers | ✅ | delivery is gated by the **SELECT policy**, which §2 already proves — so `realtime-isolation` does not re-litigate it and instead **names which tenant tables are actually in the `supabase_realtime` publication** (and which of those have RLS off). On a streaming table a permissive policy is a live firehose rather than one request at a time, and people rarely know the list |
+| 5.4 | Realtime broadcast/presence authorization (`realtime.messages` RLS) | ✅ | `realtime-isolation`. The tenant lives in the **topic** (`org_A:notifications`), so it uses a tenant expression like storage: `split_part(topic, ':', 1)` — which also covers a bare `org_A` topic, since split_part returns the whole string when the separator is absent. Probes cross-tenant channel reads AND **publishing into another tenant's channel** (joining is a write), with the same control arm as storage |
 | 5.5 | Tables exposed in **non-`public` schemas** (PostgREST `db-schemas`) | 🟡 | `schemas` is configurable, but defaults to `public` — a `public`-only run under-reports |
 | 5.6 | `service_role` key shipped to the client | ⛔ | not a database fact — needs a bundle/env/git secret scan |
 | 5.7 | JWT secret weak/leaked → forged `role: service_role` | ⛔ | key management, not RLS |
@@ -158,22 +158,30 @@ listed so nobody reads a green run as more than it is.
 ## What this means for the roadmap
 
 Ordered by (severity × prevalence in real AI-generated apps) ÷ build cost, the
-the only planned item left is **5.4 (Realtime broadcast authorization —
-`realtime.messages` is an RLS-guarded table, so it is the same probe shape as
-everything else)**. **3.7 (the UPSERT conflict path)** stays low: the
-permissive-`UPDATE`-policy case it depends on is already caught by the existing write
-probes, so it buys less than its position suggests. **2.12 (`pg_stat_activity` query
-text)** and **1.8 (naming a claim-shape mismatch explicitly)** are small polish.
+**there is no planned item left.** Every failure mode in this document that
+is coverable by "run SQL as the app role" now has a guard behind it.
 
-Everything else still open is ⛔ **by construction** — leaked service keys, pooler
-GUC bleed, app-layer IDOR through a service-role connection — and stays listed
-rather than quietly dropped, because the honest statement of what a tool cannot see
-is part of what makes the rest of it trustworthy.
+What stays open is open **on purpose**:
+
+- **3.7 (the UPSERT conflict path)** — its permissive-`UPDATE`-policy case is already
+  caught by the existing write probes, so a dedicated check would mostly re-report an
+  existing finding.
+- **2.12 (`pg_stat_activity` query text)** and **1.8 (naming a claim-shape mismatch
+  explicitly)** — small polish, worth doing when someone hits them.
+- Everything marked ⛔ is out of scope **by construction** — leaked service keys,
+  pooler GUC bleed, app-layer IDOR through a service-role connection. Those need a
+  different instrument, and they stay listed rather than quietly dropped, because
+  the honest statement of what a tool cannot see is part of what makes the rest of
+  it trustworthy.
+
+The most useful contribution now is a failure mode that **isn't in this table at
+all**. If you know one, that's the best bug report this project can get.
 
 *Done: 4.1/4.2 views & materialized views (0.9.0); 2.9 user-writable claims, 2.8
 callable GUC-setting definer functions, 4.7 partitions, 3.9 TRUNCATE (0.10.0);
 2.10 user-writable policy authority (0.11.0); 3.8 self-row escalation (0.12.0);
-5.1/5.2 storage paths + public buckets (0.13.0); 2.11 constraint oracles (0.14.0).
+5.1/5.2 storage paths + public buckets (0.13.0); 2.11 constraint oracles (0.14.0);
+5.3/5.4 Realtime channels (0.15.0).
 4.7 is the one to learn from — it was a false NEGATIVE in the flagship guard,
 found by writing the failure surface down rather than by waiting for a bug report.
 2.10 and 3.8 are the pair to learn from: in both, the policy is correct and the

@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.15.0
+
+**The map is closed.** Threat-model 5.4 was the last planned item; everything
+still open is out of scope by construction and says so.
+
+- **feat: new guard `realtime-isolation`** (`tenant-guard realtime`). Realtime is a
+  second way out of the database, and easy to forget once the REST surface looks
+  locked down.
+  - **Broadcast and Presence authorize channels through RLS on
+    `realtime.messages`.** With no policy there, any client joins any tenant's
+    channel: reads every payload flowing through it and — because joining is a
+    write — **publishes into it**. Injecting fabricated events into another
+    tenant's live channel is the realtime analogue of writing into their storage
+    folder, and a correct read policy does not prevent it.
+  - The tenant lives in the **topic**, not a column, so it uses a tenant
+    expression like storage: `split_part(topic, ':', 1)`. That one expression
+    covers both conventions — with no separator present `split_part` returns the
+    whole topic, so a bare `org_A` channel resolves correctly too.
+  - Same control arm as the storage upload probe: it publishes into its **own**
+    channel first, so a refusal elsewhere is never miscredited to tenant scoping.
+  - RLS on with **no policy** is reported as a note, not a leak — broadcast is
+    switched off rather than secured, which is almost certainly unintended but is
+    not a leak.
+  - For **`postgres_changes`** (5.3) it deliberately does *not* re-litigate the
+    SELECT policy `rls-proof` already proves; it names **which tenant tables are
+    actually in the `supabase_realtime` publication**, because on a streaming
+    table a permissive policy is a live firehose rather than one request at a
+    time, and people rarely know that list.
+- **feat: `tenant-guard all`** — runs every guard in order. With a dozen of them,
+  "how do I check everything?" needed a one-command answer. Runtime guards with no
+  database skip, and a skip is still never a pass.
+- 270 tests (was 251).
+
 ## 0.14.0
 
 Threat-model **2.11**, and the last planned read-path item: **RLS hides rows, not

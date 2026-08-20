@@ -1,6 +1,6 @@
 {
   "name": "tenant-guard",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "description": "Guard tests that fail your CI when multi-tenant code can leak across tenants. Static guards run zero-dependency in CI; runtime guards prove one tenant can't read OR write another — reads, writes, tenant-hop, INSERT, views, materialized views, partitions, Supabase Storage paths, the anon surface, and whether the identity your policies trust can be forged. Checks that live in your repo and block the merge.",
   "type": "module",
   "license": "MIT",
@@ -20,7 +20,8 @@
     "./guards/view-isolation": "./src/guards/view-isolation.mjs",
     "./guards/identity-trust": "./src/guards/identity-trust.mjs",
     "./guards/storage-isolation": "./src/guards/storage-isolation.mjs",
-    "./guards/constraint-oracles": "./src/guards/constraint-oracles.mjs"
+    "./guards/constraint-oracles": "./src/guards/constraint-oracles.mjs",
+    "./guards/realtime-isolation": "./src/guards/realtime-isolation.mjs"
   },
   "files": [
     "bin",

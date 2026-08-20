@@ -16,13 +16,14 @@ import * as viewIsolation from './guards/view-isolation.mjs';
 import * as identityTrust from './guards/identity-trust.mjs';
 import * as storageIsolation from './guards/storage-isolation.mjs';
 import * as constraintOracles from './guards/constraint-oracles.mjs';
-import { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig, resolveStorageConfig, resolveOraclesConfig } from './config.mjs';
+import * as realtimeIsolation from './guards/realtime-isolation.mjs';
+import { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig, resolveStorageConfig, resolveOraclesConfig, resolveRealtimeConfig } from './config.mjs';
 
 // The static guards: synchronous, zero-dependency, no database. These are what
 // `tenant-guard run` executes and what a project's vitest/jest suite imports.
 export const GUARDS = [migrationCollisions, definerGrants, routeOrgScoping];
 
-export { migrationCollisions, definerGrants, routeOrgScoping, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles };
+export { migrationCollisions, definerGrants, routeOrgScoping, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation };
 export { prove } from './guards/rls-proof.mjs';
 export { drift } from './guards/rls-drift.mjs';
 export { check as checkAnonWrites } from './guards/anon-writes.mjs';
@@ -31,7 +32,8 @@ export { check as checkViews } from './guards/view-isolation.mjs';
 export { check as checkIdentity } from './guards/identity-trust.mjs';
 export { check as checkStorage } from './guards/storage-isolation.mjs';
 export { check as checkOracles } from './guards/constraint-oracles.mjs';
-export { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig, resolveStorageConfig, resolveOraclesConfig } from './config.mjs';
+export { check as checkRealtime } from './guards/realtime-isolation.mjs';
+export { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig, resolveStorageConfig, resolveOraclesConfig, resolveRealtimeConfig } from './config.mjs';
 
 /** Run every static guard against a resolved per-guard config map. Returns results[]. */
 export function runAll(cwd = process.cwd()) {
@@ -121,4 +123,27 @@ export async function runStorage(cwd = process.cwd()) {
 export async function runOracles(cwd = process.cwd()) {
   const config = loadConfig(cwd);
   return constraintOracles.run(resolveOraclesConfig(config));
+}
+
+/**
+ * Run the Supabase Realtime isolation check (async; needs a database URL + `pg`).
+ * Broadcast/Presence authorize channels through RLS on `realtime.messages`, and
+ * the tenant lives in the TOPIC rather than a column. Skips cleanly without it.
+ */
+export async function runRealtime(cwd = process.cwd()) {
+  const config = loadConfig(cwd);
+  return realtimeIsolation.run(resolveRealtimeConfig(config));
+}
+
+/**
+ * Run EVERY guard: the static ones, then each runtime guard in turn. The
+ * one-command answer to "check everything" now that there are a dozen of them.
+ * Runtime guards with no database simply skip — and a skip is never a pass.
+ */
+export async function runEverything(cwd = process.cwd()) {
+  const results = runAll(cwd);
+  for (const fn of [runProof, runDrift, runAnonReads, runAnonWrites, runViews, runIdentity, runStorage, runOracles, runRealtime]) {
+    results.push(await fn(cwd));
+  }
+  return results;
 }

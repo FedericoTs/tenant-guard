@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.21.0
+
+New guard `pooler-bleed` (`tenant-guard pooler`) — threat-model §6.1, the last
+high-value row on the map, and the only failure mode here that **no
+single-request test can see**. Run one request and isolation is perfect. The
+leak exists only *between* requests.
+
+- **The mechanism.** Your policies authorize from a custom GUC
+  (`current_setting('app.tenant')`). Your app sets it with
+  `set_config('app.tenant', $1, false)` or a bare `SET` — and that third
+  argument is `is_local`, so `false` means *for the rest of this **connection***,
+  not *for the rest of this transaction*. Connections are pooled. The next
+  request to check that connection out inherits the previous request's tenant
+  and reads their rows, with the policy working exactly as written. Supabase's
+  pooler defaults to transaction mode, which is precisely the configuration that
+  leaves a session-scoped `SET` behind on a backend another client is handed.
+
+- **Verified before it was built, and demonstrated in the tests.** On one
+  connection: set the tenant session-wide, then issue a later statement that
+  sets *nothing* — it returns the previous tenant's rows. With the same code
+  using `is_local = true`, that later statement returns nothing at all. And
+  `rls-proof` reports that same database as fully isolated, with zero
+  violations. That contrast is the guard's reason to exist.
+
+- **It reads BOTH halves of the repository, which is why this went uncovered.**
+  The database alone can only say "your policies trust a settable GUC" — which
+  is why `identity-trust` reports that as a *note* and never a failure. The
+  source alone can only say "something is set session-wide", which is
+  unremarkable (`app.locale` is nobody's security boundary). Together the
+  finding is conclusive and specific: *this* GUC, authorized by *that* policy,
+  written with connection scope at *this* line. **This guard is what upgrades
+  the §2.8 note to a build failure.**
+
+- **Calibration.** A session-scoped write to a policy GUC fails the build. A
+  non-literal `is_local` (a variable, a ternary) is a note — unreadable, not
+  assumed safe. A GUC nothing in the repo sets is a note naming that. `DISCARD
+  ALL` / `RESET ALL` in the codebase downgrades the finding, since that closes
+  the hole the other way. Scanning is restricted to GUCs the policies actually
+  use, which is what stops it matching the `set x.y =` in everyone's source.
+
+- **Skips cleanly on the common Supabase case**: policies reading `auth.uid()` /
+  `auth.jwt()` are set per transaction by PostgREST from a verified token, so
+  there is nothing to outlive a request. `request.jwt.*` is excluded throughout.
+
+- The runtime probe is a **demonstration, not the verdict** — it shows a
+  session-scoped setting surviving into a later transaction while a
+  transaction-scoped one does not (the second is its control arm), and reports
+  the result as a note. It writes no data, touches no table, and opens no
+  explicit transaction.
+
+- **docs: THREAT-MODEL.md no longer contradicts itself.** The roadmap section
+  claimed "there is no planned item left" while seven rows were still tagged
+  planned. Those seven are now listed explicitly, each with why it hasn't been
+  built, ordered by (severity × prevalence) ÷ cost.
+- docs: fixed an orphaned `schema-tenancy` row in the README that rendered as a
+  headerless one-row table.
+- 439 tests (was 407), 17 guards.
+
 ## 0.20.3
 
 - **fix: upload SARIF with `github/codeql-action/upload-sarif@v4`.** v3 is

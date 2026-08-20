@@ -25,7 +25,7 @@ npx tenant-guard all      # everything: static guards + every runtime proof
 ```
 
 Or run one at a time: `prove`, `drift`, `anon-reads`, `anon-writes`, `identity`,
-`rpc`, `views`, `storage`, `realtime`, `oracles`, `shadows`, `caps`, `schemas`.
+`rpc`, `views`, `storage`, `realtime`, `oracles`, `shadows`, `caps`, `schemas`, `pooler`.
 `npx tenant-guard list` describes each, and `--help` documents the rest.
 
 Every command also speaks machine: `--json` for anything downstream, `--sarif`
@@ -100,6 +100,7 @@ tenant-guard  — guard tests for multi-tenant isolation
 | `anon-writes` | the **anonymous** role can INSERT/UPDATE/DELETE a table | a table with no tenant column, writable by `anon`, is neither a tenant leak nor drift — it's the cache-poisoning class; it proves the real `USING`/`WITH CHECK` by probing, so it doesn't false-flag `TO public USING (auth.uid()…)` policies |
 | `definer-rpc` | a `SECURITY DEFINER` **RPC** hands out another tenant's rows, **or lets a caller inject SQL that runs as its owner** | the purest form of "the policy exists but the access path around it doesn't": a definer function runs as its **owner**, so it bypasses RLS on everything it touches, and PostgREST exposes it at `/rest/v1/rpc/<name>`. A function that doesn't re-filter by tenant — or that trusts a tenant id the **caller passes in** — routes around flawless policies, and every table-level check still reports green. It also reads the body for **SQL injection** (a parameter concatenated into `EXECUTE`, or passed through `format()`'s `%s`) — injected SQL runs as the *owner*, so it bypasses RLS wholesale — and for an unpinned `search_path`. Only `STABLE`/`IMMUTABLE` functions are ever *called*: Postgres guarantees those cannot write |
 | `identity-trust` | the caller can **forge the identity** your policies authorize from, or **write the thing that grants it** | every other guard asks "given a correct identity, is the data scoped?" — this asks whether the identity itself is controllable. A policy reading `user_metadata` (which the *user* can rewrite) is defeated by forging that claim; a callable `SECURITY DEFINER` that sets your tenant GUC from an argument is a "become any tenant" primitive; a `memberships` table the caller can write makes a *flawless* policy bypassable; and because **RLS is row-level and cannot restrict columns**, a correct `USING (id = auth.uid())` self-update policy still lets a user set their own `role` or re-parent their `organization_id` |
+| `pooler-bleed` | the tenant identity **outlives the request that set it** | the only guard that has to read the database *and* your source, which is why this one goes unnoticed: the catalog says which custom GUC your policies authorize from, the source says whether you set it with `is_local = false` or a bare `SET` — which lasts for the whole **connection**. On a pooled connection the next request inherits the previous tenant and the policy hands over their rows **working exactly as designed**. Run one request and isolation is perfect, which is why every other check here passes: the leak exists only *between* requests |
 
 **Runtime — the surfaces that aren't base tables:**
 
@@ -115,7 +116,6 @@ tenant-guard  — guard tests for multi-tenant isolation
 |---|---|---|
 | `shadow-tables` | a trigger copies tenant data into a table nothing protects | the source has flawless RLS; the audit log, outbox or cache it feeds usually has **no tenant column at all**, so every tenant-aware check walks past it. Verified: the source returns one row to its tenant while the shadow returns both tenants', and `rls-proof` reports green |
 | `role-capabilities` | the app role holds a capability that defeats RLS, or a direct grant on the `auth` schema | `dblink` opens a **new connection** as whatever role its string names — RLS on it has nothing to do with the caller's; file reads never touch the policy layer; and `auth.users` is every tenant's email in one table with no policy of yours in front of it. Outbound HTTP (`pg_net`) is surfaced as a **note**: real, but exfiltration rather than a cross-tenant read |
-
 | `schema-tenancy` | one role can read **more than one tenant schema** | the other multi-tenant architecture — a schema per tenant — where the boundary is **GRANTs and nothing else**. `search_path` is not a control: it doesn't stop anyone writing `tenant_b.docs` directly, and the client can reset it. Every column-based check is blind here: point `rls-proof` at such a database and it reports "1/1 proven isolated" while the app role reads both tenants |
 
 **Catalog** — the schema's shape rather than its behaviour:

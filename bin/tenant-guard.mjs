@@ -17,11 +17,12 @@ import { join, dirname, resolve } from 'node:path';
 import {
   GUARDS, runAll, runProof, runDrift, runAnonWrites, runAnonReads, runViews, runIdentity,
   runStorage, runOracles, runRealtime, runDefinerRpc, runShadowTables, runCapabilities,
-  runSchemaTenancy, runEverything,
+  runSchemaTenancy, runPoolerBleed, runEverything,
 } from '../src/index.mjs';
 import {
   rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation,
   constraintOracles, realtimeIsolation, definerRpc, shadowTables, roleCapabilities, schemaTenancy,
+  poolerBleed,
 } from '../src/index.mjs';
 import { CONFIG_FILENAME, autodetect, loadConfig } from '../src/config.mjs';
 import { report, bold, dim, green, yellow, red } from '../src/runner.mjs';
@@ -33,7 +34,7 @@ import { VERSION } from '../src/version.mjs';
 const ALL_GUARDS = [
   ...GUARDS, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust,
   storageIsolation, constraintOracles, realtimeIsolation, definerRpc, shadowTables,
-  roleCapabilities, schemaTenancy,
+  roleCapabilities, schemaTenancy, poolerBleed,
 ];
 
 /**
@@ -55,6 +56,7 @@ const RUNTIME_COMMANDS = {
   shadows: { fn: runShadowTables, needs: 'migrated' },
   caps: { fn: runCapabilities, needs: 'migrated' },
   schemas: { fn: runSchemaTenancy, needs: 'seeded' },
+  pooler: { fn: runPoolerBleed, needs: 'migrated' },
   all: { fn: runEverything, needs: 'seeded', many: true },
 };
 
@@ -144,6 +146,7 @@ ${bold('COMMANDS')}
   storage        Supabase Storage paths leak across tenant folders
   realtime       Realtime channels leak across tenants
   schemas        one role reaches more than one tenant SCHEMA
+  pooler         a tenant identity outlives the request that set it
   shadows        a trigger copies tenant data somewhere unprotected
   oracles        a UNIQUE key reveals another tenant's rows
   caps           the app role holds an RLS-bypassing capability
@@ -322,6 +325,17 @@ if (cmd === 'init') {
       // a column-tenancy database.
       //"schemaPattern": "^tenant_",
       allowlist: [], // schema names shared on purpose
+    },
+    poolerBleed: {
+      // The tenant identity outliving the request that set it. Reads BOTH the
+      // catalog (which custom GUCs your policies authorize from) and your
+      // SOURCE (whether you set them for the connection instead of the
+      // transaction). set_config(guc, v, false) and a bare SET last for the
+      // whole connection, so the next request on a pooled connection inherits
+      // the previous tenant. Skips cleanly when no policy uses a custom GUC.
+      schemas: ['public'],
+      sourceDirs: ['src', 'app', 'lib', 'server', 'api', 'db'],
+      allowlist: [], // GUC names that are session-scoped on purpose
     },
     shadowTables: {
       // Follows triggers on tenant tables to the tables they WRITE into. An audit

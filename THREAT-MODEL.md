@@ -68,7 +68,7 @@ These are checked *before* any isolation claim.
 | 2.5 | Safe idiom `TO public USING (auth.uid() = …)` **false-flagged** | ✅ | probed, not guessed → proven safe (0 rows as anon). A catalog-only linter cries wolf here |
 | 2.6 | RLS enabled early, **disabled/policy dropped later** | ✅ | runtime reflects live state; `rls-drift` also flags catalog-vs-migrations divergence |
 | 2.7 | A second **permissive** policy widens access (policies OR together) | ✅ | behavioural — the leak shows up in the probe regardless of which policy caused it |
-| 2.8 | Policy trusts a **client-settable GUC** (`current_setting('app.tenant')`) — the client just sets it | 🟡 | `identity-trust`. The *concrete* form is a hard failure: a callable `SECURITY DEFINER` function that sets that GUC from an **argument** (a "become any tenant" primitive). Bare dependence on a settable GUC is a **note, never a build failure** — whether it is exploitable depends on architecture SQL cannot see, and it is also how this tool impersonates |
+| 2.8 | Policy trusts a **client-settable GUC** (`current_setting('app.tenant')`) — the client just sets it | 🟡 | `identity-trust`. The *concrete* form is a hard failure: a callable `SECURITY DEFINER` function that sets that GUC from an **argument** (a "become any tenant" primitive). Bare dependence on a settable GUC is a **note, never a build failure** — whether it is exploitable depends on architecture SQL cannot see, and it is also how this tool impersonates. That note is **upgraded to a failure by `pooler-bleed` (§6.1)** when the source is found writing the same GUC with connection scope |
 | 2.9 | Policy trusts a **user-writable JWT claim** (`user_metadata`) rather than `app_metadata` | ✅ | `identity-trust` detects it in the policy text (conclusive on its own) and then **proves** it: forge `user_metadata.<key>` as the victim and re-read. A control arm forging a nonexistent tenant keeps an already-open table from being blamed on the claim |
 | 2.10 | Policy subquery reads a **user-writable membership table** → self-grant into another tenant | ✅ | `identity-trust`. Dependencies come from `pg_depend` (exact, not a regex over policy text). Fails when the authority table has RLS off with a write grant, or an INSERT/UPDATE policy whose check never constrains its **tenant column** — the `WITH CHECK (user_id = auth.uid())` near-miss that pins WHO you are and leaves WHICH TENANT open. No tenant column on the authority table → a note, never a silent pass |
 | 2.11 | Existence oracles: global `UNIQUE` key, single-column FK, `ON CONFLICT DO NOTHING` reveal another tenant's hidden rows | ✅ | `constraint-oracles`, catalog-only. **UNIQUE omitting the tenant column → fails** (conclusive: the constraint either carries the tenant or it doesn't). Skips primary keys and single-UUID columns — unguessable values answer nothing. Expression indexes are skipped rather than guessed at. **Single-column FKs between tenant tables → an aggregated note**, since composite tenant FKs are rare and exploiting one needs a guessable parent id *and* an insert that passes `WITH CHECK` |
@@ -129,7 +129,7 @@ The highest-severity blind spot of any table-only scanner.
 
 | # | Failure | Status | How |
 |---|---|---|---|
-| 6.1 | Tenant GUC set with session `SET` (not `SET LOCAL`) **bleeds to the next request** on a transaction-mode pooler — the next tenant inherits the previous tenant's identity | ⛔ runtime / 🔜 static | structurally invisible to a single-connection probe: it is an *inter-transaction* property of the app's pooled connections. Detectable statically (RLS keyed on a custom `app.*` GUC + app code using bare `SET`/`set_config(…, false)`), and partially via a two-transaction persistence check |
+| 6.1 | Tenant GUC set with session `SET` (not `SET LOCAL`) **bleeds to the next request** on a transaction-mode pooler — the next tenant inherits the previous tenant's identity | ✅ | `pooler-bleed`, the only guard that reads **both halves of the repository**, which is exactly why it went uncovered: the *database* says which custom GUCs your policies authorize from, the *source* says whether you write them with `is_local = false` or a bare `SET`. Either half alone is a note (that is §2.8); together the finding is conclusive and names the policy and the line. **Verified**: with a session-scoped write, a later request that sets *nothing* reads the previous tenant's rows through a policy working exactly as written — and `rls-proof` calls that same database fully isolated. The inter-connection property itself is still not probed (that would need the app's own pooler and its own concurrency); what *is* probed is the mechanism — a session-scoped setting survives into later transactions while a transaction-scoped one does not, the second being the control arm. `DISCARD ALL` on release is detected and downgrades the finding |
 | 6.2 | Other session state (temp tables, `SET ROLE` not reset, prepared plans) bleeding across pooled clients | ⛔ | same reason |
 
 ## 7. Privileges & grants
@@ -159,22 +159,30 @@ listed so nobody reads a green run as more than it is.
 
 ## What this means for the roadmap
 
-Ordered by (severity × prevalence in real AI-generated apps) ÷ build cost, the
-**there is no planned item left.** Every failure mode in this document that
-is coverable by "run SQL as the app role" now has a guard behind it.
+Every failure mode above that is **both** coverable by this tool's method **and**
+worth the noise it would add now has a guard behind it. Seven rows are still
+🔜, and they are listed here rather than summarised away, ordered by
+(severity × prevalence) ÷ build cost:
 
-What stays open is open **on purpose**:
+| # | Why it hasn't been built |
+|---|---|
+| 7.2 `ALTER DEFAULT PRIVILEGES` | The best of the remaining set — a **time bomb**: today's green becomes tomorrow's leak when the next table auto-inherits the grant. Catalog read of `pg_default_acl`; cheap |
+| 3.11 cross-tenant FK / cascade | Real, moderate cost: insert a child pointing at another tenant's parent and see whether the reference is allowed |
+| 7.3 `CREATE` on `public` granted to `anon`/`authenticated` | Already checked *as a precondition* inside `definer-rpc` (§4.4); standalone it is a small catalog read |
+| 3.10 `MERGE` per-arm policies | PG15+, and rare in the app shapes this targets |
+| 4.8 legacy `INHERITS` children | Same enumeration as partitions, far rarer |
+| 3.7 UPSERT conflict path | Its permissive-`UPDATE`-policy case is already caught by the existing write probes, so a dedicated check would mostly re-report an existing finding |
+| 2.12 `pg_stat_activity` query text | Small; worth doing when someone hits it |
 
-- **3.7 (the UPSERT conflict path)** — its permissive-`UPDATE`-policy case is already
-  caught by the existing write probes, so a dedicated check would mostly re-report an
-  existing finding.
-- **2.12 (`pg_stat_activity` query text)** and **1.8 (naming a claim-shape mismatch
-  explicitly)** — small polish, worth doing when someone hits them.
-- Everything marked ⛔ is out of scope **by construction** — leaked service keys,
-  pooler GUC bleed, app-layer IDOR through a service-role connection. Those need a
-  different instrument, and they stay listed rather than quietly dropped, because
-  the honest statement of what a tool cannot see is part of what makes the rest of
-  it trustworthy.
+Also open, and smaller: **1.8** (naming a claim-shape mismatch explicitly rather
+than surfacing it as 1.7) and **5.5** (a `public`-only run under-reports when
+PostgREST exposes other schemas).
+
+Everything marked ⛔ is out of scope **by construction** — leaked service keys,
+pooler session-state bleed *at runtime* (§6.2), app-layer IDOR through a
+service-role connection. Those need a different instrument, and they stay listed
+rather than quietly dropped, because the honest statement of what a tool cannot
+see is part of what makes the rest of it trustworthy.
 
 The most useful contribution now is a failure mode that **isn't in this table at
 all**. If you know one, that's the best bug report this project can get.
@@ -183,11 +191,17 @@ all**. If you know one, that's the best bug report this project can get.
 callable GUC-setting definer functions, 4.7 partitions, 3.9 TRUNCATE (0.10.0);
 2.10 user-writable policy authority (0.11.0); 3.8 self-row escalation (0.12.0);
 5.1/5.2 storage paths + public buckets (0.13.0); 2.11 constraint oracles (0.14.0);
-5.3/5.4 Realtime channels (0.15.0).
-4.7 is the one to learn from — it was a false NEGATIVE in the flagship guard,
-found by writing the failure surface down rather than by waiting for a bug report.
-2.10 and 3.8 are the pair to learn from: in both, the policy is correct and the
-thing it TRUSTS is writable, which no amount of per-policy review would surface.*
+5.3/5.4 Realtime channels (0.15.0); 4.3/4.4/4.10 definer RPCs and SQL injection
+inside them (0.16.0–0.17.0); 4.9 shadow tables, 7.1 role capabilities (0.18.0);
+2.14 schema-per-tenant (0.19.0); 6.1 session-scoped tenant GUCs (0.21.0).*
+
+*Three of these are worth learning from. **4.7** was a false NEGATIVE in the
+flagship guard, found by writing the failure surface down rather than by waiting
+for a bug report. **2.10 and 3.8** are the pair where the policy is correct and
+the thing it TRUSTS is writable, which no amount of per-policy review would
+surface. And **6.1** is the one no single-request test can see at all: run one
+request and isolation is perfect — the leak exists only between requests, which
+is why it needed the database and the source read together.*
 
 If you know a failure mode that isn't in this table, that's the most useful bug
 report this project can get — open an issue.

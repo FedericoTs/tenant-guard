@@ -12,7 +12,7 @@ inputs:
       Which guards to run. "run" = the static guards (no database, no install).
       "all" = static plus every runtime proof. Or name one: prove, drift,
       anon-reads, anon-writes, identity, rpc, views, storage, realtime, schemas,
-      shadows, oracles, caps.
+      pooler, shadows, oracles, caps.
     required: false
     default: 'run'
 

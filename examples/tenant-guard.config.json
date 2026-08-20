@@ -83,6 +83,13 @@
     "allowlist": []
   },
 
+  "poolerBleed": {
+    "//": "Runtime + source. Threat-model 6.1, and the only guard that must read BOTH halves of the repo. A policy keyed on current_setting('app.tenant') is only as good as the SCOPE it is set with: set_config(guc, v, false) and a bare SET last for the whole CONNECTION, so on a pooled connection the next request inherits the previous tenant and the policy hands over their rows working exactly as designed. Every single-request test passes. Skips cleanly when no policy uses a custom GUC (the usual Supabase auth.jwt() case).",
+    "schemas": ["public"],
+    "sourceDirs": ["src", "app", "lib", "server", "api", "db"],
+    "allowlist": []
+  },
+
   "shadowTables": {
     "//": "Runtime. Follows triggers on tenant tables to the tables they WRITE into. An audit log or outbox with no tenant column and no RLS holds every tenant activity record, and the tenant-column guards walk past it. Reads the function body, because plpgsql records no catalog dependency for what it writes.",
     "schemas": ["public"],

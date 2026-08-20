@@ -249,6 +249,21 @@ export function resolveSchemaTenancyConfig(config) {
   return out;
 }
 
+/**
+ * Resolve the pooler-bleed config from the user's `poolerBleed` block.
+ * Inherits the app role from rlsProof, like the other runtime guards.
+ */
+export function resolvePoolerBleedConfig(config) {
+  const b = config.poolerBleed ?? {};
+  const out = {};
+  for (const k of ['url', 'urlEnv', 'role', 'schemas', 'sourceDirs', 'sourceExtensions', 'skipDirs', 'maxFileBytes', 'allowlist']) {
+    if (b[k] !== undefined) out[k] = b[k];
+  }
+  const p = config.rlsProof ?? {};
+  if (out.role === undefined && p.role !== undefined) out.role = p.role;
+  return out;
+}
+
 export function autodetect(cwd = process.cwd()) {
   return {
     migrationsDir: firstExisting(cwd, CANDIDATE_MIGRATION_DIRS),

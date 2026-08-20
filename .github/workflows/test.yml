@@ -75,3 +75,61 @@ jobs:
             if (j.summary.failed !== 2) throw new Error('expected 2 failed guards, got ' + j.summary.failed);
             console.log('leaky demo reported', j.summary.failed, 'failures as expected');
           " "${{ steps.leaky.outputs.json-file }}"
+
+  # The Action's RUNTIME path — install-pg, pg resolving from the action's own
+  # prefix, connecting, and the runtime guards actually running. None of that is
+  # exercised by the `action` job above (which is static-only) or by any unit
+  # test, and all three Action bugs so far lived in exactly this kind of gap.
+  action-runtime:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready --health-interval 10s
+          --health-timeout 5s --health-retries 5
+        ports: ['5432:5432']
+
+    env:
+      DB_URL: postgres://postgres:postgres@localhost:5432/postgres
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # A two-tenant schema with a REAL leak in it: invoices has a tenant column,
+      # is granted to the app role, and has NO row-level security at all.
+      - name: Seed a leaky two-tenant database
+        run: |
+          psql "$DB_URL" -v ON_ERROR_STOP=1 <<'SQL'
+            create role anon nologin;
+            create role authenticated nologin;
+            grant usage on schema public to anon, authenticated;
+            create table invoices (id serial primary key, organization_id text not null, amount int);
+            insert into invoices (organization_id, amount) values ('org_A', 100), ('org_B', 200);
+            grant select on invoices to authenticated;
+          SQL
+
+      - id: guard
+        uses: ./
+        with:
+          command: all
+          database-url: ${{ env.DB_URL }}
+          fail-on-error: false   # the seed leaks on purpose
+          upload-sarif: false
+
+      - name: The runtime guards must have RUN, and found the planted leak
+        run: |
+          set -euo pipefail
+          test "${{ steps.guard.outputs.result }}" = "fail"
+          node -e "
+            const j = JSON.parse(require('fs').readFileSync(process.argv[1], 'utf8'));
+            const proof = j.guards.find(g => g.id === 'rls-proof');
+            if (!proof) throw new Error('rls-proof missing from the results');
+            // The whole point: a skip here means install-pg or the database-url
+            // wiring is broken and every runtime guard silently did nothing.
+            if (proof.status === 'skip') throw new Error('rls-proof SKIPPED — ' + proof.reason);
+            if (j.summary.violations === 0) throw new Error('the planted leak was not reported');
+            console.log('runtime path OK:', j.summary.ran, 'guards ran,', j.summary.violations, 'violation(s)');
+          " "${{ steps.guard.outputs.json-file }}"

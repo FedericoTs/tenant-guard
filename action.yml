@@ -148,10 +148,15 @@ runs:
         ARGS=("$TG_COMMAND" "--sarif=$SARIF" "--json=$JSON" "--no-color")
         if [ "$TG_SUMMARY" = "true" ]; then ARGS+=("--markdown=$GITHUB_STEP_SUMMARY"); fi
 
-        # Deliberately NOT `set -e` around this: a guard failure is an expected
-        # outcome that still has to reach the SARIF upload and the summary.
+        # GitHub runs composite `run` steps with `bash -e`, so a non-zero exit
+        # here kills the step before a single output is written — and a guard
+        # failure is an EXPECTED outcome that still has to reach the SARIF
+        # upload, the summary and the outputs. Note that NOT writing `set -e`
+        # does not turn off the inherited one; only `set +e` does.
+        set +e
         node "$TG_CLI" "${ARGS[@]}"
         CODE=$?
+        set -e
 
         echo "exit-code=$CODE" >> "$GITHUB_OUTPUT"
         echo "sarif-file=$SARIF" >> "$GITHUB_OUTPUT"

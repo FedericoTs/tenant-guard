@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.20.2
+
+The second half of the Action fix, and a regression test so this class of bug
+cannot ship a third time.
+
+- **fix: `set +e` around the CLI call.** GitHub runs composite `run` steps with
+  errexit already on — `bash --noprofile --norc -e -o pipefail`. The CLI exiting
+  1, which is its normal behaviour when a guard fails, therefore killed the step
+  before a single output was written and before the SARIF upload could run.
+  The script carried a comment claiming it deliberately avoided `set -e`; not
+  writing `set -e` does not turn off an inherited one. Only `set +e` does.
+- **test: `test/action.test.mjs` executes the Action's shell** under that exact
+  shell invocation, against `examples/leaky-demo` (which really does fail), and
+  asserts the step survives with `result=fail` and a SARIF file on disk. Nothing
+  else in the suite could see this: action.yml is YAML and shell, invisible to
+  every unit test.
+  - Verified falsifiable — with the fix removed, both the executable test and
+    the textual one fail. The textual one initially did *not*, because a
+    substring search for `set +e` was satisfied by the comment explaining it;
+    it now matches line-by-line.
+
 ## 0.20.1
 
 Fixes the Action, which 0.20.0 shipped broken. Caught by the self-test added in
@@ -74,7 +95,7 @@ parsing terminal text. No new guards in this release — on purpose.
 - fix: an absolute output path (`--sarif=$RUNNER_TEMP/tg.sarif`) was joined onto
   the cwd instead of used — which is the normal case in the environment the flag
   exists for. Found while writing the test for it.
-- 403 tests (was 352), 16 guards — no new guards in this release.
+- 407 tests (was 352), 16 guards — no new guards in this release.
 
 ## 0.19.0
 

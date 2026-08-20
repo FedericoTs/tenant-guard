@@ -16,6 +16,7 @@ import {
   candidateFks,
   crossTenantRowsSql,
   parentTargetSql,
+  otherChildTenantSql,
   repointProbeSql,
   describeAction,
   isDestructive,
@@ -108,14 +109,33 @@ test('generated SQL quotes every identifier', () => {
     { schema: 'public', table: 'projects', column: 'organization_id' },
   ]))[0];
   assert.match(crossTenantRowsSql(weird).text, /"ta""sks"/); // doubled, not escaped out
-  assert.match(repointProbeSql(weird).text, /"ta""sks"/);
+  assert.match(repointProbeSql(weird, 1, 'org_A').text, /"ta""sks"/);
 });
 
 test('parentTargetSql and repointProbeSql are parameterised, not interpolated', () => {
   const fk = candidateFks([FK], TC)[0];
   assert.match(parentTargetSql(fk).text, /limit 1/);
-  const probe = repointProbeSql(fk);
+  const probe = repointProbeSql(fk, 42, 'org_A');
   assert.match(probe.text, /set "project_id" = \$1 where "organization_id" = \$2/);
+  assert.deepEqual(probe.values, [42, 'org_A']);
+});
+
+test('every *Sql helper returns a COMPLETE spec, callable as q(text, values)', () => {
+  // A helper whose SQL had placeholders but returned `values: []` worked only
+  // because its one caller passed them separately — a trap for the next one.
+  const fk = candidateFks([FK], TC)[0];
+  for (const spec of [
+    crossTenantRowsSql(fk),
+    parentTargetSql(fk),
+    otherChildTenantSql(fk, 'org_B'),
+    repointProbeSql(fk, 1, 'org_A'),
+  ]) {
+    const placeholders = new Set(spec.text.match(/\$\d+/g) ?? []);
+    assert.equal(
+      spec.values.length, placeholders.size,
+      `spec has ${placeholders.size} placeholder(s) but ${spec.values.length} value(s): ${spec.text.trim().slice(0, 60)}`,
+    );
+  }
 });
 
 // ── referential actions ──────────────────────────────────────────────

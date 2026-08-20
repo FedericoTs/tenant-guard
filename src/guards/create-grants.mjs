@@ -50,8 +50,15 @@ export const DEFAULTS = {
 
 // ── pure helpers (unit-tested, no I/O) ───────────────────────────────
 
-/** Which of these roles hold CREATE on which schemas, and does PUBLIC hold it. */
-export function schemaCreateGrantsSql(roles) {
+/**
+ * Which of these roles hold CREATE on which schemas, and how they hold it.
+ *
+ * `can_create` is the EFFECTIVE privilege, which is what actually matters — but
+ * it is true both for a grant to the role and for a grant to PUBLIC, and those
+ * have different fixes. `direct_can_create` separates them, so a role with its
+ * own grant is not told to revoke from PUBLIC and left still holding it.
+ */
+export function schemaCreateGrantsSql(roles, schemas) {
   return {
     text: `
       select
@@ -59,18 +66,19 @@ export function schemaCreateGrantsSql(roles) {
         r.rolname as role,
         pg_catalog.has_schema_privilege(r.oid, n.oid, 'CREATE') as can_create,
         coalesce((
-          select true
-          from aclexplode(n.nspacl) a
-          where a.grantee = 0 and a.privilege_type = 'CREATE'
-          limit 1
-        ), false) as public_can_create
+          select true from aclexplode(n.nspacl) a
+          where a.grantee = 0 and a.privilege_type = 'CREATE' limit 1
+        ), false) as public_can_create,
+        coalesce((
+          select true from aclexplode(n.nspacl) a
+          where a.grantee = r.oid and a.privilege_type = 'CREATE' limit 1
+        ), false) as direct_can_create
       from pg_catalog.pg_namespace n
       cross join pg_catalog.pg_roles r
-      where n.nspname not like 'pg\\_%'
-        and n.nspname <> 'information_schema'
+      where n.nspname = any($2)
         and r.rolname = any($1)
     `,
-    values: [roles],
+    values: [roles, schemas],
   };
 }
 
@@ -216,12 +224,14 @@ export async function check({ query, config = {} }) {
   };
 
   // ── schemas ────────────────────────────────────────────────────────
-  const schemaSpec = schemaCreateGrantsSql(roles);
+  const schemaSpec = schemaCreateGrantsSql(roles, cfg.schemas);
   const schemaRows = await q(schemaSpec.text, schemaSpec.values);
   const publicSeen = new Set();
+  const schemasSeen = new Set();
   for (const row of schemaRows) {
-    if (!cfg.schemas.includes(row.schema)) continue;
-    scanned++;
+    // `scanned` counts SCHEMAS, not (schema, role) pairs — the query returns one
+    // row per pair, and it is part of the published JSON contract.
+    schemasSeen.add(row.schema);
 
     // A grant to PUBLIC is one finding about the schema, not one per role.
     if (row.public_can_create && !publicSeen.has(row.schema) && !allow.has(`${row.schema}:PUBLIC`)) {
@@ -230,17 +240,20 @@ export async function check({ query, config = {} }) {
         classifyCreateGrant({ role: 'PUBLIC', scope: 'schema', where: row.schema, viaPublic: true, unpinned, serverVersion, appRole, unauthenticatedRoles: cfg.unauthenticatedRoles }),
         `${row.schema}:PUBLIC`,
       );
-      continue; // the per-role finding would be the same grant again
     }
-    if (row.public_can_create) continue;
 
-    if (row.can_create && !allow.has(`${row.schema}:${row.role}`)) {
+    // A role may ALSO hold its own grant. Revoking from PUBLIC would not touch
+    // it, so it is a separate finding with a separate fix — reported only when
+    // the grant is direct, which is what keeps this from doubling up.
+    const reportRole = row.public_can_create ? row.direct_can_create : row.can_create;
+    if (reportRole && !allow.has(`${row.schema}:${row.role}`)) {
       emit(
         classifyCreateGrant({ role: row.role, scope: 'schema', where: row.schema, unpinned, serverVersion, appRole, unauthenticatedRoles: cfg.unauthenticatedRoles }),
         `${row.schema}:${row.role}`,
       );
     }
   }
+  scanned = schemasSeen.size;
 
   // ── the database itself ────────────────────────────────────────────
   try {
@@ -283,7 +296,7 @@ export async function check({ query, config = {} }) {
     summary:
       violations.length > 0
         ? `${violations.length} role(s) can plant objects that a definer function would run as its owner`
-        : `CREATE privileges checked on ${cfg.schemas.length} schema(s)` + (notes.length ? `; ${notes.length} note(s)` : ''),
+        : `CREATE privileges checked on ${scanned} schema(s)` + (notes.length ? `; ${notes.length} note(s)` : ''),
   };
 }
 

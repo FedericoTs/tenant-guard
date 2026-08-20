@@ -119,6 +119,29 @@ if (PGlite) {
     assert.match(res.notes.find((n) => n.where === 'public').message, /event trigger/);
   });
 
+  test('a trigger that does NOT cover this schema no longer downgrades the finding', async () => {
+    // The body matches the regex, but it only enables RLS for tables in `other`.
+    // Reading the body alone said "mitigated"; creating a table and looking at it
+    // says otherwise, which is the whole reason this guard probes.
+    const { query } = await freshDb(`
+      create schema other;
+      alter default privileges in schema public grant select on tables to public;
+      create function force_rls_elsewhere() returns event_trigger language plpgsql as $$
+      declare r record;
+      begin
+        for r in select * from pg_event_trigger_ddl_commands() where command_tag = 'CREATE TABLE' loop
+          if r.object_identity like 'other.%' then
+            execute format('alter table %s enable row level security', r.object_identity);
+          end if;
+        end loop;
+      end $$;
+      create event trigger force_rls_elsewhere_trg on ddl_command_end execute function force_rls_elsewhere();
+    `);
+    const res = await check({ query });
+    assert.equal(res.ok, false, 'the trigger does not protect public, so this must still fail');
+    assert.equal(res.violations[0].kind, 'inherited-grant');
+  });
+
   test('an allowlisted schema is skipped entirely', async () => {
     const { query } = await freshDb('alter default privileges in schema public grant select on tables to public;');
     const res = await check({ query, config: { allowlist: ['public'] } });

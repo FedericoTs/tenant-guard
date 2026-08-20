@@ -100,6 +100,42 @@ if (PGlite) {
     assert.ok(res.scanned > 0, 'it really did look');
   });
 
+  test('a DIRECT grant is reported even when PUBLIC also has one — different fixes', async () => {
+    // Revoking from PUBLIC would leave anon still holding its own grant, so
+    // reporting only the PUBLIC finding would hand over an incomplete fix.
+    const { query } = await freshDb(`
+      grant create on schema public to public;
+      grant create on schema public to anon;
+    `);
+    const res = await check({ query });
+    const wheres = res.violations.map((v) => v.where).sort();
+    assert.deepEqual(wheres, ['public:PUBLIC', 'public:anon']);
+  });
+
+  test('a PUBLIC-derived privilege alone is NOT also reported per role', async () => {
+    const { query } = await freshDb('grant create on schema public to public;');
+    const res = await check({ query });
+    assert.deepEqual(res.violations.map((v) => v.where), ['public:PUBLIC']);
+  });
+
+  test('scanned counts SCHEMAS, not (schema, role) pairs', async () => {
+    const { query } = await freshDb();
+    const res = await check({ query });               // two roles, one schema
+    assert.equal(res.scanned, 1);
+    assert.match(res.summary, /on 1 schema\(s\)/);
+  });
+
+  test('a schema outside the configured list is never queried', async () => {
+    const { query } = await freshDb(`
+      create schema other;
+      grant create on schema other to anon;
+    `);
+    const res = await check({ query, config: { schemas: ['public'] } });
+    assert.equal(res.ok, true);
+    assert.equal(res.violations.length, 0);
+    assert.equal(res.scanned, 1);
+  });
+
   test('an allowlisted grant is not reported', async () => {
     const { query } = await freshDb('grant create on schema public to anon;');
     const res = await check({ query, config: { allowlist: ['public:anon'] } });

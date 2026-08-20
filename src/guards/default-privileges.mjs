@@ -175,13 +175,20 @@ export function classifyInherited({ schema, grants = [], rlsEnabled = false, mit
   const describe = (g) => `${g.grantee} (${g.privileges.join(', ')})`;
   const inherited = grants.map(describe).join('; ');
 
-  if (mitigated) {
+  // The probe already answered this empirically: did the table it created come
+  // back with row-level security on? That beats inferring it from an event
+  // trigger's body, which cannot tell whether the trigger covers THIS schema —
+  // and a trigger scoped to some other schema used to downgrade a real finding.
+  if (rlsEnabled) {
+    const because = mitigated
+      ? 'an enabled DDL event trigger in this database does it'
+      : 'something in this database does it — worth knowing what, so it does not get removed';
     return {
       status: 'note',
       message:
-        `a new table in "${schema}" inherits ${inherited}, but an enabled DDL event trigger in this ` +
-        `database turns row-level security on for newly created tables — which closes this. Confirm it ` +
-        `covers every path that creates a table.`,
+        `a new table in "${schema}" inherits ${inherited}, but arrives with row-level security already ` +
+        `ENABLED (${because}), so it is not exposed — proven by creating one in a rolled-back transaction. ` +
+        `The grants alone would expose the next table without whatever is doing that.`,
     };
   }
 

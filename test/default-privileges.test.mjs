@@ -148,13 +148,37 @@ test('the note leads with WRITE access when no unauthenticated role is involved'
   assert.match(v.message, /reporting can WRITE to it/);
 });
 
-test('an RLS-forcing event trigger downgrades even the PUBLIC case', () => {
+test('a table that arrives with RLS already ON downgrades even the PUBLIC case', () => {
   const v = classifyInherited({
     schema: 'public',
     grants: [{ grantee: 'PUBLIC', privileges: ['SELECT'], writes: false }],
+    rlsEnabled: true,
     mitigated: true,
   });
   assert.equal(v.status, 'note');
-  assert.match(v.message, /event trigger/);
-  assert.match(v.message, /every path that creates a table/); // still asks them to check
+  assert.match(v.message, /security already ENABLED/);
+  assert.match(v.message, /event trigger/); // the trigger explains WHY
+});
+
+test('an event trigger alone does NOT downgrade — only the observed table does', () => {
+  // The trigger body says it enables RLS, but the probe found the table without
+  // it: the trigger does not cover this schema. Inferring from the body used to
+  // turn a real finding into a note.
+  const v = classifyInherited({
+    schema: 'public',
+    grants: [{ grantee: 'PUBLIC', privileges: ['SELECT'], writes: false }],
+    rlsEnabled: false,
+    mitigated: true,
+  });
+  assert.equal(v.status, 'leak');
+});
+
+test('RLS already on, with nothing in the catalog explaining it, still says so', () => {
+  const v = classifyInherited({
+    schema: 'public',
+    grants: [{ grantee: 'anon', privileges: ['SELECT'], writes: false }],
+    rlsEnabled: true,
+  });
+  assert.equal(v.status, 'note');
+  assert.match(v.message, /so it does not get removed/);
 });

@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.24.2
+
+A bug hunt across the guards written this week. Nothing was failing — these were
+found by going looking, and each one is now pinned by a test that fails without
+the fix.
+
+- **fix (`default-privileges`): the probe's own answer was being thrown away.**
+  The guard creates a table and reads back whether row-level security came on —
+  and then decided the question by regexing an event trigger's *body* instead.
+  A trigger scoped to some other schema therefore downgraded a real finding to a
+  note, because the body matched while the table it created had no RLS at all.
+  The observed fact now decides it and the trigger only explains *why*, which is
+  what this guard claims to do in the first place. Verified both ways: the flag
+  reads `true` under an RLS-forcing trigger and `false` without one.
+
+- **fix (`create-grants`): a role holding its OWN grant was hidden behind the
+  PUBLIC one.** `has_schema_privilege` is true for both, so a schema granted to
+  `PUBLIC` *and* directly to `anon` reported only the PUBLIC finding — whose fix,
+  `REVOKE … FROM PUBLIC`, would have left `anon` still able to create. Direct
+  grants are now read separately and reported alongside, each with its own fix.
+
+- **fix (`create-grants`): `scanned` counted (schema, role) pairs.** One schema
+  and two roles reported `scanned: 2`, while the summary line printed `1` from a
+  different source — two numbers for one thing, in the published JSON contract.
+  It counts schemas, both places agree, and the schema filter moved into the SQL
+  instead of being applied after the fact.
+
+- **fix (`cross-tenant-fk`): two SQL helpers returned `values: []` while their
+  text carried `$1`/`$2`.** They worked only because their single caller passed
+  the parameters separately — every other helper in the file is callable as
+  `q(spec.text, spec.values)`, and these two would have broken the next person to
+  assume that. A test now asserts every helper's placeholder count matches its
+  values.
+
+- **fix (`scripts/make-demo-gif.py`): dead code and fragile index-peeking in the
+  line wrapper**, replaced with character-level wrapping that carries styling and
+  indentation exactly. Output is unchanged; the GIF is regenerated so the
+  committed asset matches what the current script produces.
+
+- 527 tests (was 518), 20 guards.
+
 ## 0.24.1
 
 Housekeeping the README hero, which had been showing 0.5.0-era output — three

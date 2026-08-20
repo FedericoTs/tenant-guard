@@ -190,8 +190,13 @@ export function parentTargetSql(fk) {
   };
 }
 
-/** A child tenant that is NOT the parent's tenant, so the reference really crosses. */
-export function otherChildTenantSql(fk) {
+/**
+ * A child tenant that is NOT the parent's tenant, so the reference really
+ * crosses. Returns a COMPLETE spec: every other `*Sql` helper here can be called
+ * as `q(spec.text, spec.values)`, and one that quietly needed its parameters
+ * passed separately was a trap for the next caller.
+ */
+export function otherChildTenantSql(fk, excludeTenant) {
   return {
     text: `
       select distinct ${quoteIdent(fk.childTenant)} as tenant
@@ -200,7 +205,7 @@ export function otherChildTenantSql(fk) {
         and ${quoteIdent(fk.childTenant)} <> $1
       limit 1
     `,
-    values: [],
+    values: [excludeTenant],
   };
 }
 
@@ -210,10 +215,10 @@ export function otherChildTenantSql(fk) {
  * write probes use none — targeting a row you cannot see hides the leak you are
  * hunting. Always inside a transaction that is rolled back.
  */
-export function repointProbeSql(fk) {
+export function repointProbeSql(fk, parentKey, childTenant) {
   return {
     text: `update ${qualified(fk.child_schema, fk.child_table)} set ${quoteIdent(fk.childColumn)} = $1 where ${quoteIdent(fk.childTenant)} = $2`,
-    values: [],
+    values: [parentKey, childTenant],
   };
 }
 
@@ -331,8 +336,8 @@ export async function check({ query, config = {} }) {
         if (!target) {
           probeReason = 'no parent rows to point at';
         } else {
-          const otherSpec = otherChildTenantSql(fk);
-          const other = (await q(otherSpec.text, [target.tenant]))[0];
+          const otherSpec = otherChildTenantSql(fk, target.tenant);
+          const other = (await q(otherSpec.text, otherSpec.values))[0];
           if (!other) {
             probeReason = 'no child rows belonging to a second tenant';
           } else {
@@ -340,7 +345,8 @@ export async function check({ query, config = {} }) {
             try {
               await q(`set local role ${role}`, []);
               for (const s of buildBecomeTenant(cfg.becomeTenant, other.tenant)) await q(s.text, s.values);
-              const res = await query(repointProbeSql(fk).text, [target.key, other.tenant]);
+              const probeSpec = repointProbeSql(fk, target.key, other.tenant);
+              const res = await query(probeSpec.text, probeSpec.values);
               const affected = res.rowCount ?? res.affectedRows ?? 0;
               probe = affected > 0 ? 'landed' : 'blocked';
             } catch (err) {

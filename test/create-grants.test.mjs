@@ -20,12 +20,20 @@ import {
 
 // ── SQL ──────────────────────────────────────────────────────────────
 
-test('schemaCreateGrantsSql: effective privilege AND whether the grant is to PUBLIC', () => {
-  const { text, values } = schemaCreateGrantsSql(['anon', 'authenticated']);
-  assert.match(text, /has_schema_privilege/);
-  assert.match(text, /grantee = 0/); // PUBLIC
-  assert.match(text, /nspname not like/); // system schemas excluded
-  assert.deepEqual(values, [['anon', 'authenticated']]);
+test('schemaCreateGrantsSql: effective privilege, plus HOW it is held', () => {
+  const { text, values } = schemaCreateGrantsSql(['anon', 'authenticated'], ['public']);
+  assert.match(text, /has_schema_privilege/);      // the effective answer
+  assert.match(text, /grantee = 0/);               // …via PUBLIC
+  assert.match(text, /grantee = r\.oid/);          // …or via a direct grant
+  assert.match(text, /nspname = any\(\$2\)/);       // scoped in SQL, not filtered after
+  assert.deepEqual(values, [['anon', 'authenticated'], ['public']]);
+});
+
+test('the effective and direct privileges are distinct columns — they have different fixes', () => {
+  const { text } = schemaCreateGrantsSql(['anon'], ['public']);
+  assert.match(text, /as can_create/);
+  assert.match(text, /as public_can_create/);
+  assert.match(text, /as direct_can_create/);
 });
 
 test('databaseCreateGrantsSql: CREATE on the database is the right to make SCHEMAS', () => {
@@ -37,8 +45,8 @@ test('databaseCreateGrantsSql: CREATE on the database is the right to make SCHEM
 
 test('the role list is parameterised, so a role that does not exist simply drops out', () => {
   // has_schema_privilege('nosuchrole', …) would ERROR; joining pg_roles avoids it.
-  assert.match(schemaCreateGrantsSql(['ghost']).text, /pg_roles/);
-  assert.match(schemaCreateGrantsSql(['ghost']).text, /rolname = any\(\$1\)/);
+  assert.match(schemaCreateGrantsSql(['ghost'], ['public']).text, /pg_roles/);
+  assert.match(schemaCreateGrantsSql(['ghost'], ['public']).text, /rolname = any\(\$1\)/);
 });
 
 test('definerSearchPathSql and serverVersionSql are shaped as expected', () => {

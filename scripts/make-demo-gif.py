@@ -114,48 +114,63 @@ def parse_ansi(text):
     return lines
 
 
+def _to_chars(spans):
+    """[(text, colour, bold, dim)] -> [(char, style)] so wrapping can be exact."""
+    return [(ch, (colour, bold, dim)) for text, colour, bold, dim in spans for ch in text]
+
+
+def _to_spans(chars):
+    """[(char, style)] -> [(text, colour, bold, dim)], merging runs of one style."""
+    out = []
+    for ch, style in chars:
+        if out and out[-1][1] == style:
+            out[-1][0].append(ch)
+        else:
+            out.append(([ch], style))
+    return [(''.join(buf), *style) for buf, style in out]
+
+
 def wrap(lines, cols):
     """
     Wrap to `cols`, preserving each line's own indentation and its styling.
 
-    The leading whitespace has to be carried explicitly: splitting on words
-    discards it, and losing it flattens the report's structure — which is most of
-    how the output is readable at all.
+    Done at character granularity because the styling and the indentation both
+    have to survive: splitting on words discards leading whitespace, and losing
+    that flattens the report's structure, which is most of how it reads.
     """
     out = []
     for spans in lines:
-        plain = ''.join(s[0] for s in spans)
+        chars = _to_chars(spans)
+        plain = ''.join(ch for ch, _ in chars)
         if len(plain) <= cols:
             out.append(spans)
             continue
 
         indent = len(plain) - len(plain.lstrip(' '))
-        pad = ' ' * indent
-        hang = ' ' * min(indent + 2, max(cols - 20, 0))
+        hang = min(indent + 2, max(cols - 20, 0))
+        hang_chars = [(' ', (DIM, False, False))] * hang
 
-        cur, width, first = [], 0, True
-        if indent:
-            cur.append((pad, DIM, False, False))
-            width = indent
+        line = list(chars[:indent])          # the original indent, styling intact
+        width = indent
+        has_text = False
 
-        for text, colour, bold, dim in spans:
-            body = text[indent:] if first and not cur[1:] and text.startswith(pad) else text
-            if first and body is not text:
-                pass  # the indent was hoisted into `pad` above
-            for word in re.findall(r'\S+\s*', body) or []:
-                limit = cols if first else cols - len(hang)
-                if width + len(word) > limit and any(w[0].strip() for w in cur):
-                    out.append(cur)
-                    first = False
-                    cur = [(hang, DIM, False, False)]
-                    width = len(hang)
-                    word = word.lstrip(' ')
-                    if not word:
-                        continue
-                cur.append((word, colour, bold, dim))
-                width += len(word)
-        if any(w[0].strip() for w in cur):
-            out.append(cur)
+        for m in re.finditer(r'\S+\s*', plain[indent:]):
+            word = chars[indent + m.start():indent + m.end()]
+            if width + len(word) > cols and has_text:
+                out.append(_to_spans(line))
+                line = list(hang_chars)
+                width = hang
+                has_text = False
+                while word and word[0][0] == ' ':   # no leading space on a new line
+                    word = word[1:]
+                if not word:
+                    continue
+            line.extend(word)
+            width += len(word)
+            has_text = True
+
+        if has_text:
+            out.append(_to_spans(line))
     return out
 
 

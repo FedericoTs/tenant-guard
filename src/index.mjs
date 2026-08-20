@@ -17,13 +17,14 @@ import * as identityTrust from './guards/identity-trust.mjs';
 import * as storageIsolation from './guards/storage-isolation.mjs';
 import * as constraintOracles from './guards/constraint-oracles.mjs';
 import * as realtimeIsolation from './guards/realtime-isolation.mjs';
-import { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig, resolveStorageConfig, resolveOraclesConfig, resolveRealtimeConfig } from './config.mjs';
+import * as definerRpc from './guards/definer-rpc.mjs';
+import { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig, resolveStorageConfig, resolveOraclesConfig, resolveRealtimeConfig, resolveDefinerRpcConfig } from './config.mjs';
 
 // The static guards: synchronous, zero-dependency, no database. These are what
 // `tenant-guard run` executes and what a project's vitest/jest suite imports.
 export const GUARDS = [migrationCollisions, definerGrants, routeOrgScoping];
 
-export { migrationCollisions, definerGrants, routeOrgScoping, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation };
+export { migrationCollisions, definerGrants, routeOrgScoping, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation, definerRpc };
 export { prove } from './guards/rls-proof.mjs';
 export { drift } from './guards/rls-drift.mjs';
 export { check as checkAnonWrites } from './guards/anon-writes.mjs';
@@ -33,7 +34,8 @@ export { check as checkIdentity } from './guards/identity-trust.mjs';
 export { check as checkStorage } from './guards/storage-isolation.mjs';
 export { check as checkOracles } from './guards/constraint-oracles.mjs';
 export { check as checkRealtime } from './guards/realtime-isolation.mjs';
-export { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig, resolveStorageConfig, resolveOraclesConfig, resolveRealtimeConfig } from './config.mjs';
+export { check as checkDefinerRpc } from './guards/definer-rpc.mjs';
+export { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig, resolveStorageConfig, resolveOraclesConfig, resolveRealtimeConfig, resolveDefinerRpcConfig } from './config.mjs';
 
 /** Run every static guard against a resolved per-guard config map. Returns results[]. */
 export function runAll(cwd = process.cwd()) {
@@ -142,8 +144,20 @@ export async function runRealtime(cwd = process.cwd()) {
  */
 export async function runEverything(cwd = process.cwd()) {
   const results = runAll(cwd);
-  for (const fn of [runProof, runDrift, runAnonReads, runAnonWrites, runViews, runIdentity, runStorage, runOracles, runRealtime]) {
+  for (const fn of [runProof, runDrift, runAnonReads, runAnonWrites, runViews, runIdentity, runDefinerRpc, runStorage, runOracles, runRealtime]) {
     results.push(await fn(cwd));
   }
   return results;
+}
+
+/**
+ * Run the SECURITY DEFINER RPC check (async; needs a database URL + `pg`). A
+ * definer function runs as its owner and bypasses RLS, so one that doesn't
+ * re-filter by tenant — or trusts a tenant argument — routes around perfectly
+ * good policies. Only STABLE/IMMUTABLE functions are ever called: Postgres
+ * guarantees those cannot write.
+ */
+export async function runDefinerRpc(cwd = process.cwd()) {
+  const config = loadConfig(cwd);
+  return definerRpc.run(resolveDefinerRpcConfig(config));
 }

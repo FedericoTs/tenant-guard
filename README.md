@@ -25,7 +25,7 @@ npx tenant-guard all      # everything: static guards + every runtime proof
 ```
 
 Or run one at a time: `prove`, `drift`, `anon-reads`, `anon-writes`, `identity`,
-`views`, `storage`, `realtime`, `oracles`. `npx tenant-guard list` describes each.
+`rpc`, `views`, `storage`, `realtime`, `oracles`. `npx tenant-guard list` describes each.
 
 ---
 
@@ -93,6 +93,7 @@ tenant-guard  — guard tests for multi-tenant isolation
 |---|---|---|
 | `anon-reads` | the **anonymous** role can SELECT a **tenant** table, view, or materialized view | the CVE-2025-48757 class — the public anon key reads every tenant's data with no login; scoped to objects with a tenant column so public content isn't flagged, and it *probes* as `anon` so it evaluates the real policy, not just the grant |
 | `anon-writes` | the **anonymous** role can INSERT/UPDATE/DELETE a table | a table with no tenant column, writable by `anon`, is neither a tenant leak nor drift — it's the cache-poisoning class; it proves the real `USING`/`WITH CHECK` by probing, so it doesn't false-flag `TO public USING (auth.uid()…)` policies |
+| `definer-rpc` | a `SECURITY DEFINER` **RPC** hands out another tenant's rows | the purest form of "the policy exists but the access path around it doesn't": a definer function runs as its **owner**, so it bypasses RLS on everything it touches, and PostgREST exposes it at `/rest/v1/rpc/<name>`. A function that doesn't re-filter by tenant — or that trusts a tenant id the **caller passes in** — routes around flawless policies, and every table-level check still reports green. Only `STABLE`/`IMMUTABLE` functions are ever *called*: Postgres guarantees those cannot write |
 | `identity-trust` | the caller can **forge the identity** your policies authorize from, or **write the thing that grants it** | every other guard asks "given a correct identity, is the data scoped?" — this asks whether the identity itself is controllable. A policy reading `user_metadata` (which the *user* can rewrite) is defeated by forging that claim; a callable `SECURITY DEFINER` that sets your tenant GUC from an argument is a "become any tenant" primitive; a `memberships` table the caller can write makes a *flawless* policy bypassable; and because **RLS is row-level and cannot restrict columns**, a correct `USING (id = auth.uid())` self-update policy still lets a user set their own `role` or re-parent their `organization_id` |
 
 **Runtime — the surfaces that aren't base tables:**
@@ -231,6 +232,15 @@ view ignores RLS entirely; Storage and Realtime key tenancy off an object **path
 and a channel **topic** rather than a column, and in both the *client* chooses that
 string when it writes. Each is invisible to a table-only check — there is a test
 asserting `rls-proof` passes while `view-isolation` fails on the same database.
+
+**`rpc` — the function that runs as its owner.** A `SECURITY DEFINER` function
+bypasses RLS on everything it touches and is exposed by PostgREST as an endpoint.
+If it doesn't re-filter by an auth-derived tenant — or filters by a tenant id the
+*caller* supplies — the policies on the underlying tables never get a say. This is
+also where the tool is most careful about its own blast radius: it will only
+**call** a function Postgres has classified `STABLE` or `IMMUTABLE`, because the
+engine enforces that those cannot write. A `VOLATILE` definer function is never
+invoked — it is reported from a read of its body, as a note, saying exactly that.
 
 **`oracles` — the schema itself.** RLS hides rows, not constraints. A globally
 `UNIQUE` natural key on a tenant table lets anyone test whether a value exists in

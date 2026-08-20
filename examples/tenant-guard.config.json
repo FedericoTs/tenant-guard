@@ -78,6 +78,12 @@
     "allowlist": ["brand-assets"]
   },
 
+  "definerRpc": {
+    "//": "Runtime. A SECURITY DEFINER function runs as its OWNER and bypasses RLS on everything it touches, and PostgREST exposes it at /rest/v1/rpc/<name>. Flags ones that don't re-filter by tenant, or that trust a tenant id the caller passes in. Only STABLE/IMMUTABLE functions are ever CALLED — Postgres enforces that those cannot write; VOLATILE ones are reported from their body as explicitly unproven. Inherits identity from rlsProof.",
+    "schemas": ["public"],
+    "allowlist": []
+  },
+
   "realtimeIsolation": {
     "//": "Runtime, Supabase only (skips cleanly otherwise). Broadcast/Presence authorize channels through RLS on realtime.messages, and the tenant lives in the TOPIC (org_A:notifications). Joining a channel is a write, so an unpinned INSERT policy lets anyone publish into another tenant's channel.",
     "topicSeparator": ":",

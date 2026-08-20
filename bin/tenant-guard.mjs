@@ -12,6 +12,7 @@
  *   tenant-guard storage  exit 1 if Supabase Storage leaks across tenant folders
  *   tenant-guard oracles  exit 1 if a UNIQUE key reveals another tenant’s rows
  *   tenant-guard realtime exit 1 if Realtime channels leak across tenants
+ *   tenant-guard rpc      exit 1 if a SECURITY DEFINER RPC routes around RLS
  *   tenant-guard all      run every guard above, in order
  *   tenant-guard init    write a tenant-guard.config.json, seeded from this repo
  *   tenant-guard list    list the available guards and what each prevents
@@ -23,8 +24,8 @@
  */
 import { writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { GUARDS, runAll, runProof, runDrift, runAnonWrites, runAnonReads, runViews, runIdentity, runStorage, runOracles, runRealtime, runEverything } from '../src/index.mjs';
-import { rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation } from '../src/index.mjs';
+import { GUARDS, runAll, runProof, runDrift, runAnonWrites, runAnonReads, runViews, runIdentity, runStorage, runOracles, runRealtime, runDefinerRpc, runEverything } from '../src/index.mjs';
+import { rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation, definerRpc } from '../src/index.mjs';
 import { CONFIG_FILENAME, autodetect } from '../src/config.mjs';
 import { report, bold, dim, green, yellow } from '../src/runner.mjs';
 
@@ -146,9 +147,17 @@ if (cmd === 'all') {
   process.exit(code);
 }
 
+if (cmd === 'rpc') {
+  // SECURITY DEFINER functions that bypass RLS. Async — needs a DB.
+  const result = await runDefinerRpc(cwd);
+  const code = report([result], { emptyHint: false });
+  if (result.skipped) console.log(dim(SKIP_HINT('rpc')));
+  process.exit(code);
+}
+
 if (cmd === 'list') {
   console.log(bold('\ntenant-guard guards\n'));
-  for (const g of [...GUARDS, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation]) {
+  for (const g of [...GUARDS, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation, definerRpc]) {
     console.log(`  ${bold(g.meta.id)}`);
     console.log(dim(`    ${g.meta.title}`));
     console.log(dim(`    ${g.meta.why}\n`));
@@ -214,6 +223,13 @@ if (cmd === 'init') {
       schemas: ['public'],
       allowlist: [], // "schema.table" intentionally readable by anon (published/reference data)
     },
+    definerRpc: {
+      // A SECURITY DEFINER function runs as its OWNER and bypasses RLS, and
+      // PostgREST exposes it at /rest/v1/rpc/<name>. Only STABLE/IMMUTABLE
+      // functions are ever CALLED — Postgres guarantees those cannot write.
+      schemas: ['public'],
+      allowlist: [], // "schema.function" that is intentionally cross-tenant (an admin RPC)
+    },
     realtimeIsolation: {
       // Broadcast/Presence authorize channels through RLS on realtime.messages,
       // and the tenant lives in the TOPIC (org_A:notifications), not a column.
@@ -267,5 +283,5 @@ if (cmd === 'init') {
   process.exit(0);
 }
 
-console.error(`Unknown command: ${cmd}\nUsage: tenant-guard [run|prove|drift|anon-writes|all|anon-reads|views|identity|storage|oracles|realtime|init|list]`);
+console.error(`Unknown command: ${cmd}\nUsage: tenant-guard [run|prove|drift|anon-writes|all|anon-reads|views|identity|storage|oracles|realtime|rpc|init|list]`);
 process.exit(2);

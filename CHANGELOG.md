@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.16.0
+
+A Reddit reviewer asked for "RPCs where SECURITY DEFINER + grants can quietly
+undermine otherwise-correct RLS". Checking rather than assuming turned up a real
+**false negative**, and a catalog fact that unblocked the check that had been
+parked as too dangerous to build.
+
+- **feat: new guard `definer-rpc`** (`tenant-guard rpc`). A `SECURITY DEFINER`
+  function runs as its **owner**, so it bypasses RLS on everything it touches, and
+  PostgREST exposes it at `/rest/v1/rpc/<name>`. This:
+
+      create function get_invoices(org text) returns setof invoices
+        language sql security definer stable
+        as $$ select * from invoices where organization_id = org $$;
+      grant execute on function get_invoices(text) to authenticated;
+
+  hands out every tenant's invoices while `invoices` itself has flawless RLS —
+  and before this release **every guard here reported green on it**. There is a
+  test asserting exactly that: `rls-proof` passes while `definer-rpc` fails, on
+  the same database.
+- **The safety objection had a catalog answer.** Calling an arbitrary definer
+  function is genuinely unsafe — an unknown body can commit autonomously and
+  outlive the rollback that makes every other guard harmless, which is why the
+  threat model had this parked as "gated". But Postgres *enforces* that a
+  non-`VOLATILE` function cannot write (*"INSERT is not allowed in a non-volatile
+  function"*). So `STABLE`/`IMMUTABLE` definer functions are **called and
+  measured**, and `VOLATILE` ones are **never invoked** — reported from a read of
+  their body, as a note that says plainly it is not proven and why.
+- Distinguishes **trusts-argument** (called with another tenant's id, returned
+  their rows) from **no-filter** (returns rows even for a tenant id that cannot
+  exist) using a control arm, because the fix differs. Probes zero-arg and
+  single-tenant-arg functions; anything else is skipped rather than guessed at,
+  and says so.
+- Threat model **4.3 and 4.5 → covered**.
+- 292 tests (was 270), 13 guards.
+
 ## 0.15.0
 
 **The map is closed.** Threat-model 5.4 was the last planned item; everything

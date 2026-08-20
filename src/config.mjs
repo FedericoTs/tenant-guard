@@ -197,6 +197,20 @@ export function resolveRealtimeConfig(config) {
   return out;
 }
 
+/** Resolve the definer-rpc config from the user's `definerRpc` block. */
+export function resolveDefinerRpcConfig(config) {
+  const d = config.definerRpc ?? {};
+  const out = {};
+  for (const k of ['url', 'urlEnv', 'schemas', 'tenantColumns', 'role', 'becomeTenant', 'claim', 'allowlist', 'tenantArgTypes']) {
+    if (d[k] !== undefined) out[k] = d[k];
+  }
+  const p = config.rlsProof ?? {};
+  for (const k of ['role', 'becomeTenant', 'claim', 'tenantColumns', 'schemas']) {
+    if (out[k] === undefined && p[k] !== undefined) out[k] = p[k];
+  }
+  return out;
+}
+
 export function autodetect(cwd = process.cwd()) {
   return {
     migrationsDir: firstExisting(cwd, CANDIDATE_MIGRATION_DIRS),

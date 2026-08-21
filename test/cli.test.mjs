@@ -2,7 +2,7 @@
  * End-to-end CLI tests: flags, exit codes, and — the one that actually matters
  * for CI — that `--json` puts NOTHING on stdout except JSON.
  *
- * These spawn the real binary against examples/leaky-demo, which has two known
+ * These spawn the real binary against examples/leaky-demo, which has three known
  * violations, so the exit code under test is a genuine 1 rather than a mock.
  */
 import { test } from 'node:test';
@@ -73,14 +73,14 @@ test('--json puts NOTHING on stdout but JSON', () => {
   const { out } = cli(['run', '--json']);
   const parsed = JSON.parse(out); // would throw on a banner or a stray hint
   assert.equal(parsed.schemaVersion, 1);
-  assert.equal(parsed.summary.failed, 2);
+  assert.equal(parsed.summary.failed, 3);
 });
 
 test('--sarif puts NOTHING on stdout but SARIF', () => {
   const { out } = cli(['run', '--sarif']);
   const parsed = JSON.parse(out);
   assert.equal(parsed.version, '2.1.0');
-  assert.equal(parsed.runs[0].results.length, 2);
+  assert.equal(parsed.runs[0].results.length, 3);
 });
 
 test('--json and --sarif cannot both take stdout — it exits 2 instead of interleaving', () => {
@@ -117,7 +117,7 @@ test('--json=FILE writes the file AND keeps the human report', () => {
     assert.match(r.out, /guard\(s\) failed/); // the human report is still there
     assert.match(r.out, /wrote JSON/);
     const parsed = JSON.parse(readFileSync(out, 'utf8'));
-    assert.equal(parsed.summary.failed, 2);
+    assert.equal(parsed.summary.failed, 3);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

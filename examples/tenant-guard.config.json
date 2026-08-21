@@ -13,6 +13,13 @@
     "allowlist": ["record_login_attempt", "check_login_rate_limit", "validate_public_token"]
   },
 
+  "updatableViews": {
+    "//": "Static. A view over one relation with no aggregation is AUTO-UPDATABLE, so Postgres passes INSERT/UPDATE/DELETE through to the base table; with the default security_invoker = false those writes run as the view's OWNER and the base table's RLS never applies to the caller; and on Supabase the default privileges grant anon/authenticated writes on every new object, so GRANT SELECT does not make a view read-only. Reported from production, where DELETE on a public profile view wiped the users table. assumeDefaultWriteGrants: 'auto' looks for the evidence in your own migrations rather than assuming a platform.",
+    "exposedRoles": ["anon", "authenticated"],
+    "assumeDefaultWriteGrants": "auto",
+    "allowlist": []
+  },
+
   "routeOrgScoping": {
     "//": "Static. Authenticated route + filters by bare id + never mentions a tenant column. Bare-id patterns ship for Supabase, Prisma and Drizzle; raw SQL is left out of the default to avoid false positives on self-loads.",
     "routesDir": "src/app/api",

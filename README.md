@@ -32,6 +32,7 @@ npx tenant-guard all      # everything: static guards + every runtime proof
 
 Or run one at a time: `prove`, `drift`, `anon-reads`, `anon-writes`, `identity`,
 `rpc`, `views`, `storage`, `realtime`, `oracles`, `shadows`, `caps`, `schemas`, `pooler`, `defaults`, `fks`, `creates`.
+The view write-through check runs inside `run`, with no database.
 `npx tenant-guard list` describes each, and `--help` documents the rest.
 
 Every command also speaks machine: `--json` for anything downstream, `--sarif`
@@ -63,19 +64,29 @@ newer models were **not** safer.
 ## What it catches (run against a typical vibe-coded app)
 
 ```
-tenant-guard  — guard tests for multi-tenant isolation
+tenant-guard  â€” guard tests for multi-tenant isolation
 
-✓ migration-collisions — 2 migrations scanned; 0 grandfathered duplicate(s) ignored
-✗ definer-grants — 1 unsafe function(s)
-    • 200_add_reset_helper.sql
+âœ“ migration-collisions â€” 3 migrations scanned; 0 grandfathered duplicate(s) ignored
+âœ— definer-grants â€” 1 unsafe function(s)
+    â€¢ 200_add_reset_helper.sql
       function "reset_workspace" is SECURITY DEFINER + mutates but EXECUTE is not revoked from PUBLIC/anon
-      → In the SAME migration add:  REVOKE EXECUTE ON FUNCTION public.reset_workspace(<args>) FROM PUBLIC, anon;
-✗ route-org-scoping — 1 route(s) can leak across tenants
-    • src/app/api/invoices/[id]/route.ts
+      â†’ In the SAME migration add:  REVOKE EXECUTE ON FUNCTION public.reset_workspace(<args>) FROM PUBLIC, anon;
+            If it is intentionally pre-auth, add "reset_workspace" to definerGrants.allowlist[] in your tenant-guard config.
+âœ— route-org-scoping â€” 1 route(s) can leak across tenants
+    â€¢ src/app/api/invoices/[id]/route.ts
       authenticated + filters by bare id + never scopes by a tenant column
-      → Add the tenant column to every query, e.g. .eq('organization_id', auth.organizationId).
+      â†’ Add the tenant column to every query in this route, e.g. .eq('organization_id', auth.organizationId).
+            If this route is genuinely tenant-agnostic, add "src/app/api/invoices/[id]/route.ts" to routeOrgScoping.allowlist[] with a one-line justification.
+âœ— updatable-view-writethrough â€” 1 view(s) write through to their base table, bypassing its RLS
+    â€¢ 202_public_profiles.sql
+      view "public_profiles" is auto-updatable (one relation, no aggregation) and runs as its OWNER â€” security_invoker is not set â€” so INSERT/UPDATE/DELETE pass straight through to "users", with that table's RLS evaluated as the owner rather than the caller. No REVOKE of INSERT/UPDATE/DELETE appears in these migrations, and this looks like a Supabase project (it references anon/authenticated), where default privileges grant writes on every new object in public. Granting only SELECT does not make a view read-only: the write privileges arrive on their own.
+      â†’ REVOKE INSERT, UPDATE, DELETE ON public_profiles FROM anon, authenticated;
+            A view that exists to expose safe columns should be readable only. If writes ARE intended,
+            make them go through checks: CREATE VIEW â€¦ WITH (security_invoker = true), or an INSTEAD OF trigger.
+            If this view is deliberately writable, add "public_profiles" to updatableViews.allowlist[] with a reason.
 
-✗ 2 guard(s) failed
+âœ— 3 guard(s) failed  (4 ran, 0 skipped)
+  A guard fails your build so the leak never merges. Fix it, or allowlist it with a reason.
 ```
 
 (That output is real — it's `examples/leaky-demo/`. Reproduce it:
@@ -89,6 +100,7 @@ tenant-guard  — guard tests for multi-tenant isolation
 |---|---|---|
 | `route-org-scoping` | an authenticated route filters by a bare `id` and never mentions a tenant column | catches the *shape* of the IDOR (auth + bare-id + no-tenant), and it lives in your CI so it blocks the merge instead of adding one more report |
 | `definer-grants` | a mutating `SECURITY DEFINER` function's **final** definition isn't revoked from `PUBLIC`/`anon` | requires knowing Postgres default grants + PostgREST exposure interact — *revoking from `anon` alone is a no-op*; judged on the net state of history, so a fix in a later repair migration counts |
+| `updatable-view-writethrough` | a view built to expose SAFE columns is also **writable through** to its base table | three ordinary defaults collide and nobody writes any of them down: a view over one relation with no aggregation is **auto-updatable**, so Postgres passes `INSERT`/`UPDATE`/`DELETE` to the base table; `security_invoker` is off by default, so those writes run as the view's **owner** and the base table's RLS never applies to the caller; and Supabase's default privileges grant `anon`/`authenticated` writes on every new object, so `GRANT SELECT` does not make it read-only. Reported from production, where `DELETE /rest/v1/public_profiles` with the public anon key wiped the users table. `view-isolation` cannot see it — that proves READ isolation, and this is a write |
 | `migration-collisions` | two migrations share a numeric prefix | a project-specific CI invariant (your numbering scheme), not a code smell |
 
 **Runtime — the core proof**, against a seeded test database:

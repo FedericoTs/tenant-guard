@@ -25,13 +25,14 @@ import * as poolerBleed from './guards/pooler-bleed.mjs';
 import * as defaultPrivileges from './guards/default-privileges.mjs';
 import * as crossTenantFk from './guards/cross-tenant-fk.mjs';
 import * as createGrants from './guards/create-grants.mjs';
+import * as updatableViews from './guards/updatable-view-writethrough.mjs';
 import { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig, resolveStorageConfig, resolveOraclesConfig, resolveRealtimeConfig, resolveDefinerRpcConfig, resolveShadowConfig, resolveCapabilitiesConfig, resolveSchemaTenancyConfig, resolvePoolerBleedConfig, resolveDefaultPrivilegesConfig, resolveCrossTenantFkConfig, resolveCreateGrantsConfig } from './config.mjs';
 
 // The static guards: synchronous, zero-dependency, no database. These are what
 // `tenant-guard run` executes and what a project's vitest/jest suite imports.
-export const GUARDS = [migrationCollisions, definerGrants, routeOrgScoping];
+export const GUARDS = [migrationCollisions, definerGrants, routeOrgScoping, updatableViews];
 
-export { migrationCollisions, definerGrants, routeOrgScoping, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation, definerRpc, shadowTables, roleCapabilities, schemaTenancy, poolerBleed, defaultPrivileges, crossTenantFk, createGrants };
+export { migrationCollisions, definerGrants, routeOrgScoping, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation, definerRpc, shadowTables, roleCapabilities, schemaTenancy, poolerBleed, defaultPrivileges, crossTenantFk, createGrants, updatableViews };
 export { prove } from './guards/rls-proof.mjs';
 export { drift } from './guards/rls-drift.mjs';
 export { check as checkAnonWrites } from './guards/anon-writes.mjs';

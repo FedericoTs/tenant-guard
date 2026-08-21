@@ -42,6 +42,19 @@ export function loadConfig(cwd = process.cwd()) {
  * Resolve the per-guard config, autodetecting paths where the user left them
  * blank. Absolute migration dirs are produced for the filesystem guards.
  */
+/**
+ * Drop keys whose value is `undefined`.
+ *
+ * `{ ...DEFAULTS, ...config }` treats an explicitly-undefined key as a value and
+ * overwrites the default with it, so a resolver that returns
+ * `option: config.block?.option` silently erases the default whenever the user
+ * did not set that option. Stripping them keeps the spread meaning what it reads
+ * like.
+ */
+export function definedOnly(obj) {
+  return Object.fromEntries(Object.entries(obj ?? {}).filter(([, v]) => v !== undefined));
+}
+
 export function resolveGuardConfigs(config) {
   const cwd = config.cwd ?? process.cwd();
   const migrationsRel =
@@ -49,7 +62,7 @@ export function resolveGuardConfigs(config) {
   const migrationsDir = migrationsRel ? join(cwd, migrationsRel) : null;
   const routesRel = config.routeOrgScoping?.routesDir ?? firstExisting(cwd, CANDIDATE_ROUTE_DIRS);
 
-  return {
+  return definedOnlyDeep({
     'migration-collisions': {
       dir: migrationsDir,
       grandfather: config.migrations?.grandfather ?? [],
@@ -58,6 +71,12 @@ export function resolveGuardConfigs(config) {
       dir: migrationsDir,
       baseline: config.definerGrants?.baseline ?? 0,
       allowlist: config.definerGrants?.allowlist ?? [],
+    },
+    'updatable-view-writethrough': {
+      dir: migrationsDir,
+      exposedRoles: config.updatableViews?.exposedRoles,
+      assumeDefaultWriteGrants: config.updatableViews?.assumeDefaultWriteGrants,
+      allowlist: config.updatableViews?.allowlist ?? [],
     },
     'route-org-scoping': {
       cwd,
@@ -68,7 +87,12 @@ export function resolveGuardConfigs(config) {
       tenantSignals: config.routeOrgScoping?.tenantSignals,
       allowlist: config.routeOrgScoping?.allowlist ?? [],
     },
-  };
+  });
+}
+
+/** `definedOnly` applied to each guard's block. */
+function definedOnlyDeep(byGuard) {
+  return Object.fromEntries(Object.entries(byGuard).map(([k, v]) => [k, definedOnly(v)]));
 }
 
 /**

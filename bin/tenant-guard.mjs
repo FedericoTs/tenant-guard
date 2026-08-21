@@ -283,6 +283,17 @@ if (cmd === 'init') {
       baseline: 0,
       allowlist: [],
     },
+    updatableViews: {
+      // Static. A view over one relation with no aggregation is AUTO-UPDATABLE,
+      // so Postgres passes INSERT/UPDATE/DELETE through to the base table; with
+      // the default security_invoker = false those writes run as the view's
+      // OWNER, so the base table's RLS never applies to the caller; and on
+      // Supabase the default privileges grant anon/authenticated writes on every
+      // new object. GRANT SELECT does not make a view read-only.
+      exposedRoles: ['anon', 'authenticated'],
+      assumeDefaultWriteGrants: 'auto',
+      allowlist: [],
+    },
     routeOrgScoping: {
       routesDir: detected.routesDir ?? 'src/app/api',
       allowlist: [],

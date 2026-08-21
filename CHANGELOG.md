@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.27.0
+
+New **static** guard `updatable-view-writethrough` — the flagship recommendation
+of the MonkeyTravel brief, and the check that would have blocked that app's worst
+bug at pull-request time with no database.
+
+- **The bug it catches.** A view created to expose only safe profile columns was
+  also writable through to `users`. With the public anon key,
+  `DELETE /rest/v1/public_profiles` wiped the table. Three ordinary defaults
+  collide, and **not one of them appears in the migration**:
+  1. a view over one relation with no aggregation is **auto-updatable** —
+     Postgres passes `INSERT`/`UPDATE`/`DELETE` through to the base table;
+  2. `security_invoker` is **off by default**, so those writes execute as the
+     view's OWNER and the base table's RLS never applies to the caller — which
+     is precisely what makes the view useful for reading, so it is not the bug;
+  3. Supabase's default privileges grant `anon`/`authenticated` writes on every
+     new object, so `GRANT SELECT` does **not** make a view read-only.
+
+  The word `DELETE` never appears anywhere. `view-isolation` cannot see it: that
+  guard proves READ isolation across tenants, and this is a write.
+
+- **Static, because every ingredient is in the text.** It parses the view's
+  options and shape, tracks the net effect of `GRANT`/`REVOKE` across migration
+  history, and detects whether the project looks like one where default
+  privileges grant writes — preferring evidence (`ALTER DEFAULT PRIVILEGES` in
+  your own migrations) over assuming a platform.
+
+- **Proven against a real database, both directions.** An integration test shows
+  the `DELETE` passing through while the base table's policy denies the caller
+  outright, that `security_invoker = true` genuinely fixes it, and that the
+  `REVOKE` this guard recommends actually blocks the write (42501). A static rule
+  about Postgres behaviour should be a fact about Postgres, not an assertion.
+
+- Calibrated: a materialized view, a `security_invoker` view, an aggregate or
+  multi-table shape, and an explicit `REVOKE` are all silent. Without evidence of
+  default write grants it is a note rather than a failure.
+
+- `examples/leaky-demo` now contains the reported shape, so the README's example
+  output demonstrates it — and that block is regenerated from a real run.
+
+### Also
+
+- **fix: an explicitly-`undefined` config value no longer erases its default.**
+  `{ ...DEFAULTS, ...config }` treats `undefined` as a value, and
+  `resolveGuardConfigs` returns `option: config.block?.option` — so any option a
+  user had not set wiped the default. It only surfaced now because the older
+  static guards read their config key by key with `??`. Found by wiring the new
+  guard in, which crashed immediately.
+
+- 589 tests (was 563), 21 guards.
+
 ## 0.26.0
 
 **`definer-grants` recommended a fix that caused a production outage.** Reported

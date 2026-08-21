@@ -71,6 +71,29 @@ export const DEFAULTS = {
 /** A tenant id that cannot exist — the control arm for argument-trusting RPCs. */
 export const NONEXISTENT_TENANT = '__tenant_guard_no_such_tenant__';
 
+/**
+ * The control arm needs a tenant id that certainly does not exist — and it has
+ * to be VALID for the argument's type.
+ *
+ * The text sentinel above cannot be cast to `uuid`: `'__tenant_guard_no_such_
+ * tenant__'::uuid` raises 22P02. That mattered, because `uuid` is the ordinary
+ * Supabase tenant type — the probe had already MEASURED a cross-tenant read, and
+ * then the control arm threw, the measurement was discarded, and the run went
+ * green on a proven leak. Reproduced: identical scenario with a `text` argument
+ * failed the build, with `uuid` it passed.
+ *
+ * The all-zero uuid is used rather than a random one so the probe is
+ * deterministic; a row actually carrying it would show up as a non-zero control
+ * count, which `classifyRpc` already reads as "this function has no filter"
+ * rather than as a clean result.
+ */
+export const NONEXISTENT_TENANT_UUID = '00000000-0000-0000-0000-000000000000';
+
+/** The sentinel that is valid for this argument type. */
+export function sentinelFor(argType) {
+  return /uuid/i.test(String(argType ?? '')) ? NONEXISTENT_TENANT_UUID : NONEXISTENT_TENANT;
+}
+
 // ── pure helpers (unit-tested, no I/O) ───────────────────────────────
 
 /**
@@ -498,21 +521,63 @@ export async function check({ query, config = {} }) {
       scanned++;
       let foreignRows = 0;
       let controlRows = 0;
-      try {
-        if (call.mode === 'tenant-arg') {
-          const p = tenantArgProbeSql(fn.schema, fn.name, call.argType);
-          foreignRows = (await q(p.text, [tenantB]))[0].n;
-          if (foreignRows > 0) controlRows = (await q(p.text, [NONEXISTENT_TENANT]))[0].n;
-        } else {
-          const p = noArgProbeSql(fn.schema, fn.name, tenantColumn);
-          foreignRows = (await q(p.text, [tenantA]))[0].n;
+      let measured = false;
+
+      // Every probe gets its own savepoint. Without one, a single function whose
+      // call errors — and the guard's own note below says that is the ORDINARY
+      // case, a return shape with no tenant column — aborts this transaction, and
+      // every function scanned afterwards fails with 25P02 and is downgraded to a
+      // reassuring note. A proven leak then reports green, decided by nothing more
+      // than alphabetical order. Reproduced, and fixed the way the six sibling
+      // guards already do it.
+      const sp = async (fnc) => {
+        await query('savepoint tg_probe', []);
+        try {
+          const out = await fnc();
+          await query('release savepoint tg_probe', []);
+          return { ok: true, out };
+        } catch (err) {
+          try { await query('rollback to savepoint tg_probe', []); await query('release savepoint tg_probe', []); }
+          catch { /* the outer rollback still discards everything */ }
+          return { ok: false, err };
         }
-      } catch (err) {
-        if (!isPermissionDenied(err)) {
-          notes.push({ where: `${fn.schema}.${fn.name}(${fn.args || ''})`, message: `not probed — calling it errored (${err.message.slice(0, 120)}). This is usually a return shape without a tenant column, not a leak.` });
+      };
+
+      if (call.mode === 'tenant-arg') {
+        const p = tenantArgProbeSql(fn.schema, fn.name, call.argType);
+        const r = await sp(async () => (await q(p.text, [tenantB]))[0].n);
+        if (!r.ok) {
+          if (!isPermissionDenied(r.err)) {
+            notes.push({ where: `${fn.schema}.${fn.name}(${fn.args || ''})`, message: `not probed — calling it errored (${r.err.message.slice(0, 120)}). This is usually a return shape without a tenant column, not a leak.` });
+          }
+          continue;
         }
-        continue;
+        foreignRows = r.out;
+        measured = true;
+
+        if (foreignRows > 0) {
+          const c = await sp(async () => (await q(p.text, [sentinelFor(call.argType)]))[0].n);
+          if (c.ok) controlRows = c.out;
+          else {
+            // The control arm only ever DOWNGRADES a finding (it reclassifies
+            // "trusts-argument" as "no-filter"). Losing it must never lose the
+            // leak that was already measured — that is what used to happen.
+            notes.push({ where: `${fn.schema}.${fn.name}(${fn.args || ''})`, message: `the control probe could not run (${c.err.message.slice(0, 90)}), so the finding below is reported as trusts-argument; it may in fact ignore the argument entirely.` });
+          }
+        }
+      } else {
+        const p = noArgProbeSql(fn.schema, fn.name, tenantColumn);
+        const r = await sp(async () => (await q(p.text, [tenantA]))[0].n);
+        if (!r.ok) {
+          if (!isPermissionDenied(r.err)) {
+            notes.push({ where: `${fn.schema}.${fn.name}(${fn.args || ''})`, message: `not probed — calling it errored (${r.err.message.slice(0, 120)}). This is usually a return shape without a tenant column, not a leak.` });
+          }
+          continue;
+        }
+        foreignRows = r.out;
+        measured = true;
       }
+      if (!measured) continue;
 
       const verdict = classifyRpc({ ...base, mode: call.mode, foreignRows, controlRows });
       if (verdict.status === 'leak') {

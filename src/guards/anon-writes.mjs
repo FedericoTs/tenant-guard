@@ -22,6 +22,15 @@
  * `anon` must NOT be able to read a deny-all table. If it can, `anon` bypasses
  * RLS and the probe results are meaningless — so we abort instead.
  *
+ *
+ * **Column grants count.** `has_table_privilege` answers only about the TABLE
+ * ACL, so `GRANT SELECT (id, body) ON notes TO anon` returns false and the whole
+ * relation was skipped — on a table with RLS off, where anon really was reading
+ * every tenant's rows. Measured: anon read 2 rows across two tenants and updated
+ * 2, and this guard reported ok. `has_any_column_privilege` is the question that
+ * matches what the role can actually do; the table-level answer is kept only to
+ * tell full exposure from partial in the message.
+ *
  * Non-destructive: everything is one rolled-back transaction, writes wrapped in
  * savepoints. Needs `pg` + a database URL; skips cleanly without them. Honest
  * limit: on RLS-ON tables it proves UPDATE/DELETE by probe; a pure INSERT-only
@@ -58,8 +67,12 @@ export function surfaceSql(schemas, role) {
   const text = `
     select n.nspname as schema, c.relname as "table",
            c.relrowsecurity as rls_enabled,
-           has_table_privilege($2, format('%I.%I', n.nspname, c.relname), 'INSERT') as can_insert,
-           has_table_privilege($2, format('%I.%I', n.nspname, c.relname), 'UPDATE') as can_update,
+           (has_table_privilege($2, format('%I.%I', n.nspname, c.relname), 'INSERT')
+             or has_any_column_privilege($2, format('%I.%I', n.nspname, c.relname), 'INSERT')) as can_insert,
+           (has_table_privilege($2, format('%I.%I', n.nspname, c.relname), 'UPDATE')
+             or has_any_column_privilege($2, format('%I.%I', n.nspname, c.relname), 'UPDATE')) as can_update,
+           -- DELETE has no column-level form in Postgres: you cannot GRANT
+           -- DELETE (col), so the table answer is the whole answer here.
            has_table_privilege($2, format('%I.%I', n.nspname, c.relname), 'DELETE') as can_delete,
            (select a.attname from pg_catalog.pg_attribute a
               where a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped and a.attgenerated = ''
@@ -109,8 +122,10 @@ export function viewSurfaceSql(schemas, role) {
              pg_catalog.pg_relation_is_updatable(c.oid, true) as updatable_mask,
              coalesce((select option_value from pg_catalog.pg_options_to_table(c.reloptions)
                        where option_name = 'security_invoker'), 'false') as security_invoker,
-             pg_catalog.has_table_privilege($2::text, c.oid, 'INSERT') as can_insert,
-             pg_catalog.has_table_privilege($2::text, c.oid, 'UPDATE') as can_update,
+             (pg_catalog.has_table_privilege($2::text, c.oid, 'INSERT')
+               or pg_catalog.has_any_column_privilege($2::text, c.oid, 'INSERT')) as can_insert,
+             (pg_catalog.has_table_privilege($2::text, c.oid, 'UPDATE')
+               or pg_catalog.has_any_column_privilege($2::text, c.oid, 'UPDATE')) as can_update,
              pg_catalog.has_table_privilege($2::text, c.oid, 'DELETE') as can_delete,
              (select a.attname from pg_catalog.pg_attribute a
                where a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped

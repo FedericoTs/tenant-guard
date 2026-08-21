@@ -207,16 +207,34 @@ export async function check({ query, config = {} }) {
   let proven = 0;
 
   await query('begin', []);
+/**
+   * Run one probe inside a savepoint.
+   *
+   * The guard does its whole scan in a single transaction. Without a savepoint,
+   * ONE relation the app role cannot read aborts that transaction, and every
+   * relation examined afterwards fails with 25P02 and is silently downgraded to a
+   * note — so a real leak reports green, decided by nothing but sort order.
+   * Reproduced. Six sibling guards already did it this way.
+   */
+  const savepointed = async (fn) => {
+    await query('savepoint tg_v', []);
+    try {
+      const out = await fn();
+      await query('release savepoint tg_v', []);
+      return { ok: true, out };
+    } catch (err) {
+      try { await query('rollback to savepoint tg_v', []); await query('release savepoint tg_v', []); }
+      catch { /* the outer rollback still discards everything */ }
+      return { ok: false, err };
+    }
+  };
   try {
     // Privileged pass: which tenants are visible through each view at all.
     for (const v of plan) {
-      try {
-        const d = distinctTenantsSql(v.schema, v.view, v.tenantColumn, cfg.sampleLimit);
-        v.tenants = (await q(d.text, d.values)).map((r) => r.t);
-      } catch (err) {
-        v.introspectError = err.message;
-        v.tenants = [];
-      }
+      const d = distinctTenantsSql(v.schema, v.view, v.tenantColumn, cfg.sampleLimit);
+      const r = await savepointed(async () => (await q(d.text, d.values)).map((x) => x.t));
+      if (r.ok) v.tenants = r.out;
+      else { v.introspectError = r.err.message; v.tenants = []; }
     }
 
     // Negative control: the app role must be subject to RLS at all.
@@ -261,21 +279,22 @@ export async function check({ query, config = {} }) {
       let probeError = null;
       let ownVisible = 0;
       let crossVisible = 0;
-      try {
+      const probe = await savepointed(async () => {
         for (const s of buildBecomeTenant(cfg.becomeTenant, tenantA)) await query(s.text, s.values);
         const own = tenantRowCountSql(v.schema, v.view, v.tenantColumn, tenantA);
         const cross = tenantRowCountSql(v.schema, v.view, v.tenantColumn, tenantB);
-        ownVisible = (await q(own.text, own.values))[0].n;
-        crossVisible = (await q(cross.text, cross.values))[0].n;
+        const o = (await q(own.text, own.values))[0].n;
+        let c = (await q(cross.text, cross.values))[0].n;
 
         // Reverse direction, same as rls-proof: B must not see A either.
         for (const s of buildBecomeTenant(cfg.becomeTenant, tenantB)) await query(s.text, s.values);
         const crossA = tenantRowCountSql(v.schema, v.view, v.tenantColumn, tenantA);
-        crossVisible = Math.max(crossVisible, (await q(crossA.text, crossA.values))[0].n);
-      } catch (err) {
-        if (isPermissionDenied(err)) noAccess = true;
-        else probeError = err.message;
-      }
+        c = Math.max(c, (await q(crossA.text, crossA.values))[0].n);
+        return { o, c };
+      });
+      if (probe.ok) { ownVisible = probe.out.o; crossVisible = probe.out.c; }
+      else if (isPermissionDenied(probe.err)) noAccess = true;
+      else probeError = probe.err.message;
 
       if (probeError) {
         notes.push({ where: v.id, message: `could not probe — check role/becomeTenant: ${probeError}` });

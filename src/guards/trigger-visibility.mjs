@@ -177,17 +177,35 @@ export async function check({ query, config = {} }) {
   const totals = new Map();
   const visible = new Map();
   await query('begin', []);
+  // Each count in its own savepoint. A table the role cannot read raises 42501,
+  // and without a savepoint that aborts the transaction — every later count then
+  // fails too and is recorded as "sees nothing", which reads as a finding. The
+  // service-role-only table that triggers it is in most Supabase projects.
+  const counted = async (sql) => {
+    await query('savepoint tg_c', []);
+    try {
+      const n = (await q(sql, []))[0].n;
+      await query('release savepoint tg_c', []);
+      return { ok: true, n };
+    } catch {
+      try { await query('rollback to savepoint tg_c', []); await query('release savepoint tg_c', []); }
+      catch { /* outer rollback still discards */ }
+      return { ok: false };
+    }
+  };
   try {
     for (const id of new Set(candidates.flatMap((c) => c.reads))) {
       const [schema, table] = id.split('.');
-      const sql = `select count(*)::int as n from "${schema}"."${table}"`;
-      try { totals.set(id, (await q(sql, []))[0].n); } catch { /* skip this table */ }
+      const r = await counted(`select count(*)::int as n from "${schema}"."${table}"`);
+      if (r.ok) totals.set(id, r.n); // otherwise the table is simply not compared
     }
     await query(`set local role ${role}`, []);
     for (const id of totals.keys()) {
       const [schema, table] = id.split('.');
-      try { visible.set(id, (await q(`select count(*)::int as n from "${schema}"."${table}"`, []))[0].n); }
-      catch { visible.set(id, 0); } // permission denied — it sees nothing at all
+      const r = await counted(`select count(*)::int as n from "${schema}"."${table}"`);
+      // A denial means it sees nothing, which IS the fact we are measuring; a
+      // savepoint is what keeps that from also poisoning every later count.
+      visible.set(id, r.ok ? r.n : 0);
     }
   } finally {
     try { await query('rollback', []); } catch { /* ignore */ }

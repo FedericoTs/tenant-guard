@@ -59,7 +59,8 @@ export function roleExistsSql(role) {
 export function readSurfaceSql(schema, table, role) {
   return {
     text:
-      `select has_table_privilege($1, format('%I.%I', $2::text, $3::text), 'SELECT') as can_select, ` +
+      `select (has_table_privilege($1, format('%I.%I', $2::text, $3::text), 'SELECT') or has_any_column_privilege($1, format('%I.%I', $2::text, $3::text), 'SELECT')) as can_select, ` +
+      `has_table_privilege($1, format('%I.%I', $2::text, $3::text), 'SELECT') as can_select_all, ` +
       `(select count(*)::int from ${qualified(schema, table)}) as total`,
     values: [role, schema, table],
   };

@@ -278,6 +278,28 @@ export function insertOmittedProbeSql(schema, table, column) {
   return { text: `insert into ${qualified(schema, table)} (${c}) values (NULL)`, values: [] };
 }
 
+/**
+ * Positive control — INSERT a row belonging to the acting tenant ITSELF.
+ *
+ * Every other probe here asks "can A touch B's rows". Isolation has a second
+ * failure mode and this tool only ever named the first: a policy can be too
+ * TIGHT, and that breaks the product silently. The reported shapes were a
+ * referral page rendering "A friend" and a balances screen showing blank names —
+ * an application writing rows it then cannot read.
+ *
+ * The control is conclusive because the database itself accepted the row: the
+ * WITH CHECK passed, so this row is unambiguously the acting tenant's. If a
+ * table the session CAN read does not show it, the read policy is strictly
+ * narrower than the write policy. Verified across four shapes — read gated on a
+ * column the insert ignores (row written, invisible); symmetric policies (count
+ * grows); append-only (own count 0, which is how that legitimate design is told
+ * apart); and insert refused outright (42501).
+ */
+export function insertOwnProbeSql(schema, table, column, ownTenantId) {
+  const c = quoteIdent(column);
+  return { text: `insert into ${qualified(schema, table)} (${c}) values ($1)`, values: [ownTenantId] };
+}
+
 /** Expand the becomeTenant templates into { text, values } for a tenant id. */
 export function buildBecomeTenant(templates, tenantId) {
   return templates.map((text) => ({ text, values: [tenantId] }));
@@ -333,7 +355,7 @@ export function isRlsCheckViolation(err) {
  * one entry per kind, and the caller emits a violation for each.
  * @returns {{ status:'isolated'|'leak'|'no-policy'|'insufficient-data'|'over-restrictive'|'no-access', message?:string, leaks?:Array<{kind:'read'|'write',message:string,fix:string}> }}
  */
-export function classifyTableResult({ rlsEnabled, policyCount, ownVisible, crossVisible, writeAffected = 0, insertLeaked = false, orphanLeaked = false, tenantCount, noAccess, probedWrites = false }) {
+export function classifyTableResult({ rlsEnabled, policyCount, ownVisible, crossVisible, writeAffected = 0, insertLeaked = false, orphanLeaked = false, ownInsertInvisible = false, ownInsertRejected = false, tenantCount, noAccess, probedWrites = false }) {
   if (noAccess) {
     return { status: 'no-access', message: `role cannot read this table at all (no SELECT grant) — nothing to prove` };
   }
@@ -391,6 +413,33 @@ export function classifyTableResult({ rlsEnabled, policyCount, ownVisible, cross
   if (ownVisible === 0) {
     return { status: 'over-restrictive', message: `the tenant session sees none of its own rows either — this table wasn't actually proven (not a leak). Usually the role/becomeTenant config doesn't match your policies; if your policies read a MEMBERSHIP table (org_id IN (select … where user_id = auth.uid())), the impersonated identity also needs a seeded membership row, not just a claim.` };
   }
+
+  // The positive control. Reached only when nothing leaked and the session can
+  // read its own rows — so a row it just wrote, and the database accepted,
+  // going missing is not ambiguity, it is the read policy being narrower than
+  // the write policy. `ownVisible > 0` is what separates this from a legitimate
+  // append-only table, where the session cannot read ANY row and the count is 0.
+  if (ownInsertInvisible) {
+    return {
+      status: 'write-read-asymmetry',
+      message:
+        `tenant A INSERTed a row of its OWN — the database accepted it, so the WITH CHECK passed and the row is unambiguously A's — and then could not read it back. ` +
+        `This table IS readable by A (it sees ${ownVisible} of its own rows), so the SELECT policy is strictly narrower than the INSERT policy: the application can create data it cannot then see. ` +
+        `Isolation has two failure modes and this is the quiet one — it never leaks anything, it just makes the product render blanks. Not a leak; still a bug.`,
+      fix:
+        `Make the read and write predicates agree. Usually one of them gained a condition the other never got:\n` +
+        `  - a SELECT policy filtering on a column the INSERT leaves at its DEFAULT (status, visibility, published_at) — the row is created outside the policy's window;\n` +
+        `  - a FOR ALL policy whose USING is stricter than its WITH CHECK.\n` +
+        `      If this table is intentionally append-only, it would not be reported: that shape has no readable rows at all.`,
+    };
+  }
+  if (ownInsertRejected) {
+    return {
+      status: 'isolated',
+      message: `isolated — and note that tenant A could not INSERT a row of its own (the WITH CHECK refused it). Fine for a read-only or service-written table; a bug if the application is supposed to write here.`,
+    };
+  }
+
   return {
     status: 'isolated',
     message: probedWrites
@@ -615,6 +664,40 @@ export async function prove({ query, config = {} }) {
       }
     };
 
+    // POSITIVE CONTROL — insert a row belonging to the acting tenant ITSELF and
+    // check it can be read back. Every other probe asks "can A touch B's rows";
+    // this asks whether A can still see its own, which is the failure mode that
+    // breaks a product rather than leaking it.
+    //
+    // Anything that is not a clean yes/no answers 'inconclusive'. A NOT NULL
+    // column, a foreign key, a unique constraint or a missing sequence grant all
+    // stop the insert for reasons that say nothing about policy, and reporting
+    // those as findings would make the control worthless.
+    const probeOwnInsert = async (insSql, insValues, ownCountSql, ownCountValues) => {
+      await query('savepoint tg_own', []);
+      const undo = async () => {
+        try { await query('rollback to savepoint tg_own', []); await query('release savepoint tg_own', []); }
+        catch { /* ignore */ }
+      };
+      try {
+        const before = (await q(ownCountSql, ownCountValues))[0].n;
+        const res = await query(insSql, insValues);
+        const affected = res.rowCount ?? res.affectedRows ?? 0;
+        if (affected < 1) { await undo(); return { outcome: 'rejected' }; }
+        const after = (await q(ownCountSql, ownCountValues))[0].n;
+        await undo();
+        // The row was accepted, so the WITH CHECK passed and it is this tenant's.
+        // If the own-row count did not grow, the SELECT policy cannot see a row
+        // the INSERT policy just allowed.
+        return after > before ? { outcome: 'visible' } : { outcome: 'invisible' };
+      } catch (err) {
+        await undo();
+        if (isRlsCheckViolation(err)) return { outcome: 'rejected' }; // WITH CHECK refused its own tenant
+        if (/permission denied for (table|relation|view)/i.test(err.message || '')) return { outcome: 'rejected' };
+        return { outcome: 'inconclusive', reason: err.message };
+      }
+    };
+
     // OMITTED-tenant probe — insert a row with the tenant column NULL and see if
     // the acting tenant can then READ it. Delta logic is INVERTED vs probeInsert:
     // here own-count GROWING means the orphan is visible to this session (and so
@@ -727,6 +810,7 @@ export async function prove({ query, config = {} }) {
       let writeAffected = 0;
       const insertOutcomes = [];
       const orphanOutcomes = [];
+      let ownInsert = null;
       try {
         // become tenant A: read own + the other tenant's rows, then try to write theirs
         for (const s of buildBecomeTenant(cfg.becomeTenant, tenantA)) await query(s.text, s.values);
@@ -756,6 +840,10 @@ export async function prove({ query, config = {} }) {
           const oA = insertOmittedProbeSql(t.schema, t.table, t.tenantColumn);
           const ownAllA = tenantOwnVisibleSql(t.schema, t.table);
           orphanOutcomes.push(await probeInsertOmitted(oA.text, oA.values, ownAllA.text, ownAllA.values, t.tenantColumn));
+          // (5) The positive control, tenant A only — one direction is enough,
+          // and running both would report the same policy asymmetry twice.
+          const ownIns = insertOwnProbeSql(t.schema, t.table, t.tenantColumn, tenantA);
+          ownInsert = await probeOwnInsert(ownIns.text, ownIns.values, ownCntA.text, ownCntA.values);
         }
 
         // reverse direction: become tenant B, check reading/writing A's rows
@@ -801,7 +889,7 @@ export async function prove({ query, config = {} }) {
       const orphanLeaked = orphanOutcomes.some((o) => o.outcome === 'leak');
       const insertInconclusive = !insertLeaked && !orphanLeaked &&
         (insertOutcomes.find((o) => o.outcome === 'inconclusive') || orphanOutcomes.find((o) => o.outcome === 'inconclusive'));
-      const verdict = classifyTableResult({ rlsEnabled: t.rlsEnabled, policyCount: t.policyCount, ownVisible, crossVisible, writeAffected, insertLeaked, orphanLeaked, tenantCount: t.tenants.length, noAccess, probedWrites });
+      const verdict = classifyTableResult({ rlsEnabled: t.rlsEnabled, policyCount: t.policyCount, ownVisible, crossVisible, writeAffected, insertLeaked, orphanLeaked, ownInsertInvisible: ownInsert?.outcome === 'invisible', ownInsertRejected: ownInsert?.outcome === 'rejected', tenantCount: t.tenants.length, noAccess, probedWrites });
       const tbl = qualified(t.schema, t.table);
       // An otherwise-clean table whose insert path we couldn't exercise: say so,
       // so a green result never overclaims "no write can cross tenants".

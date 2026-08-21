@@ -55,6 +55,7 @@ These are checked *before* any isolation claim.
 | 1.5 | Probe role **owns the table**, `FORCE ROW LEVEL SECURITY` off → owner bypasses RLS *for that table only* | ✅ | per-table owner check; the canary **cannot** catch this (it isn't owned by the app role), so it's checked from `pg_class.relowner`/`relforcerowsecurity` and reported as **not proven** with the exact `ALTER TABLE … FORCE ROW LEVEL SECURITY` fix |
 | 1.6 | RLS on, **zero policies** → deny-all that *looks* isolated | ✅ | reported as `no policy`, never as a pass |
 | 1.7 | Table sees none of its own rows (misconfigured `becomeTenant`/claim) | ✅ | reported as `over-restrictive` — "not proven", never a pass |
+| 1.9 | **Over-restriction**: the policy is too TIGHT — the app writes rows it cannot read back | ✅ | `rls-proof` positive control. Isolation has two failure modes and this tool only named one; a policy that is too tight never leaks anything and still breaks the product (reported symptoms: a referral page rendering "A friend", a balances screen showing blank names). Conclusive because the DATABASE accepted the row — the `WITH CHECK` passed, so it is unambiguously the acting tenant's; if a table the session CAN read does not show it, the `SELECT` policy is strictly narrower than the `INSERT` policy. The usual cause is a read policy filtering on a column the insert leaves at its DEFAULT. An append-only table is told apart by having no readable rows at all, and a NOT NULL/unique/FK failure answers *inconclusive* rather than reporting anything |
 | 1.8 | Claim GUC set in a shape the app's `auth.uid()` doesn't read | 🟡 | surfaces as 1.7 (not a false pass), but the diagnosis could name the mismatch explicitly |
 
 ## 2. Read path
@@ -209,7 +210,7 @@ callable GUC-setting definer functions, 4.7 partitions, 3.9 TRUNCATE (0.10.0);
 inside them (0.16.0–0.17.0); 4.9 shadow tables, 7.1 role capabilities (0.18.0);
 2.14 schema-per-tenant (0.19.0); 6.1 session-scoped tenant GUCs (0.21.0);
 7.2 inherited default privileges (0.22.0); 3.11 cross-tenant foreign keys (0.23.0); 7.3 CREATE grants (0.24.0);
-2.15 untenanted sensitive columns (0.31.0); 4.11 pinned-but-writable search_path (0.32.0).*
+2.15 untenanted sensitive columns (0.31.0); 4.11 pinned-but-writable search_path (0.32.0); 1.9 over-restriction positive control (0.33.0).*
 
 *Three of these are worth learning from. **4.7** was a false NEGATIVE in the
 flagship guard, found by writing the failure surface down rather than by waiting

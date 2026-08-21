@@ -107,7 +107,7 @@ tenant-guard  â€” guard tests for multi-tenant isolation
 
 | Guard | Fails when… | Why a scanner misses it |
 |---|---|---|
-| `rls-proof` | a tenant's session can actually read **or write** another tenant's rows | it isn't reading source at all — it runs real queries as your app role (SELECT, plus `UPDATE`/`DELETE`/tenant-hop/`INSERT`/omitted-tenant probes) and measures the leak; nothing static can prove isolation *holds*, and RLS is per-command so reads passing says nothing about writes |
+| `rls-proof` | a tenant's session can actually read **or write** another tenant's rows | it isn't reading source at all — it runs real queries as your app role (SELECT, plus `UPDATE`/`DELETE`/tenant-hop/`INSERT`/omitted-tenant probes) and measures the leak; nothing static can prove isolation *holds*, and RLS is per-command so reads passing says nothing about writes. Also runs a **positive control**: isolation has two failure modes and most tools name one. A policy that is too TIGHT never leaks and still breaks the product — so the guard inserts a row belonging to the acting tenant and checks it can read it back. Conclusive, because the database accepted the row: if a table it CAN read does not show it, the read policy is narrower than the write policy. |
 | `rls-drift` | the database has RLS enabled or a policy that **no migration declares** | catches security posture applied by hand in the dashboard/psql — invisible to code review, absent from CI, changeable with no diff or history |
 
 **Runtime — who can reach your data:**

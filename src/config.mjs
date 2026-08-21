@@ -143,7 +143,7 @@ export function resolveViewIsolationConfig(config) {
 export function resolveIdentityTrustConfig(config) {
   const i = config.identityTrust ?? {};
   const out = {};
-  for (const k of ['url', 'urlEnv', 'schemas', 'tenantColumns', 'role', 'becomeTenant', 'claim', 'allowlist']) {
+  for (const k of ['url', 'urlEnv', 'schemas', 'tenantColumns', 'authorizationColumns', 'role', 'becomeTenant', 'claim', 'allowlist']) {
     if (i[k] !== undefined) out[k] = i[k];
   }
   // Identity is inherited from rlsProof so it is configured once.

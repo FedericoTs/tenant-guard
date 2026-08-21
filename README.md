@@ -105,7 +105,7 @@ tenant-guard  — guard tests for multi-tenant isolation
 | `anon-reads` | the **anonymous** role can SELECT a **tenant** table, view, or materialized view | the CVE-2025-48757 class — the public anon key reads every tenant's data with no login; scoped to objects with a tenant column so public content isn't flagged, and it *probes* as `anon` so it evaluates the real policy, not just the grant |
 | `anon-writes` | the **anonymous** role can INSERT/UPDATE/DELETE a table | a table with no tenant column, writable by `anon`, is neither a tenant leak nor drift — it's the cache-poisoning class; it proves the real `USING`/`WITH CHECK` by probing, so it doesn't false-flag `TO public USING (auth.uid()…)` policies |
 | `definer-rpc` | a `SECURITY DEFINER` **RPC** hands out another tenant's rows, **or lets a caller inject SQL that runs as its owner** | the purest form of "the policy exists but the access path around it doesn't": a definer function runs as its **owner**, so it bypasses RLS on everything it touches, and PostgREST exposes it at `/rest/v1/rpc/<name>`. A function that doesn't re-filter by tenant — or that trusts a tenant id the **caller passes in** — routes around flawless policies, and every table-level check still reports green. It also reads the body for **SQL injection** (a parameter concatenated into `EXECUTE`, or passed through `format()`'s `%s`) — injected SQL runs as the *owner*, so it bypasses RLS wholesale — and for an unpinned `search_path`. Only `STABLE`/`IMMUTABLE` functions are ever *called*: Postgres guarantees those cannot write |
-| `identity-trust` | the caller can **forge the identity** your policies authorize from, or **write the thing that grants it** | every other guard asks "given a correct identity, is the data scoped?" — this asks whether the identity itself is controllable. A policy reading `user_metadata` (which the *user* can rewrite) is defeated by forging that claim; a callable `SECURITY DEFINER` that sets your tenant GUC from an argument is a "become any tenant" primitive; a `memberships` table the caller can write makes a *flawless* policy bypassable; and because **RLS is row-level and cannot restrict columns**, a correct `USING (id = auth.uid())` self-update policy still lets a user set their own `role` or re-parent their `organization_id` |
+| `identity-trust` | the caller can **forge the identity** your policies authorize from, or **write the thing that grants it** | every other guard asks "given a correct identity, is the data scoped?" — this asks whether the identity itself is controllable. A policy reading `user_metadata` (which the *user* can rewrite) is defeated by forging that claim; a callable `SECURITY DEFINER` that sets your tenant GUC from an argument is a "become any tenant" primitive; a `memberships` table the caller can write makes a *flawless* policy bypassable; and — the one most apps have — **a user can make themselves an admin**: because **RLS is row-level and cannot restrict columns**, the textbook-correct `USING (id = auth.uid()) WITH CHECK (id = auth.uid())` self-update policy pins *which rows* you may touch and says nothing about *which columns*, so `update profiles set is_admin = true where id = me` succeeds. Checked on every table with an update policy — including when the flag is read by a policy on that same table, or by nothing in the database at all because your application checks it. A column-level `GRANT` is the only real fix, and the guard recognises one as such |
 | `pooler-bleed` | the tenant identity **outlives the request that set it** | the only guard that has to read the database *and* your source, which is why this one goes unnoticed: the catalog says which custom GUC your policies authorize from, the source says whether you set it with `is_local = false` or a bare `SET` — which lasts for the whole **connection**. On a pooled connection the next request inherits the previous tenant and the policy hands over their rows **working exactly as designed**. Run one request and isolation is perfect, which is why every other check here passes: the leak exists only *between* requests |
 
 **Runtime — the surfaces that aren't base tables:**
@@ -277,6 +277,38 @@ from an argument is a "become any tenant" primitive; a membership table you can
 write makes a correct policy bypassable; and a self-update policy still lets you
 rewrite the `role` column that grants your access, because **RLS cannot restrict
 columns** — only a column-level `GRANT` can.
+
+That last one is worth spelling out, because it is the one most applications
+have and the one that looks correct in review:
+
+```sql
+-- The policy is right. Everyone reviews this and moves on.
+CREATE POLICY self ON profiles FOR UPDATE
+  USING (id = auth.uid()) WITH CHECK (id = auth.uid());
+
+-- And then:
+UPDATE profiles SET is_admin = true WHERE id = auth.uid();   -- succeeds
+```
+
+RLS decides *which rows* you may touch. It has nothing to say about *which
+columns*, so a policy that correctly confines you to your own row does not stop
+you rewriting the field that grants your access. The guard checks every table
+carrying an update policy — including when the flag is read by a policy on that
+same table, or by **nothing in the database at all** because your application is
+what checks it — and grades accordingly: a tenant column or a column some policy
+reads **fails the build**; a column merely *named* like an authorization field
+(`is_admin`, `role`, `plan`, …) that no policy reads is a **note**, since SQL
+cannot see whether your app treats it as one. Add your own names with
+`identityTrust.authorizationColumns`. The fix it gives is the only one that
+works:
+
+```sql
+REVOKE UPDATE ON profiles FROM authenticated;
+GRANT UPDATE (display_name, avatar_url) ON profiles TO authenticated;
+```
+
+and once that grant is in place the guard goes quiet, because the column really
+is unwritable.
 
 **`views`, `storage`, `realtime` — the surfaces that aren't base tables.** A view
 runs with its *owner's* rights unless `security_invoker` is set; a materialized

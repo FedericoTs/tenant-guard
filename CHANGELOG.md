@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.25.1
+
+Documents the self-escalation check properly, and fixes a config option that
+could not be set.
+
+- **fix: `identityTrust.authorizationColumns` was unreachable.** The list of
+  column names that mean "this decides access" (`role`, `is_admin`, `plan`, …)
+  was in the guard's `DEFAULTS` but missing from the config resolver — so if your
+  admin column is called `account_type` or `permission_level`, you could write it
+  in `tenant-guard.config.json`, nothing would complain, and it would have no
+  effect. Found while documenting it.
+
+- **test: `config-reachability.test.mjs` walks EVERY guard** and asserts each
+  `DEFAULTS` key survives its resolver, plus a check that no guard escapes the
+  walk. Each resolver is a hand-written key allowlist, so this failure is a
+  property of the pattern rather than of one guard; the audit found exactly one
+  other candidate (`route-org-scoping`, configured through the shared static
+  resolver) and it was already correct.
+
+- **docs: the README now spells out the escalation case** rather than leaving it
+  as the last clause of a long table row — with the SQL, because the policy looks
+  right and that is the whole problem:
+
+  ```sql
+  CREATE POLICY self ON profiles FOR UPDATE
+    USING (id = auth.uid()) WITH CHECK (id = auth.uid());   -- reviewed, approved
+  UPDATE profiles SET is_admin = true WHERE id = auth.uid(); -- succeeds
+  ```
+
+  It states what is checked (every table with an update policy, including when
+  the flag is read by a policy on that same table or by nothing in the database
+  at all), the three severity tiers, the `authorizationColumns` knob, and that a
+  column-level `GRANT` is both the fix and something the guard recognises.
+
+- docs: the guard's own description, the annotated example config and
+  `tenant-guard init` all updated to match.
+- 551 tests (was 531), 20 guards.
+
 ## 0.25.0
 
 Fixes a coverage gap in `identity-trust` that the documentation did not have:

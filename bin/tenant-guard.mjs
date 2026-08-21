@@ -414,9 +414,15 @@ if (cmd === 'init') {
     },
     identityTrust: {
       // Asks whether the caller can FORGE the identity your policies authorize
-      // from: user-writable JWT claims (user_metadata), or a callable SECURITY
-      // DEFINER function that sets the tenant GUC from an argument. Identity
-      // config is inherited from rlsProof unless set here.
+      // from: user-writable JWT claims (user_metadata), a callable SECURITY
+      // DEFINER function that sets the tenant GUC from an argument, and — the
+      // one most apps have — an admin flag a user can set on their OWN row.
+      // RLS is ROW-level: a correct self-update policy pins which ROWS you may
+      // touch and says nothing about which COLUMNS, so
+      //   update profiles set is_admin = true where id = me
+      // succeeds. Only a column-level GRANT stops it. Add your own column names
+      // here if they aren't in the default list.
+      //"authorizationColumns": ["role", "is_admin", "access_level"],
       schemas: ['public'],
       allowlist: [], // "schema.policyname" / "schema.table" / "schema.function"
     },

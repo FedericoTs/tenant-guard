@@ -70,7 +70,7 @@ import {
 export const meta = {
   id: 'identity-trust',
   title: 'What your policies trust for identity (forgeable-identity escalation)',
-  why: 'Asks the question every other check assumes away: can the caller forge the identity your policies authorize from? Flags user-writable JWT claims (user_metadata), callable SECURITY DEFINER functions that set the tenant GUC from an argument, membership/junction tables that policies derive authority from but the caller can write (a self-grant into any tenant), and authorization columns writable on your own row (RLS is row-level and cannot restrict columns).',
+  why: 'Asks the question every other check assumes away: can the caller forge the identity your policies authorize from? Flags user-writable JWT claims (user_metadata), callable SECURITY DEFINER functions that set the tenant GUC from an argument, membership tables that policies derive authority from but the caller can write (a self-grant into any tenant), and — the one people hit most — an admin flag a user can set on their OWN row: RLS is ROW-level, so a textbook-correct self-update policy pins which rows you may touch and says nothing about which columns, and only a column-level GRANT can.',
 };
 
 export const DEFAULTS = {

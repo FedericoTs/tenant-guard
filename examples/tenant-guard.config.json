@@ -61,8 +61,10 @@
   },
 
   "identityTrust": {
-    "//": "Runtime. Can the caller FORGE the identity your policies authorize from? Flags user_metadata used for authorization, a callable SECURITY DEFINER that sets the tenant GUC from an argument, a membership table the caller can write, and authorization columns writable on your own row. Inherits role/becomeTenant/claim from rlsProof.",
+    "//": "Runtime. Can the caller FORGE the identity your policies authorize from? Flags user_metadata used for authorization, a callable SECURITY DEFINER that sets the tenant GUC from an argument, a membership table the caller can write, and \u2014 the one most apps have \u2014 an admin flag a user can set on their OWN row. RLS is ROW-level: a correct self-update policy pins which ROWS you may touch and says nothing about which COLUMNS, so `update profiles set is_admin = true where id = me` succeeds. Only a column-level GRANT stops it, and this recognises one. Inherits role/becomeTenant/claim from rlsProof.",
     "schemas": ["public"],
+    "//authorizationColumns": "Column names that decide access in YOUR app, if they are not in the default list (role, roles, user_role, is_admin, is_superadmin, is_staff, is_owner, admin, permissions, scopes, access_level, plan, tier). A column no policy reads is reported as a note \u2014 the database does not treat it as a boundary, but the name says you do.",
+    "authorizationColumns": ["role", "is_admin", "plan"],
     "allowlist": []
   },
 

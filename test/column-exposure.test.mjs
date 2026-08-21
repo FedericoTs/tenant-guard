@@ -96,8 +96,11 @@ test('probeSql quotes identifiers rather than interpolating them raw', () => {
 });
 
 test('readableColumns keeps only the columns that returned a value', () => {
+  // Aliases are POSITIONAL (c0, c1, …), not derived from the column name:
+  // `n_<column>` overflowed Postgres 63-byte identifier limit on a long name and
+  // was silently truncated, so the lookup missed and a real exposure read clean.
   const cols = [{ column: 'email', kind: 'pii' }, { column: 'phone', kind: 'pii' }];
-  assert.deepEqual(readableColumns({ n_email: 3, n_phone: 0 }, cols).map((c) => c.column), ['email']);
+  assert.deepEqual(readableColumns({ c0: 3, c1: 0 }, cols).map((c) => c.column), ['email']);
   assert.deepEqual(readableColumns(null, cols), []);
 });
 

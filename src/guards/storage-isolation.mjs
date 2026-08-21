@@ -146,7 +146,7 @@ export function uploadProbeSql() {
  * Verdict for one bucket.
  * @returns {{status:'leak'|'isolated'|'insufficient-data'|'no-access', kind?:string, message?:string, fix?:string}}
  */
-export function classifyBucket({ bucket, isPublic, tenantFolders, crossVisible, uploadedIntoOther, ownUploadWorked, noAccess, role = 'authenticated' }) {
+export function classifyBucket({ bucket, isPublic, tenantFolders, crossVisible, ownVisible = null, uploadedIntoOther, ownUploadWorked, noAccess, role = 'authenticated' }) {
   if (isPublic && tenantFolders >= 2) {
     return {
       status: 'leak',
@@ -182,6 +182,20 @@ export function classifyBucket({ bucket, isPublic, tenantFolders, crossVisible, 
         `        CREATE POLICY tenant_write ON storage.objects FOR INSERT\n` +
         `          WITH CHECK (bucket_id = '${bucket}' AND (storage.foldername(name))[1] = <the caller's tenant>);\n` +
         `      Add matching UPDATE/DELETE policies, or a user can move and remove other tenants' objects too.`,
+    };
+  }
+  // The control arm. Seeing zero of ANOTHER tenant's objects proves isolation
+  // only if this session could see its OWN — otherwise it saw nothing at all and
+  // "proven isolated" is a claim about a probe that never ran. The write path
+  // already had this check (`ownUploadWorked`); the read path did not, so a
+  // misconfigured becomeTenant/role reported N/N proven. A note, not a
+  // violation: it stops the guard claiming proof, without crying wolf.
+  if (ownVisible === 0) {
+    return {
+      status: 'not-proven',
+      message:
+        `bucket "${bucket}": the impersonated session listed 0 objects in its OWN tenant folder as well as 0 in the other tenant's, so nothing was actually compared — this bucket is NOT proven isolated. ` +
+        `Usually the storageIsolation.becomeTenant/role config does not match your storage policies, or the seeded folders hold no objects.`,
     };
   }
   return { status: 'isolated', ownUploadWorked };
@@ -286,6 +300,7 @@ export async function check({ query, config = {} }) {
 
       let noAccess = false;
       let crossVisible = 0;
+      let ownVisible = null;
       let uploadedIntoOther = false;
       let ownUploadWorked = false;
       let probeError = null;
@@ -294,6 +309,8 @@ export async function check({ query, config = {} }) {
         for (const s of buildBecomeTenant(cfg.becomeTenant, folderA)) await query(s.text, s.values);
         const cnt = folderObjectCountSql(seg);
         crossVisible = (await q(cnt.text, [b.id, folderB]))[0].n;
+        // …and inside its OWN, which is what makes a zero above mean anything.
+        ownVisible = (await q(cnt.text, [b.id, folderA]))[0].n;
 
         // Reverse direction.
         for (const s of buildBecomeTenant(cfg.becomeTenant, folderB)) await query(s.text, s.values);
@@ -320,7 +337,7 @@ export async function check({ query, config = {} }) {
         continue;
       }
 
-      const verdict = classifyBucket({ bucket: b.id, isPublic, tenantFolders, crossVisible, uploadedIntoOther, ownUploadWorked, noAccess, role });
+      const verdict = classifyBucket({ bucket: b.id, isPublic, tenantFolders, crossVisible, ownVisible, uploadedIntoOther, ownUploadWorked, noAccess, role });
       if (verdict.status === 'leak') {
         violations.push({ where: `storage.objects (bucket "${b.id}")`, kind: verdict.kind, message: verdict.message, fix: verdict.fix, crossVisible });
       } else if (verdict.status === 'isolated') {

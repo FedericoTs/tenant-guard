@@ -220,11 +220,16 @@ export async function check({ query, config = {} }) {
 
     if (hidden.length) violations.push(classifyTrigger({ trigger: c, hidden, role }));
     else {
+      // An EMPTY table makes the comparison vacuous: 0 < 0 is false, so it fell
+      // into the reassurance branch and asserted "sees every row, nothing is
+      // being missed" — on a table where nothing was compared. Say which it is.
+      const empty = c.reads.every((id) => (totals.get(id) ?? 0) === 0);
       notes.push({
         where: `${c.schema}.${c.table} (trigger "${c.trigger}")`,
-        message:
-          `trigger "${c.trigger}" enforces a rule by reading ${c.reads.join(', ')}, which has RLS on, and its function is not SECURITY DEFINER — so it evaluates against whatever the writing role can see. ` +
-          `Right now "${role}" sees every row, so nothing is being missed; the day a policy narrows that table this check starts passing silently. Not a finding, and worth knowing before it becomes one.`,
+        message: empty
+          ? `trigger "${c.trigger}" enforces a rule by reading ${c.reads.join(', ')}, which has RLS on, and its function is not SECURITY DEFINER — so it evaluates against whatever the writing role can see. That table is EMPTY, so nothing could be compared and this is NOT proven either way. Seed it, or re-run against a database with data.`
+          : `trigger "${c.trigger}" enforces a rule by reading ${c.reads.join(', ')}, which has RLS on, and its function is not SECURITY DEFINER — so it evaluates against whatever the writing role can see. ` +
+            `Right now "${role}" sees every row, so nothing is being missed; the day a policy narrows that table this check starts passing silently. Not a finding, and worth knowing before it becomes one.`,
       });
     }
   }

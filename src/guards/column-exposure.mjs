@@ -138,7 +138,11 @@ export function planRelations(rows, { tenantColumns, allowlist = [] } = {}) {
  */
 export function probeSql(rel, columns, limit) {
   const q = (s) => `"${String(s).replace(/"/g, '""')}"`;
-  const counts = columns.map((c) => `count(${q(c.column)})::int as ${q(`n_${c.column}`)}`).join(', ');
+  // Aliased POSITIONALLY, not by column name. An identifier over 63 bytes is
+  // silently truncated by Postgres, so `n_<a 62-character column>` came back
+  // under a different key, the lookup missed, and a real exposure read as clean.
+  // Verified with a 64-character column name: ok=true, zero violations.
+  const counts = columns.map((c, i) => `count(${q(c.column)})::int as c${i}`).join(', ');
   const cols = columns.map((c) => q(c.column)).join(', ');
   return `select ${counts} from (select ${cols} from ${q(rel.schema)}.${q(rel.table)} limit ${Number(limit) || 500}) s`;
 }
@@ -146,7 +150,7 @@ export function probeSql(rel, columns, limit) {
 /** Which of the probed columns actually returned a value. */
 export function readableColumns(row, columns) {
   if (!row) return [];
-  return columns.filter((c) => Number(row[`n_${c.column}`] ?? 0) > 0);
+  return columns.filter((c, i) => Number(row[`c${i}`] ?? 0) > 0);
 }
 
 // ── verdicts ─────────────────────────────────────────────────────────
@@ -190,6 +194,20 @@ export async function check({ query, config = {} }) {
   const cfg = { ...DEFAULTS, ...config };
   const role = safeRole(cfg.role);
   const q = async (text, values) => (await query(text, values)).rows;
+
+  // A skip is not a pass. With no such role every `set local role` throws, the
+  // per-relation catch turns that into "not reachable", and the guard returned a
+  // confident green — "N untenanted relation(s) probed, nothing readable" — on a
+  // database where nothing was probed at all. Verified. The two sibling guards
+  // already precheck this.
+  const roleRows = (await q(`select 1 from pg_catalog.pg_roles where rolname = $1`, [role]));
+  if (roleRows.length === 0) {
+    return OK({
+      skipped: true,
+      reason: `role "${role}" does not exist — set columnExposure.role to your unauthenticated role`,
+      summary: `skipped — no "${role}" role`,
+    });
+  }
 
   const intro = columnsSql(cfg.schemas);
   const { plan, handedOff } = planRelations(await q(intro.text, intro.values), {

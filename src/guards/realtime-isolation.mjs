@@ -238,7 +238,15 @@ export async function check({ query, config = {} }) {
     return { id: meta.id, ok: false, violations, notes, scanned: 1, summary: '1 realtime isolation issue (RLS is off on realtime.messages)' };
   }
   if (policyCount === 0) {
+    // "RLS on with no policy denies everything" is true only for a role that is
+    // SUBJECT to RLS. Returning here skipped the identity canary below, so a
+    // configured role that bypasses RLS — a superuser, BYPASSRLS, or the table
+    // owner — got a green verdict asserting a denial that does not apply to it.
     notes.push({ where: 'realtime.messages', message: classifyRealtime({ rlsEnabled: true, policyCount: 0, role }).message });
+    notes.push({
+      where: `role "${role}"`,
+      message: `this verdict is read from the catalog, not probed. It holds only if "${role}" is subject to RLS — a superuser, a BYPASSRLS role, or the owner of realtime.messages reads it regardless of the policy count. Confirm the configured role is the one your clients actually connect as.`,
+    });
     return { id: meta.id, ok: true, violations, notes, scanned: 1, summary: 'realtime.messages has RLS but no policy — broadcast is denied, not secured (see notes)' };
   }
 

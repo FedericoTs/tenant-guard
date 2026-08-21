@@ -28,13 +28,14 @@ import * as createGrants from './guards/create-grants.mjs';
 import * as updatableViews from './guards/updatable-view-writethrough.mjs';
 import * as mfaEnforcement from './guards/mfa-enforcement.mjs';
 import * as columnExposure from './guards/column-exposure.mjs';
-import { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig, resolveStorageConfig, resolveOraclesConfig, resolveRealtimeConfig, resolveDefinerRpcConfig, resolveShadowConfig, resolveCapabilitiesConfig, resolveSchemaTenancyConfig, resolvePoolerBleedConfig, resolveDefaultPrivilegesConfig, resolveCrossTenantFkConfig, resolveCreateGrantsConfig, resolveMfaEnforcementConfig, resolveColumnExposureConfig } from './config.mjs';
+import * as triggerVisibility from './guards/trigger-visibility.mjs';
+import { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig, resolveStorageConfig, resolveOraclesConfig, resolveRealtimeConfig, resolveDefinerRpcConfig, resolveShadowConfig, resolveCapabilitiesConfig, resolveSchemaTenancyConfig, resolvePoolerBleedConfig, resolveDefaultPrivilegesConfig, resolveCrossTenantFkConfig, resolveCreateGrantsConfig, resolveMfaEnforcementConfig, resolveColumnExposureConfig, resolveTriggerVisibilityConfig } from './config.mjs';
 
 // The static guards: synchronous, zero-dependency, no database. These are what
 // `tenant-guard run` executes and what a project's vitest/jest suite imports.
 export const GUARDS = [migrationCollisions, definerGrants, routeOrgScoping, updatableViews];
 
-export { migrationCollisions, definerGrants, routeOrgScoping, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation, definerRpc, shadowTables, roleCapabilities, schemaTenancy, poolerBleed, defaultPrivileges, crossTenantFk, createGrants, updatableViews, mfaEnforcement, columnExposure };
+export { migrationCollisions, definerGrants, routeOrgScoping, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation, definerRpc, shadowTables, roleCapabilities, schemaTenancy, poolerBleed, defaultPrivileges, crossTenantFk, createGrants, updatableViews, mfaEnforcement, columnExposure, triggerVisibility };
 export { prove } from './guards/rls-proof.mjs';
 export { drift } from './guards/rls-drift.mjs';
 export { check as checkAnonWrites } from './guards/anon-writes.mjs';
@@ -169,7 +170,7 @@ export async function runRealtime(cwd = process.cwd()) {
  */
 export async function runEverything(cwd = process.cwd()) {
   const results = runAll(cwd);
-  for (const fn of [runProof, runDrift, runAnonReads, runAnonWrites, runViews, runIdentity, runDefinerRpc, runShadowTables, runCapabilities, runSchemaTenancy, runPoolerBleed, runDefaultPrivileges, runCrossTenantFk, runCreateGrants, runMfaEnforcement, runColumnExposure, runStorage, runOracles, runRealtime]) {
+  for (const fn of [runProof, runDrift, runAnonReads, runAnonWrites, runViews, runIdentity, runDefinerRpc, runShadowTables, runCapabilities, runSchemaTenancy, runPoolerBleed, runDefaultPrivileges, runCrossTenantFk, runCreateGrants, runMfaEnforcement, runColumnExposure, runTriggerVisibility, runStorage, runOracles, runRealtime]) {
     results.push(await fn(cwd));
   }
   return results;
@@ -283,4 +284,15 @@ export async function runMfaEnforcement(cwd = process.cwd()) {
 export async function runColumnExposure(cwd = process.cwd()) {
   const config = loadConfig(cwd);
   return columnExposure.run(resolveColumnExposureConfig(config));
+}
+
+/**
+ * Run the trigger-visibility check (async; needs a database URL + `pg`).
+ * A trigger function runs as the INVOKER unless declared SECURITY DEFINER, so a
+ * rule it enforces by reading an RLS-protected table is evaluated against
+ * whatever the writing role can see — and silently starts passing.
+ */
+export async function runTriggerVisibility(cwd = process.cwd()) {
+  const config = loadConfig(cwd);
+  return triggerVisibility.run(resolveTriggerVisibilityConfig(config));
 }

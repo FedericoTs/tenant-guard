@@ -37,6 +37,7 @@ const GUARD_CONFIGS = [
   ['createGrants', tg.createGrants, cfg.resolveCreateGrantsConfig],
   ['mfaEnforcement', tg.mfaEnforcement, cfg.resolveMfaEnforcementConfig],
   ['columnExposure', tg.columnExposure, cfg.resolveColumnExposureConfig],
+  ['triggerVisibility', tg.triggerVisibility, cfg.resolveTriggerVisibilityConfig],
 ];
 
 for (const [block, mod, resolve] of GUARD_CONFIGS) {

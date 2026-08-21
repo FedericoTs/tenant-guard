@@ -432,6 +432,22 @@ export function resolveColumnExposureConfig(config) {
   return out;
 }
 
+/** Resolve the trigger-visibility config from the user's `triggerVisibility` block. */
+export function resolveTriggerVisibilityConfig(config) {
+  const m = config.triggerVisibility ?? {};
+  const out = {};
+  for (const k of ['url', 'urlEnv', 'role', 'schemas', 'allowlist']) {
+    if (m[k] !== undefined) out[k] = m[k];
+  }
+  // The role is the one whose writes fire the trigger, so it follows rlsProof's
+  // app role rather than the anonymous one.
+  const p = config.rlsProof ?? {};
+  for (const k of ['role', 'schemas']) {
+    if (out[k] === undefined && p[k] !== undefined) out[k] = p[k];
+  }
+  return out;
+}
+
 /** Resolve the MFA-enforcement config from the user's `mfaEnforcement` block. */
 export function resolveMfaEnforcementConfig(config) {
   const m = config.mfaEnforcement ?? {};

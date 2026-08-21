@@ -15,12 +15,12 @@
 import { writeFileSync, appendFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import {
-  GUARDS, runAll, runColumnExposure, runProof, runDrift, runAnonWrites, runAnonReads, runViews, runIdentity,
+  GUARDS, runAll, runColumnExposure, runTriggerVisibility, runProof, runDrift, runAnonWrites, runAnonReads, runViews, runIdentity,
   runStorage, runOracles, runRealtime, runDefinerRpc, runShadowTables, runCapabilities,
   runSchemaTenancy, runPoolerBleed, runDefaultPrivileges, runCrossTenantFk, runCreateGrants, runMfaEnforcement, runEverything,
 } from '../src/index.mjs';
 import {
-  rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, columnExposure,
+  rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, columnExposure, triggerVisibility,
   constraintOracles, realtimeIsolation, definerRpc, shadowTables, roleCapabilities, schemaTenancy,
   poolerBleed, defaultPrivileges, crossTenantFk, createGrants, mfaEnforcement,
 } from '../src/index.mjs';
@@ -35,7 +35,7 @@ const ALL_GUARDS = [
   ...GUARDS, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust,
   storageIsolation, constraintOracles, realtimeIsolation, definerRpc, shadowTables,
   roleCapabilities, schemaTenancy, poolerBleed, defaultPrivileges, crossTenantFk,
-  createGrants, mfaEnforcement, columnExposure,
+  createGrants, mfaEnforcement, columnExposure, triggerVisibility,
 ];
 
 /**
@@ -63,6 +63,7 @@ const RUNTIME_COMMANDS = {
   creates: { fn: runCreateGrants, needs: 'migrated' },
   mfa: { fn: runMfaEnforcement, needs: 'migrated' },
   columns: { fn: runColumnExposure, needs: 'any' },
+  triggers: { fn: runTriggerVisibility, needs: 'seeded' },
   all: { fn: runEverything, needs: 'seeded', many: true },
 };
 
@@ -150,6 +151,7 @@ ${bold('COMMANDS')}
   rpc            a SECURITY DEFINER function routes around RLS
   views          a view or materialized view leaks across tenants
   columns        sensitive columns an anonymous visitor actually reads
+  triggers       triggers enforcing a rule over rows RLS hides from them
   storage        Supabase Storage paths leak across tenant folders
   realtime       Realtime channels leak across tenants
   schemas        one role reaches more than one tenant SCHEMA

@@ -120,6 +120,8 @@ The highest-severity blind spot of any table-only scanner.
 
 | 4.12 | **Effective** write grants on a VIEW that already exists — not what a new object would inherit | ✅ | `anon-writes` (runtime) alongside `updatable-view-writethrough` (static). The static half reads migrations; this reads what the database grants right now, which is how the reported bug arrived — `ALTER DEFAULT PRIVILEGES ... ON TABLES` armed a view created afterwards, so no migration reads like a security change and the grant exists only in the catalog. Was a false negative: `anon-writes` scanned `relkind in ('r','p')` and returned OK on a database where `anon` could DELETE through a view over an RLS-protected table. Three catalog facts settle it and all three are needed — `pg_relation_is_updatable` (0 for an aggregate or join view, so a grant-only check fires on every reporting view), `security_invoker` (verified: 1 row affected with it off, 42501 with it on), and the privilege itself — then it PROBES to prove it |
 
+| 4.13 | A **trigger enforces a rule by reading a table RLS hides from it** — and hardening the table is what breaks the rule | ✅ | `trigger-visibility`. A trigger function runs as the INVOKER unless declared `SECURITY DEFINER`, so `IF EXISTS (SELECT 1 FROM profiles WHERE username = NEW.username)` inside one sees only what RLS shows the WRITING role. Verified, and worse than a missed check: in invoker mode the duplicate row was **INSERTED**; the identical trigger marked `SECURITY DEFINER` raised. Nothing errors and nothing logs, and the better the RLS gets the more completely the guarantee disappears. Conclusive only when all four line up — not definer, reads an RLS table, ENFORCES (`RAISE` / `RETURN NULL`) rather than records, and the role demonstrably sees fewer rows than exist; the enforcement signal is what keeps it off every `set_updated_at` in the schema. `shadow-tables` covers trigger *copies*; this is trigger *reads* |
+
 ## 5. Supabase surfaces
 
 | # | Failure | Status | How |
@@ -212,7 +214,7 @@ callable GUC-setting definer functions, 4.7 partitions, 3.9 TRUNCATE (0.10.0);
 inside them (0.16.0–0.17.0); 4.9 shadow tables, 7.1 role capabilities (0.18.0);
 2.14 schema-per-tenant (0.19.0); 6.1 session-scoped tenant GUCs (0.21.0);
 7.2 inherited default privileges (0.22.0); 3.11 cross-tenant foreign keys (0.23.0); 7.3 CREATE grants (0.24.0);
-2.15 untenanted sensitive columns (0.31.0); 4.11 pinned-but-writable search_path (0.32.0); 1.9 over-restriction positive control (0.33.0); 4.12 effective view write grants (0.34.0).*
+2.15 untenanted sensitive columns (0.31.0); 4.11 pinned-but-writable search_path (0.32.0); 1.9 over-restriction positive control (0.33.0); 4.12 effective view write grants (0.34.0); 4.13 trigger reads under RLS (0.35.0).*
 
 *Three of these are worth learning from. **4.7** was a false NEGATIVE in the
 flagship guard, found by writing the failure surface down rather than by waiting

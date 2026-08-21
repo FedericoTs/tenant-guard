@@ -6,7 +6,7 @@
  * whose paths don't autodetect) SKIPS rather than fails — the tool never
  * punishes you for a stack it doesn't apply to.
  */
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 
 export const CONFIG_FILENAME = 'tenant-guard.config.json';
@@ -55,6 +55,13 @@ export function definedOnly(obj) {
   return Object.fromEntries(Object.entries(obj ?? {}).filter(([, v]) => v !== undefined));
 }
 
+/** The tenancy model for this run, detected once from the migrations. */
+function detectedTenancy(config) {
+  const cwd = config.cwd ?? process.cwd();
+  const rel = config.migrations?.dir ?? firstExisting(cwd, CANDIDATE_MIGRATION_DIRS);
+  return detectTenancyModel(readMigrationsSql(rel ? join(cwd, rel) : null));
+}
+
 export function resolveGuardConfigs(config) {
   const cwd = config.cwd ?? process.cwd();
   const migrationsRel =
@@ -84,7 +91,10 @@ export function resolveGuardConfigs(config) {
       routeFilePattern: config.routeOrgScoping?.routeFilePattern,
       authSignals: config.routeOrgScoping?.authSignals,
       idFilterPattern: config.routeOrgScoping?.idFilterPattern,
-      tenantSignals: config.routeOrgScoping?.tenantSignals,
+      // Per-USER apps are a large share of the Supabase population, and
+      // org-only signals give them a wall of false positives on first run. The
+      // model is read from the schema; an explicit config always wins.
+      tenantSignals: config.routeOrgScoping?.tenantSignals ?? signalsForModel(detectedTenancy(config).model),
       allowlist: config.routeOrgScoping?.allowlist ?? [],
     },
   });
@@ -326,9 +336,99 @@ export function resolveCreateGrantsConfig(config) {
   return out;
 }
 
+/** Column names that mean "this row belongs to an organisation". */
+export const ORG_TENANT_COLUMNS = ['organization_id', 'organisation_id', 'tenant_id', 'account_id', 'workspace_id', 'org_id', 'team_id'];
+/** Column names that mean "this row belongs to a person". */
+export const USER_TENANT_COLUMNS = ['user_id', 'owner_id', 'created_by', 'profile_id', 'author_id'];
+
+/** Route-file signals for each model, matching how the columns are written in TS. */
+export const ORG_TENANT_SIGNALS = ['organization_id', 'organizationId', 'tenant_id', 'tenantId', 'org_id', 'account_id', 'workspace_id'];
+export const USER_TENANT_SIGNALS = ['user_id', 'userId', 'user.id', 'owner_id', 'ownerId', 'auth.uid', 'created_by', 'createdBy'];
+
+/**
+ * Which tenancy model is this schema built on?
+ *
+ * A large share of the apps this tool targets — anything built on Supabase Auth,
+ * which is most of the "vibe-coded" population — are per-USER multi-tenant: the
+ * tenant is `auth.uid()` and there is no organisation at all. Defaulting to
+ * org-only columns hands those projects a wall of false positives on their first
+ * run, which is the fastest way to be uninstalled.
+ *
+ * Decided by counting column declarations in the migrations, so it reflects the
+ * schema rather than a guess about the framework.
+ *
+ * @returns {{model:'org'|'user'|'both'|'unknown', org:number, user:number}}
+ */
+export function detectTenancyModel(migrationsSql) {
+  const sql = String(migrationsSql ?? '').toLowerCase();
+  const count = (names) => names.reduce(
+    (n, col) => n + (sql.match(new RegExp(`\\b${col}\\b`, 'g')) ?? []).length,
+    0,
+  );
+  const org = count(ORG_TENANT_COLUMNS);
+  const user = count(USER_TENANT_COLUMNS);
+
+  if (org === 0 && user === 0) return { model: 'unknown', org, user };
+  if (org === 0) return { model: 'user', org, user };
+  if (user === 0) return { model: 'org', org, user };
+  // Both present: an org app that also stamps a creator is still org-tenanted,
+  // so only call it user-tenanted when the user columns clearly dominate.
+  if (user >= org * 3) return { model: 'user', org, user };
+  if (org >= user * 3) return { model: 'org', org, user };
+  return { model: 'both', org, user };
+}
+
+/** The tenant signals implied by a detected model. */
+export function signalsForModel(model) {
+  if (model === 'user') return [...USER_TENANT_SIGNALS];
+  if (model === 'both') return [...ORG_TENANT_SIGNALS, ...USER_TENANT_SIGNALS];
+  return [...ORG_TENANT_SIGNALS];
+}
+
+/** The tenant COLUMNS implied by a detected model, for the runtime guards. */
+export function tenantColumnsForModel(model) {
+  if (model === 'user') return [...USER_TENANT_COLUMNS];
+  if (model === 'both') return [...ORG_TENANT_COLUMNS, ...USER_TENANT_COLUMNS];
+  return [...ORG_TENANT_COLUMNS];
+}
+
+/** Read every migration as one string, for detection. Empty when there are none. */
+export function readMigrationsSql(dir) {
+  if (!dir || !existsSync(dir)) return '';
+  try {
+    return readdirSync(dir)
+      .filter((f) => f.endsWith('.sql'))
+      .map((f) => readFileSync(join(dir, f), 'utf8'))
+      .join('\n');
+  } catch {
+    return '';
+  }
+}
+
+/** Resolve the MFA-enforcement config from the user's `mfaEnforcement` block. */
+export function resolveMfaEnforcementConfig(config) {
+  const m = config.mfaEnforcement ?? {};
+  const out = {};
+  for (const k of ['url', 'urlEnv', 'role', 'schemas', 'tenantColumns', 'allowlist']) {
+    if (m[k] !== undefined) out[k] = m[k];
+  }
+  const p = config.rlsProof ?? {};
+  for (const k of ['role', 'schemas']) {
+    if (out[k] === undefined && p[k] !== undefined) out[k] = p[k];
+  }
+  // Tenant columns follow the detected tenancy model, like everything else.
+  if (out.tenantColumns === undefined) {
+    out.tenantColumns = p.tenantColumns ?? tenantColumnsForModel(detectedTenancy(config).model);
+  }
+  return out;
+}
+
 export function autodetect(cwd = process.cwd()) {
+  const migrationsDir = firstExisting(cwd, CANDIDATE_MIGRATION_DIRS);
+  const tenancy = detectTenancyModel(readMigrationsSql(migrationsDir ? join(cwd, migrationsDir) : null));
   return {
-    migrationsDir: firstExisting(cwd, CANDIDATE_MIGRATION_DIRS),
+    migrationsDir,
     routesDir: firstExisting(cwd, CANDIDATE_ROUTE_DIRS),
+    tenancy,
   };
 }

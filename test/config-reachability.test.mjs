@@ -35,6 +35,7 @@ const GUARD_CONFIGS = [
   ['defaultPrivileges', tg.defaultPrivileges, cfg.resolveDefaultPrivilegesConfig],
   ['crossTenantFk', tg.crossTenantFk, cfg.resolveCrossTenantFkConfig],
   ['createGrants', tg.createGrants, cfg.resolveCreateGrantsConfig],
+  ['mfaEnforcement', tg.mfaEnforcement, cfg.resolveMfaEnforcementConfig],
 ];
 
 for (const [block, mod, resolve] of GUARD_CONFIGS) {

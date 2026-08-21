@@ -26,13 +26,14 @@ import * as defaultPrivileges from './guards/default-privileges.mjs';
 import * as crossTenantFk from './guards/cross-tenant-fk.mjs';
 import * as createGrants from './guards/create-grants.mjs';
 import * as updatableViews from './guards/updatable-view-writethrough.mjs';
-import { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig, resolveStorageConfig, resolveOraclesConfig, resolveRealtimeConfig, resolveDefinerRpcConfig, resolveShadowConfig, resolveCapabilitiesConfig, resolveSchemaTenancyConfig, resolvePoolerBleedConfig, resolveDefaultPrivilegesConfig, resolveCrossTenantFkConfig, resolveCreateGrantsConfig } from './config.mjs';
+import * as mfaEnforcement from './guards/mfa-enforcement.mjs';
+import { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig, resolveStorageConfig, resolveOraclesConfig, resolveRealtimeConfig, resolveDefinerRpcConfig, resolveShadowConfig, resolveCapabilitiesConfig, resolveSchemaTenancyConfig, resolvePoolerBleedConfig, resolveDefaultPrivilegesConfig, resolveCrossTenantFkConfig, resolveCreateGrantsConfig, resolveMfaEnforcementConfig } from './config.mjs';
 
 // The static guards: synchronous, zero-dependency, no database. These are what
 // `tenant-guard run` executes and what a project's vitest/jest suite imports.
 export const GUARDS = [migrationCollisions, definerGrants, routeOrgScoping, updatableViews];
 
-export { migrationCollisions, definerGrants, routeOrgScoping, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation, definerRpc, shadowTables, roleCapabilities, schemaTenancy, poolerBleed, defaultPrivileges, crossTenantFk, createGrants, updatableViews };
+export { migrationCollisions, definerGrants, routeOrgScoping, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation, definerRpc, shadowTables, roleCapabilities, schemaTenancy, poolerBleed, defaultPrivileges, crossTenantFk, createGrants, updatableViews, mfaEnforcement };
 export { prove } from './guards/rls-proof.mjs';
 export { drift } from './guards/rls-drift.mjs';
 export { check as checkAnonWrites } from './guards/anon-writes.mjs';
@@ -50,6 +51,7 @@ export { check as checkPoolerBleed } from './guards/pooler-bleed.mjs';
 export { check as checkDefaultPrivileges } from './guards/default-privileges.mjs';
 export { check as checkCrossTenantFk } from './guards/cross-tenant-fk.mjs';
 export { check as checkCreateGrants } from './guards/create-grants.mjs';
+export { check as checkMfaEnforcement } from './guards/mfa-enforcement.mjs';
 // Output serialisers — so a programmatic caller gets the same JSON/SARIF the
 // CLI emits instead of re-deriving the shape. Documented in docs/OUTPUT.md.
 export { toJson, toJsonString, summarise, statusOf, SCHEMA_VERSION } from './output/json.mjs';
@@ -166,7 +168,7 @@ export async function runRealtime(cwd = process.cwd()) {
  */
 export async function runEverything(cwd = process.cwd()) {
   const results = runAll(cwd);
-  for (const fn of [runProof, runDrift, runAnonReads, runAnonWrites, runViews, runIdentity, runDefinerRpc, runShadowTables, runCapabilities, runSchemaTenancy, runPoolerBleed, runDefaultPrivileges, runCrossTenantFk, runCreateGrants, runStorage, runOracles, runRealtime]) {
+  for (const fn of [runProof, runDrift, runAnonReads, runAnonWrites, runViews, runIdentity, runDefinerRpc, runShadowTables, runCapabilities, runSchemaTenancy, runPoolerBleed, runDefaultPrivileges, runCrossTenantFk, runCreateGrants, runMfaEnforcement, runStorage, runOracles, runRealtime]) {
     results.push(await fn(cwd));
   }
   return results;
@@ -258,4 +260,15 @@ export async function runCrossTenantFk(cwd = process.cwd()) {
 export async function runCreateGrants(cwd = process.cwd()) {
   const config = loadConfig(cwd);
   return createGrants.run(resolveCreateGrantsConfig(config));
+}
+
+/**
+ * Run the MFA-enforcement check (async; needs a database URL + `pg`).
+ * Catalog-only. PostgREST honours whatever token the client presents, so only a
+ * policy can refuse a single-factor one — and an `aal2` check written
+ * PERMISSIVELY enforces nothing, because permissive policies OR.
+ */
+export async function runMfaEnforcement(cwd = process.cwd()) {
+  const config = loadConfig(cwd);
+  return mfaEnforcement.run(resolveMfaEnforcementConfig(config));
 }

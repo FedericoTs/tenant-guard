@@ -126,6 +126,15 @@ The highest-severity blind spot of any table-only scanner.
 | 5.6 | `service_role` key shipped to the client | ⛔ | not a database fact — needs a bundle/env/git secret scan |
 | 5.7 | JWT secret weak/leaked → forged `role: service_role` | ⛔ | key management, not RLS |
 
+## 5b. Authentication assurance (MFA)
+
+| # | Failure | Status | How |
+|---|---|---|---|
+| 5.8 | An `aal2` (MFA) policy written **PERMISSIVELY**, which cannot restrict | ✅ | `mfa-enforcement`. Postgres **ORs** permissive policies and **ANDs** restrictive ones, so a permissive "require aal2" gate can only ADD access alongside the tenancy policy — it never removes any. Verified against a real database: with a permissive gate an `aal1` session reads every row it would have read anyway; with `AS RESTRICTIVE` it reads none. Conclusive, because it is Postgres semantics rather than a judgement about the app |
+| 5.9 | MFA enrolled in the auth service, but **no policy checks the level** | ✅ | `mfa-enforcement`, as a note. PostgREST presents whatever JWT the client holds, so a session that never completed the second factor has the same data access as one that did — the factor gates the login screen, not the data. A note rather than a failure because MFA may deliberately gate only an admin console, which SQL cannot see |
+| 5.10 | MFA enforced on **some** tenant tables and not others | ✅ | `mfa-enforcement`, as a note listing the uncovered tables. Partial enforcement is the shape people miss: the protected table is the one they thought of |
+| 5.11 | A stolen/replayed `aal2` token, or MFA enrolment bypass in the auth service | ⛔ | token lifetime and enrolment flows are the auth service's, not the database's. No SQL-as-role probe can see them |
+
 ## 6. Connection pooling & session state
 
 | # | Failure | Status | How |

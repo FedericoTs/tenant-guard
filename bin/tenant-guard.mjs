@@ -17,12 +17,12 @@ import { join, dirname, resolve } from 'node:path';
 import {
   GUARDS, runAll, runProof, runDrift, runAnonWrites, runAnonReads, runViews, runIdentity,
   runStorage, runOracles, runRealtime, runDefinerRpc, runShadowTables, runCapabilities,
-  runSchemaTenancy, runPoolerBleed, runDefaultPrivileges, runCrossTenantFk, runCreateGrants, runEverything,
+  runSchemaTenancy, runPoolerBleed, runDefaultPrivileges, runCrossTenantFk, runCreateGrants, runMfaEnforcement, runEverything,
 } from '../src/index.mjs';
 import {
   rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation,
   constraintOracles, realtimeIsolation, definerRpc, shadowTables, roleCapabilities, schemaTenancy,
-  poolerBleed, defaultPrivileges, crossTenantFk, createGrants,
+  poolerBleed, defaultPrivileges, crossTenantFk, createGrants, mfaEnforcement,
 } from '../src/index.mjs';
 import { CONFIG_FILENAME, autodetect, loadConfig } from '../src/config.mjs';
 import { report, bold, dim, green, yellow, red } from '../src/runner.mjs';
@@ -35,7 +35,7 @@ const ALL_GUARDS = [
   ...GUARDS, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust,
   storageIsolation, constraintOracles, realtimeIsolation, definerRpc, shadowTables,
   roleCapabilities, schemaTenancy, poolerBleed, defaultPrivileges, crossTenantFk,
-  createGrants,
+  createGrants, mfaEnforcement,
 ];
 
 /**
@@ -61,6 +61,7 @@ const RUNTIME_COMMANDS = {
   defaults: { fn: runDefaultPrivileges, needs: 'migrated' },
   fks: { fn: runCrossTenantFk, needs: 'seeded' },
   creates: { fn: runCreateGrants, needs: 'migrated' },
+  mfa: { fn: runMfaEnforcement, needs: 'migrated' },
   all: { fn: runEverything, needs: 'seeded', many: true },
 };
 
@@ -154,6 +155,7 @@ ${bold('COMMANDS')}
   defaults       what a table created TOMORROW will inherit
   fks            a foreign key lets one tenant reach another's rows
   creates        who can plant objects a definer function would run as owner
+  mfa            whether MFA gates your DATA or only your login screen
   shadows        a trigger copies tenant data somewhere unprotected
   oracles        a UNIQUE key reveals another tenant's rows
   caps           the app role holds an RLS-bypassing capability
@@ -422,6 +424,14 @@ if (cmd === 'init') {
       // there is no storage schema. Identity is inherited from rlsProof.
       pathSegment: 1, // which '/'-separated segment identifies the tenant
       allowlist: [], // bucket ids that are genuinely public (logos, marketing assets)
+    },
+    mfaEnforcement: {
+      // Is your second factor actually a factor? PostgREST honours whatever JWT
+      // the client presents, so only a policy can refuse a single-factor token —
+      // and an aal2 check written PERMISSIVELY enforces nothing, because
+      // permissive policies OR together. It must be AS RESTRICTIVE.
+      schemas: ['public'],
+      allowlist: [], // "schema.table", "schema.table.policyname" exempt on purpose
     },
     identityTrust: {
       // Asks whether the caller can FORGE the identity your policies authorize

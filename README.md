@@ -31,7 +31,7 @@ npx tenant-guard all      # everything: static guards + every runtime proof
 ```
 
 Or run one at a time: `prove`, `drift`, `anon-reads`, `anon-writes`, `identity`,
-`rpc`, `views`, `storage`, `realtime`, `oracles`, `shadows`, `caps`, `schemas`, `pooler`, `defaults`, `fks`, `creates`.
+`rpc`, `views`, `storage`, `realtime`, `oracles`, `shadows`, `caps`, `schemas`, `pooler`, `defaults`, `fks`, `creates`, `mfa`.
 The view write-through check runs inside `run`, with no database.
 `npx tenant-guard list` describes each, and `--help` documents the rest.
 
@@ -138,6 +138,7 @@ tenant-guard  â€” guard tests for multi-tenant isolation
 | `default-privileges` | a table created **tomorrow** arrives granted and unprotected | the only guard about the database as it *will be*. `ALTER DEFAULT PRIVILEGES` grants on every table created after it, and Postgres never enables RLS by default — so a green run says nothing about the table somebody adds next week: it arrives already granted, with no policy, exposed the instant it exists, and **no migration diff shows a security change**. It proves rather than infers, by creating a table inside a rolled-back transaction and reading what that table actually inherited |
 | `cross-tenant-fk` | a foreign key lets one tenant reach — and **destroy** — another tenant's rows | the only finding here where a tenant *deletes* another tenant's data rather than reading it. **Referential integrity checks always bypass RLS** — they must, or a constraint could be defeated by hiding a row. So a key carrying an id but not the tenant lets tenant A point their row at tenant B's (the FK confirms a row A cannot see; the `WITH CHECK` governs the tenant column, not the reference), and then **`ON DELETE CASCADE` means B deleting their own row deletes A's**. Verified end to end, on a database `rls-proof` calls isolated |
 | `create-grants` | someone who is not your migration role can **plant objects** in your database | `CREATE` is the quietest privilege in Postgres — nothing about it looks like data access — and it is the precondition that turns an unpinned `SECURITY DEFINER` `search_path` into escalation: you can only shadow an object if you can create one. That is CVE-2018-1058's shape, and why **Postgres 15 stopped granting it on `public` to `PUBLIC`**. Reported **even when no definer function exists yet**, because the grant arms the next one somebody writes — the one state a function-by-function check has nothing to evaluate in |
+| `mfa-enforcement` | your second factor gates the **login screen**, not the data | PostgREST honours whatever JWT the client presents, so the only thing that can refuse a single-factor token at the data layer is a policy checking the assurance level. And an `aal2` check written **PERMISSIVELY enforces nothing** — Postgres ORs permissive policies and ANDs restrictive ones, so it can only *widen* access. Verified: with a permissive gate an `aal1` session reads every row; with `AS RESTRICTIVE` it reads none. The policy reads exactly right and does nothing. Also flags factors enrolled with no `aal` policy anywhere, and enforcement that covers only some tenant tables |
 
 **Catalog** — the schema's shape rather than its behaviour:
 

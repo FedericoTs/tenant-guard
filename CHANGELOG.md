@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.28.0
+
+Three items off the MonkeyTravel brief, plus a new guard for a question that came
+in alongside it: **is your second factor actually a factor?**
+
+### New guard: `mfa-enforcement` (`tenant-guard mfa`)
+
+PostgREST honours whatever JWT the client presents. Your login screen asked for a
+code; the data layer never heard about it. The only thing that can refuse a
+single-factor token is a policy that checks the assurance level — and there is a
+trap in writing one:
+
+```sql
+-- reads exactly right, enforces NOTHING
+CREATE POLICY require_mfa ON notes FOR SELECT
+  USING ((SELECT auth.jwt()->>'aal') = 'aal2');
+```
+
+Postgres **ORs permissive policies** and **ANDs restrictive ones**, so a
+permissive gate can only *widen* access alongside your tenancy policy. Verified
+against a real database, both ways:
+
+```
+PERMISSIVE  aal2 policy -> aal2 sees 1 row, aal1 sees 1 row   <-- not enforced
+RESTRICTIVE aal2 policy -> aal2 sees 1 row, aal1 sees 0 rows  (enforced)
+```
+
+The guard fails on a permissive gate (conclusive — it is Postgres semantics, not
+a judgement about your app), notes when factors are enrolled and **no** policy
+checks `aal` at all, and notes partial coverage naming the tenant tables left
+out. Catalog-only; skips on a project not using MFA.
+
+### From the brief
+
+- **P1: the tenancy model is now detected from your schema.** Defaulting to
+  org-only columns handed every per-user Supabase app a wall of false positives
+  on first run — 7 of 7 in the reported case. `route-org-scoping` (and the
+  runtime tenant columns) now follow whichever model the migrations actually use,
+  counted from column declarations: `user`, `org`, `both`, or `unknown`. An
+  explicit config always wins. Confirmed on a per-user fixture: false positive
+  before, clean after, with no configuration.
+
+- **P1: the tenant signal must appear in the SAME QUERY as the bare-id filter.**
+  A file-wide match let a route call `getUser()`, reference `user.id` for its auth
+  check, and still run an unscoped `.eq('id', …)` underneath. Now three outcomes
+  rather than two: scoped in the query passes; **no tenant signal at all** still
+  fails; and *tenant in the file but not in the query* is a **note** — because
+  that is both the IDOR shape and the ordinary fetch-then-check pattern, and the
+  source genuinely cannot tell which.
+
+- 601 tests (was 589), 22 guards.
+
 ## 0.27.0
 
 New **static** guard `updatable-view-writethrough` — the flagship recommendation

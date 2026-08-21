@@ -67,6 +67,12 @@
     "allowlist": []
   },
 
+  "mfaEnforcement": {
+    "//": "Runtime, catalog-only. Is your second factor actually a factor? PostgREST honours whatever JWT the client presents, so the only thing that can refuse a single-factor token at the data layer is a policy checking the assurance level — and an aal2 check written PERMISSIVELY enforces NOTHING, because Postgres ORs permissive policies and ANDs restrictive ones. Verified: with a permissive gate an aal1 session reads every row; with AS RESTRICTIVE it reads none. Also notes when factors are enrolled but no policy checks aal at all (MFA gates the login screen, not the data), and when enforcement covers only some tenant tables.",
+    "schemas": ["public"],
+    "allowlist": []
+  },
+
   "identityTrust": {
     "//": "Runtime. Can the caller FORGE the identity your policies authorize from? Flags user_metadata used for authorization, a callable SECURITY DEFINER that sets the tenant GUC from an argument, a membership table the caller can write, and \u2014 the one most apps have \u2014 an admin flag a user can set on their OWN row. RLS is ROW-level: a correct self-update policy pins which ROWS you may touch and says nothing about which COLUMNS, so `update profiles set is_admin = true where id = me` succeeds. Only a column-level GRANT stops it, and this recognises one. Inherits role/becomeTenant/claim from rlsProof.",
     "schemas": ["public"],

@@ -43,19 +43,62 @@ export const DEFAULTS = {
  * Classify one route file's text. Pure.
  * @returns {{ authenticated:boolean, filtersById:boolean, mentionsTenant:boolean, leak:boolean }}
  */
+/**
+ * The statement containing `index`, approximately.
+ *
+ * Bounded by the surrounding `;` so a whole query builder chain counts as one
+ * statement however many lines it spans — which is what "the same query" has to
+ * mean for `.from(…).eq(…).eq(…)`, `where: { … }` and `.where(and(…))` alike.
+ */
+export function enclosingStatement(text, index) {
+  const start = Math.max(text.lastIndexOf(';', index) + 1, 0);
+  const end = text.indexOf(';', index);
+  return text.slice(start, end === -1 ? text.length : end);
+}
+
+/**
+ * Classify one route file's text. Pure.
+ *
+ * The tenant signal is looked for in the SAME statement as the bare-id filter,
+ * not merely somewhere in the module: a route can call `getUser()` and reference
+ * `user.id` for its auth check and still run an unscoped `.eq('id', …)` query
+ * underneath, and a file-wide match hides exactly that.
+ *
+ * Three outcomes rather than two, because "the tenant is mentioned in the file
+ * but not in the query" is genuinely ambiguous — it is the IDOR shape, and it is
+ * also the ordinary fetch-then-check pattern, and the text cannot tell which. So
+ * it is reported, at a severity that does not block the build.
+ *
+ * @returns {{authenticated, filtersById, mentionsTenant, scopedInQuery, leak, unscopedQuery}}
+ */
 export function classifyRouteFile(text, opts = {}) {
   const authSignals = opts.authSignals ?? DEFAULTS.authSignals;
   const tenantSignals = opts.tenantSignals ?? DEFAULTS.tenantSignals;
-  const idFilter = new RegExp(opts.idFilterPattern ?? DEFAULTS.idFilterPattern, 'i');
+  const pattern = opts.idFilterPattern ?? DEFAULTS.idFilterPattern;
+  const idFilter = new RegExp(pattern, 'i');
 
   const authenticated = authSignals.some((s) => text.includes(s));
   const mentionsTenant = tenantSignals.some((s) => text.includes(s));
   const filtersById = idFilter.test(text);
+
+  // Does at least one bare-id filter sit in a statement that also names a tenant?
+  let scopedInQuery = false;
+  if (filtersById) {
+    for (const m of text.matchAll(new RegExp(pattern, 'gi'))) {
+      const stmt = enclosingStatement(text, m.index);
+      if (tenantSignals.some((sig) => stmt.includes(sig))) { scopedInQuery = true; break; }
+    }
+  }
+
   return {
     authenticated,
     filtersById,
     mentionsTenant,
+    scopedInQuery,
     leak: authenticated && filtersById && !mentionsTenant,
+    // Authenticated, filters by id, the file knows about tenancy — but the query
+    // itself does not carry it.
+    unscopedQuery: authenticated && filtersById && mentionsTenant && !scopedInQuery,
   };
 }
 
@@ -102,10 +145,20 @@ export function run(config = {}) {
   const allow = new Set(config.allowlist ?? []);
   const files = collectRouteFiles(routesDir, config.routeFilePattern);
   const violations = [];
+  const notes = [];
   for (const abs of files) {
     const rel = relative(cwd, abs).replace(/\\/g, '/');
     if (allow.has(rel)) continue;
     const verdict = classifyRouteFile(readFileSync(abs, 'utf8'), config);
+    if (verdict.unscopedQuery) {
+      notes.push({
+        where: rel,
+        message:
+          `this route filters by a bare id, and a tenant column appears in the file but NOT in the same query. ` +
+          `That is either an IDOR hiding behind an unrelated auth check, or a fetch-then-check — the source cannot tell which. ` +
+          `If the row is loaded before it is authorised, put the tenant in the query: .eq('id', id).eq('<tenant column>', …).`,
+      });
+    }
     if (verdict.leak) {
       violations.push({
         where: rel,
@@ -120,6 +173,7 @@ export function run(config = {}) {
     id: meta.id,
     ok: violations.length === 0,
     violations,
+    notes,
     scanned: files.length,
     summary:
       violations.length === 0

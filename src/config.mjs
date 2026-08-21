@@ -405,6 +405,33 @@ export function readMigrationsSql(dir) {
   }
 }
 
+/**
+ * Resolve the column-exposure config from the user's `columnExposure` block.
+ *
+ * The role defaults to `anon` and is inherited from `anonReads`, not `rlsProof`
+ * — this guard asks what an UNAUTHENTICATED visitor reads, so the authenticated
+ * role would be the wrong question entirely.
+ */
+export function resolveColumnExposureConfig(config) {
+  const m = config.columnExposure ?? {};
+  const out = {};
+  for (const k of ['url', 'urlEnv', 'role', 'schemas', 'tenantColumns', 'sampleRows', 'allowlist']) {
+    if (m[k] !== undefined) out[k] = m[k];
+  }
+  const a = config.anonReads ?? {};
+  for (const k of ['role', 'schemas']) {
+    if (out[k] === undefined && a[k] !== undefined) out[k] = a[k];
+  }
+  const p = config.rlsProof ?? {};
+  if (out.schemas === undefined && p.schemas !== undefined) out.schemas = p.schemas;
+  // Tenant columns are used ONLY to hand a relation off to anon-reads, so they
+  // follow the same detected model as every other guard.
+  if (out.tenantColumns === undefined) {
+    out.tenantColumns = p.tenantColumns ?? tenantColumnsForModel(detectedTenancy(config).model);
+  }
+  return out;
+}
+
 /** Resolve the MFA-enforcement config from the user's `mfaEnforcement` block. */
 export function resolveMfaEnforcementConfig(config) {
   const m = config.mfaEnforcement ?? {};

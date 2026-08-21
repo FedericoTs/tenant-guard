@@ -74,6 +74,7 @@ These are checked *before* any isolation claim.
 | 2.11 | Existence oracles: global `UNIQUE` key, single-column FK, `ON CONFLICT DO NOTHING` reveal another tenant's hidden rows | ✅ | `constraint-oracles`, catalog-only. **UNIQUE omitting the tenant column → fails** (conclusive: the constraint either carries the tenant or it doesn't). Skips primary keys and single-UUID columns — unguessable values answer nothing. Expression indexes are skipped rather than guessed at. **Single-column FKs between tenant tables → an aggregated note** that hands off to §3.11, which proves reachability and owns the worse half (cascade deletion). Reporting the same key from both guards would be one finding twice |
 | 2.12 | `pg_stat_activity` exposes other tenants' live query text (all users share one DB role) | 🔜 | read it as the app role |
 | 2.13 | Planner/statistics side channels (`pg_stats`, non-`LEAKPROOF` functions) | ⛔ | needs adversarial query construction; low yield, high noise |
+| 2.15 | **Untenanted table serves sensitive columns to `anon`** — the waitlist, the author directory, the `api_clients` lookup | ✅ | `column-exposure`. The gap every OTHER read guard has by construction: they all select on a tenant column, so a relation without one is invisible to all of them — correctly, since there are no tenants to leak across. It leaks to the internet instead. **Grant-based detection does not work here and was measured failing**: one table-level `GRANT SELECT` expands to every column in `information_schema.column_privileges`, so it reported a fully-isolated table as exposing all seven of its columns and fired on a table RLS already closes — the "tighten what is already closed" advice shape that took a production database down in 0.26.0. Proven by reading instead: fails only on a real non-null value, via `count()` so the finding never carries the leaked value into a CI log. Hands tenant-scoped relations to `anon-reads` |
 | 2.14 | **Schema-per-tenant**: one role reaches more than one tenant schema | ✅ | `schema-tenancy`. A different architecture entirely — the boundary is GRANTs, not policies, and `search_path` is not a control. Was a verified blind spot: `rls-proof` reported "1/1 proven isolated" on a database where the app role read both tenant schemas |
 
 ## 3. Write path
@@ -205,7 +206,8 @@ callable GUC-setting definer functions, 4.7 partitions, 3.9 TRUNCATE (0.10.0);
 5.3/5.4 Realtime channels (0.15.0); 4.3/4.4/4.10 definer RPCs and SQL injection
 inside them (0.16.0–0.17.0); 4.9 shadow tables, 7.1 role capabilities (0.18.0);
 2.14 schema-per-tenant (0.19.0); 6.1 session-scoped tenant GUCs (0.21.0);
-7.2 inherited default privileges (0.22.0); 3.11 cross-tenant foreign keys (0.23.0); 7.3 CREATE grants (0.24.0).*
+7.2 inherited default privileges (0.22.0); 3.11 cross-tenant foreign keys (0.23.0); 7.3 CREATE grants (0.24.0);
+2.15 untenanted sensitive columns (0.31.0).*
 
 *Three of these are worth learning from. **4.7** was a false NEGATIVE in the
 flagship guard, found by writing the failure surface down rather than by waiting

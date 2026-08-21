@@ -203,7 +203,10 @@ test('classify: READS the other tenant with RLS on -> read leak (permissive poli
   assert.equal(v.leaks.length, 1);
   assert.equal(v.leaks[0].kind, 'read');
   assert.match(v.leaks[0].message, /permissive or missing the tenant predicate/);
-  assert.match(v.leaks[0].fix, /current_setting/);
+  // The template carries {cmp}; the comparison is built per column TYPE at emit
+  // time, because `col = current_setting(...)` does not compile against a uuid
+  // column (42883) — and uuid is the commonest tenant type there is.
+  assert.match(v.leaks[0].fix, /\{cmp\}/);
 });
 
 test('classify: READS the other tenant with RLS off -> read leak (RLS disabled = the CVE case)', () => {

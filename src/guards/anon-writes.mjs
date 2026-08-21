@@ -181,11 +181,18 @@ export function violationForView(v, commands, role) {
       `The usual cause is ALTER DEFAULT PRIVILEGES granting writes on TABLES, which covers views created afterwards, so nothing in any migration reads like a security change.`,
     fix:
       `Take the write grant away — a view meant for reading needs only SELECT:\n` +
-      `        REVOKE INSERT, UPDATE, DELETE ON ${id} FROM ${role}, authenticated;\n` +
+      `        REVOKE INSERT, UPDATE, DELETE ON ${id} FROM ${role};\n` +
+      `      If the grant was made TO PUBLIC rather than to a named role, that REVOKE does nothing — verified, the privilege survives it — and you need:\n` +
+      `        REVOKE INSERT, UPDATE, DELETE ON ${id} FROM PUBLIC;\n` +
+      `      Check which it is first, so you revoke the one that is actually there:\n` +
+      `        SELECT grantee, privilege_type FROM information_schema.role_table_grants WHERE table_name = '${v.table}';\n` +
+      `      (a grantee of PUBLIC shows up as the empty grantee in relacl, and as 'PUBLIC' in that view.) Name only roles that exist — a REVOKE listing a role this database does not have fails outright with 42704 and applies none of it.\n` +
       `      If writes through it are intended, make it run as the CALLER so the base table's RLS applies (Postgres 15+; on 14 and earlier the option does not exist, so the REVOKE is your only choice):\n` +
       `        ALTER VIEW ${id} SET (security_invoker = true);\n` +
       `      Measure what that actually gives you. Verified both ways: if ${role} holds no privilege on the BASE table the write is refused with 42501 — but if it does, which is the usual case here because ALTER DEFAULT PRIVILEGES granted the table too, the write is not refused at all. It silently affects zero rows, since RLS is now evaluated as ${role} and matches nothing. Safe, but silent, which is why the REVOKE is the fix that tells you it worked.\n` +
-      `      And check what else inherited it:  ALTER DEFAULT PRIVILEGES IN SCHEMA ${v.schema} REVOKE INSERT, UPDATE, DELETE ON TABLES FROM ${role};`,
+      `      And close the source, so the NEXT object created does not inherit it again. ALTER DEFAULT PRIVILEGES only affects defaults recorded for the role that runs it, so without FOR ROLE it silently changes nothing unless you happen to be the granting role. Find the grantor, then name it:\n` +
+      `        SELECT pg_get_userbyid(defaclrole) AS grantor FROM pg_default_acl d JOIN pg_namespace n ON n.oid = d.defaclnamespace WHERE n.nspname = '${v.schema}';\n` +
+      `        ALTER DEFAULT PRIVILEGES FOR ROLE <grantor> IN SCHEMA ${v.schema} REVOKE INSERT, UPDATE, DELETE ON TABLES FROM ${role};`,
   };
 }
 

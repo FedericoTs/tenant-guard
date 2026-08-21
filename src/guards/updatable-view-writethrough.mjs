@@ -125,37 +125,75 @@ export function autoUpdatableShape(select) {
 /**
  * Net write privileges on each object across the whole migration history:
  * a GRANT adds, a REVOKE takes away, in migration order.
+ *
+ * Two things this has to get right, both of which it used to get wrong.
+ *
+ * **`ON ALL TABLES IN SCHEMA x` counts, and it covers views.** That statement is
+ * the single most common lockdown a Supabase project performs —
+ * `REVOKE INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public FROM anon` — and
+ * the per-object pattern could not see it, because it looks for an object name
+ * followed by TO/FROM. So the guard fired on a migration history that had
+ * already closed the hole. A guard that cries wolf on correct code teaches
+ * people to ignore it, which is the worst outcome available here.
+ *
+ * **Order decides it.** A schema-wide REVOKE followed by a per-object GRANT
+ * leaves the object writable, and the reverse leaves it closed. So every
+ * statement — per-object and schema-wide — is applied in one ordered stream
+ * rather than in two passes, which is what made a later re-GRANT invisible.
+ *
+ * `viewNames` seeds the state so a schema-wide REVOKE reaches views that never
+ * had an explicit GRANT of their own — the ones that got their write access from
+ * ALTER DEFAULT PRIVILEGES, which is exactly the population this guard is about.
+ *
  * @returns {Map<string, {granted:Set<string>, revoked:Set<string>}>} keyed by bare object name
  */
-export function netWriteGrants(files, exposedRoles) {
+export function netWriteGrants(files, exposedRoles, viewNames = []) {
   const roles = new Set(exposedRoles.map((r) => r.toLowerCase()));
   const state = new Map();
   const touch = (name) => {
     if (!state.has(name)) state.set(name, { granted: new Set(), revoked: new Set() });
     return state.get(name);
   };
+  for (const v of viewNames) touch(bare(v));
 
-  const sorted = [...files].sort(compareMigrations);
-  for (const { sql } of sorted) {
+  const hitsRole = (targets) =>
+    [...roles].some((r) => new RegExp(`\\b${r}\\b`).test(targets)) || /\bpublic\b/.test(targets);
+
+  const privsOf = (privs) =>
+    /\ball\b/.test(privs) ? WRITE_PRIVS : WRITE_PRIVS.filter((x) => new RegExp(`\\b${x}\\b`).test(privs));
+
+  const apply = (entry, verb, applies) => {
+    for (const priv of applies) {
+      if (verb === 'grant') { entry.granted.add(priv); entry.revoked.delete(priv); }
+      else { entry.revoked.add(priv); entry.granted.delete(priv); }
+    }
+  };
+
+  for (const { sql } of [...files].sort(compareMigrations)) {
     const text = stripSqlComments(sql);
+    const events = [];
+
+    const allRe = /\b(grant|revoke)\s+([\s\S]*?)\s+on\s+all\s+tables\s+in\s+schema\s+([a-z0-9_."]+)\s+(?:to|from)\s+([^;]+)/gi;
+    let a;
+    while ((a = allRe.exec(text)) !== null) {
+      if (!hitsRole(a[4].toLowerCase())) continue;
+      const applies = privsOf(a[2].toLowerCase());
+      if (applies.length) events.push({ at: a.index, verb: a[1].toLowerCase(), applies, all: true });
+    }
+
     const re = /\b(grant|revoke)\s+([\s\S]*?)\s+on\s+(?:table\s+)?([a-z0-9_."]+)\s+(?:to|from)\s+([^;]+)/gi;
     let m;
     while ((m = re.exec(text)) !== null) {
-      const verb = m[1].toLowerCase();
-      const privs = m[2].toLowerCase();
-      const obj = bare(m[3]);
-      const targets = m[4].toLowerCase();
-      const hitsRole = [...roles].some((r) => new RegExp(`\\b${r}\\b`).test(targets)) || /\bpublic\b/.test(targets);
-      if (!hitsRole) continue;
+      if (/^all$/i.test(m[3])) continue; // the schema-wide form, handled above
+      if (!hitsRole(m[4].toLowerCase())) continue;
+      const applies = privsOf(m[2].toLowerCase());
+      if (applies.length) events.push({ at: m.index, verb: m[1].toLowerCase(), applies, obj: bare(m[3]) });
+    }
 
-      const applies = /\ball\b/.test(privs) ? WRITE_PRIVS : WRITE_PRIVS.filter((p) => new RegExp(`\\b${p}\\b`).test(privs));
-      if (applies.length === 0) continue;
-
-      const entry = touch(obj);
-      for (const p of applies) {
-        if (verb === 'grant') { entry.granted.add(p); entry.revoked.delete(p); }
-        else { entry.revoked.add(p); entry.granted.delete(p); }
-      }
+    events.sort((x, y) => x.at - y.at);
+    for (const ev of events) {
+      if (ev.all) for (const entry of state.values()) apply(entry, ev.verb, ev.applies);
+      else apply(touch(ev.obj), ev.verb, ev.applies);
     }
   }
   return state;
@@ -270,7 +308,8 @@ export function run(config = {}) {
     .map((f) => ({ name: f, sql: readFileSync(join(dir, f), 'utf8') }));
 
   const allow = new Set(cfg.allowlist.map((n) => bare(n)));
-  const grants = netWriteGrants(files, cfg.exposedRoles);
+  const viewsForGrants = extractViews(files.map((f) => f.sql).join('\n')).map((v) => v.name);
+  const grants = netWriteGrants(files, cfg.exposedRoles, viewsForGrants);
   const detected = detectDefaultWriteGrants(files, cfg.exposedRoles);
   const assumeDefaults = cfg.assumeDefaultWriteGrants === 'auto'
     ? detected.assume

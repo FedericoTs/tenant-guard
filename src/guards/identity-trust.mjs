@@ -222,6 +222,38 @@ export function definerSetsTrustedGuc(body, args, gucs) {
 }
 
 /**
+ * Does the body AUTHORIZE the argument before it trusts it?
+ *
+ * The `forgeable-guc` finding used to fire on any definer function that set the
+ * trusted GUC from a parameter — including one that checks membership first,
+ * which is verbatim what the finding's own fix text tells you to write. Applying
+ * the recommended remediation left the guard failing you, which is a closed loop:
+ * the only way out was to ignore the tool. Verified against a real database.
+ *
+ * The gate is looked for BEFORE the `set_config` call, because a check that runs
+ * afterwards has already leaked the tenant. Recognising this is deliberately
+ * loose: a false NOTE on a function that only looks authorized is much cheaper
+ * than telling someone their correct code is a "become any tenant" primitive.
+ */
+export function authorizesBeforeSettingGuc(body, guc) {
+  const text = String(body ?? '');
+  const esc = String(guc ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const at = text.search(new RegExp(`set_config\\s*\\(\\s*'${esc}'`, 'i'));
+  if (at < 0) return false;
+  const before = text.slice(0, at);
+
+  // Something that can REFUSE: raise, or a return that ends the function early.
+  const refuses = /\braise\s+(exception|error)\b/i.test(before)
+    || /\breturn\b[^;]*;/i.test(before);
+  // Something that consults the VERIFIED identity, rather than the argument.
+  const consultsIdentity = /auth\.uid\s*\(|request\.jwt|auth\.jwt\s*\(|current_setting\s*\(\s*'request\./i.test(before);
+  // …and actually looks it up.
+  const looksUp = /\b(select|exists|perform)\b/i.test(before);
+
+  return refuses && consultsIdentity && looksUp;
+}
+
+/**
  * Which OTHER tables each tenant policy depends on — its "authority tables".
  * Read from `pg_depend` rather than by parsing the policy expression: creating a
  * policy records a real dependency on every relation its subqueries touch, so
@@ -510,7 +542,16 @@ export async function check({ query, config = {} }) {
       const hit = definerSetsTrustedGuc(fn.body, fn.args, trustedGucs);
       if (!hit || !canExecute) continue;
       const fqn = `${fn.schema}.${fn.name}(${fn.args || ''})`;
-      if (hit.fromParam) {
+      // A function that authorizes the argument against the verified session
+      // before setting the GUC is the SHAPE THIS GUARD RECOMMENDS. Reporting it
+      // meant the recommended fix could not clear the finding.
+      if (hit.fromParam && authorizesBeforeSettingGuc(fn.body, hit.guc)) {
+        notes.push({
+          where: fqn,
+          message:
+            `SECURITY DEFINER function sets '${hit.guc}' from a caller argument, but authorizes that argument against the verified session first (a membership lookup and a raise ahead of the set_config). That is the recommended shape, so it is not reported as a leak — confirm the check really covers every path through the function, because everything downstream trusts this GUC.`,
+        });
+      } else if (hit.fromParam) {
         violations.push({
           where: fqn,
           kind: 'forgeable-guc',

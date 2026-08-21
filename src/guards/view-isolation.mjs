@@ -141,9 +141,13 @@ export function fixForView({ kind, schema, view, securityInvoker, role, pgVersio
     );
   }
   return (
-    `Make the view evaluate RLS as the CALLER, not its owner:\n` +
+    `Make the view evaluate RLS as the CALLER, not its owner — but apply BOTH lines, not just the first:\n` +
     `        ALTER VIEW ${q} SET (security_invoker = true);\n` +
-    `      (then confirm the base table's own policy is correct — \`tenant-guard prove\`)`
+    `        GRANT SELECT ON <each base table of the view> TO ${role};\n` +
+    `      security_invoker makes the caller's own privileges apply to the base tables, and the usual reason a view exists is that the caller was NOT granted them. Applying the first line alone therefore breaks the view for its legitimate users: verified, a tenant that read its own row through the view got 42501 afterwards, and the row came back once the base grant was added.\n` +
+    `      Granting SELECT on the base table is safe here precisely because RLS is now doing the scoping — that is the point of the change.\n` +
+    `      If you would rather not grant the base table, put the tenant predicate in the view's own definition instead, or move it out of the API-exposed schema.\n` +
+    `      Then confirm the base table's policy is correct (\`tenant-guard prove\`), and note that security_invoker does NOT propagate: a nested view that still runs as its owner keeps leaking even when every base table is right.`
   );
 }
 

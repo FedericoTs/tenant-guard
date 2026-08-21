@@ -121,6 +121,9 @@ export function introspectionSql(schemas, tenantColumns, role = 'authenticated')
     select n.nspname            as schema,
            c.relname            as table,
            a.attname            as column,
+           -- the emitted policy has to COMPILE: col = current_setting(...)
+           -- raises 42883 on a uuid column, the commonest tenant type there is.
+           a.atttypid::regtype::text as column_type,
            c.relrowsecurity     as rls_enabled,
            c.relforcerowsecurity as rls_forced,
            c.relowner::regrole::text as owner_role,
@@ -165,6 +168,7 @@ export function planTables(rows, tenantColumns, grandfather = []) {
         schema: r.schema,
         table: r.table,
         tenantColumn: r.column,
+        tenantColumnType: r.column_type ?? null,
         rlsEnabled: r.rls_enabled === true || r.rls_enabled === 't',
         rlsForced: r.rls_forced === true || r.rls_forced === 't',
         ownerRole: r.owner_role ?? null,
@@ -355,6 +359,30 @@ export function isRlsCheckViolation(err) {
  * one entry per kind, and the caller emits a violation for each.
  * @returns {{ status:'isolated'|'leak'|'no-policy'|'insufficient-data'|'over-restrictive'|'no-access', message?:string, leaks?:Array<{kind:'read'|'write',message:string,fix:string}> }}
  */
+/**
+ * The comparison to emit in a suggested policy, for a tenant column of this type.
+ *
+ * `USING (org_id = current_setting('app.current_tenant'))` does not compile when
+ * the column is `uuid` — Postgres raises 42883 `operator does not exist: uuid =
+ * text`. That is the most common tenant type there is, and it is what this
+ * guard's own seed generates, so the headline fix was untestable on the shape it
+ * most often reports. Verified: identical policy, `text` column created fine,
+ * `uuid` column rejected.
+ *
+ * `::text` on the column is used rather than a cast on the setting because it
+ * works for every type without knowing which one it is — the caller passes the
+ * real type when it has it, and gets the exact cast when it does not matter.
+ */
+export function tenantComparison(col, type) {
+  const t = String(type ?? '').toLowerCase();
+  if (t === 'uuid') return `${col} = current_setting('app.current_tenant', true)::uuid`;
+  if (t === 'text' || t === 'character varying' || t === 'varchar' || t === '') {
+    return `${col} = current_setting('app.current_tenant', true)`;
+  }
+  // int, bigint, citext, a domain — cast the column instead of guessing.
+  return `${col}::text = current_setting('app.current_tenant', true)`;
+}
+
 export function classifyTableResult({ rlsEnabled, policyCount, ownVisible, crossVisible, writeAffected = 0, insertLeaked = false, orphanLeaked = false, ownInsertInvisible = false, ownInsertRejected = false, tenantCount, noAccess, probedWrites = false }) {
   if (noAccess) {
     return { status: 'no-access', message: `role cannot read this table at all (no SELECT grant) — nothing to prove` };
@@ -383,22 +411,22 @@ export function classifyTableResult({ rlsEnabled, policyCount, ownVisible, cross
       kind: 'read',
       message: `tenant A's session READ ${crossVisible} row(s) belonging to tenant B — ${cause}`,
       fix: rlsEnabled
-        ? `Scope the read policy by the tenant column, e.g. USING ({col} = current_setting('app.current_tenant')).`
-        : `Enable RLS and add a tenant policy:\n  ALTER TABLE {tbl} ENABLE ROW LEVEL SECURITY;\n  ALTER TABLE {tbl} FORCE ROW LEVEL SECURITY;\n  CREATE POLICY tenant_isolation ON {tbl} USING ({col} = current_setting('app.current_tenant'));`,
+        ? `Scope the read policy by the tenant column, e.g. USING ({cmp}).`
+        : `Enable RLS and add a tenant policy:\n  ALTER TABLE {tbl} ENABLE ROW LEVEL SECURITY;\n  ALTER TABLE {tbl} FORCE ROW LEVEL SECURITY;\n  CREATE POLICY tenant_isolation ON {tbl} USING ({cmp});`,
     });
   }
   if (writeAffected > 0) {
     leaks.push({
       kind: 'write',
       message: `tenant A's session made a cross-tenant WRITE affecting ${writeAffected} row(s) — it can UPDATE/DELETE another tenant's rows, or reassign its OWN rows INTO another tenant (a tenant-hop the read policy passes but no WITH CHECK on the destination stops). RLS is per-command; a correct SELECT policy protects none of this`,
-      fix: `Add write coverage — a FOR ALL policy, or explicit UPDATE/DELETE policies, scoped by the tenant column:\n  CREATE POLICY tenant_all ON {tbl} FOR ALL\n    USING ({col} = current_setting('app.current_tenant'))\n    WITH CHECK ({col} = current_setting('app.current_tenant'));`,
+      fix: `Adding a policy is NOT enough on its own. Postgres OR-combines permissive policies, so a permissive write policy that is not tenant-scoped keeps granting everything no matter what you add beside it — verified: with a `+ '`' + `USING (true)` + '`' + ` policy present, adding the tenant policy below left exactly as many rows writable as before, and dropping the loose one was what fixed it.\n  1. Find the permissive write policies that are not tenant-scoped:\n       SELECT polname, polcmd, polpermissive, pg_get_expr(polqual, polrelid) AS using_expr\n         FROM pg_policy WHERE polrelid = '{tbl}'::regclass;\n  2. DROP POLICY "<name>" ON {tbl};   -- for each one whose USING does not name {col}\n  3. Then add the scoped policy:\n       CREATE POLICY tenant_all ON {tbl} FOR ALL\n         USING ({cmp})\n         WITH CHECK ({cmp});`,
     });
   }
   if (insertLeaked) {
     leaks.push({
       kind: 'write',
       message: `tenant A's session INSERTed a row belonging to tenant B — it can CREATE rows in another tenant. INSERT is governed only by a WITH CHECK clause; SELECT/UPDATE/DELETE policies don't cover it, so a table can scope reads correctly yet let any session write into any tenant`,
-      fix: `Add a WITH CHECK on INSERT — a FOR ALL policy covers it — scoped by the tenant column:\n  CREATE POLICY tenant_all ON {tbl} FOR ALL\n    USING ({col} = current_setting('app.current_tenant'))\n    WITH CHECK ({col} = current_setting('app.current_tenant'));`,
+      fix: `Add a WITH CHECK on INSERT — a FOR ALL policy covers it — scoped by the tenant column:\n  CREATE POLICY tenant_all ON {tbl} FOR ALL\n    USING ({cmp})\n    WITH CHECK ({cmp});\n      And check for a permissive INSERT policy that is not tenant-scoped: permissive policies OR together, so one of those keeps letting the insert through whatever you add beside it.\n       SELECT polname, pg_get_expr(polwithcheck, polrelid) FROM pg_policy WHERE polrelid = '{tbl}'::regclass;`,
     });
   }
   if (orphanLeaked) {
@@ -898,11 +926,17 @@ export async function prove({ query, config = {} }) {
       }
       if (verdict.status === 'leak') {
         for (const leak of verdict.leaks) {
+          // The message needs the same substitution as the fix. It did not get
+          // it, so the orphan-leak finding printed a literal "{col}" to the user.
+          const fill = (text) => String(text ?? '')
+            .split('{cmp}').join(tenantComparison(quoteIdent(t.tenantColumn), t.tenantColumnType))
+            .split('{col}').join(quoteIdent(t.tenantColumn))
+            .split('{tbl}').join(tbl);
           violations.push({
             where: `${t.schema}.${t.table} (${t.tenantColumn})`,
             kind: leak.kind,
-            message: leak.message,
-            fix: leak.fix.split('{col}').join(quoteIdent(t.tenantColumn)).split('{tbl}').join(tbl),
+            message: fill(leak.message),
+            fix: fill(leak.fix),
             crossVisible,
             writeAffected,
             rlsEnabled: t.rlsEnabled,

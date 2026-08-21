@@ -175,10 +175,26 @@ export async function check({ query, config = {} }) {
   try {
     // Read the privileged surface (grant + total rows) BEFORE dropping role.
     for (const t of tables) {
-      const s = readSurfaceSql(t.schema, t.name, role);
-      const row = (await q(s.text, s.values))[0];
-      t.canSelect = row.can_select === true || row.can_select === 't';
-      t.total = row.total ?? 0;
+      // Each relation in its own savepoint. The privileged pre-pass counts rows,
+      // and some relations raise when read: a materialized view created WITH NO
+      // DATA raises 55000, which threw straight out of check() and lost the
+      // ENTIRE scan — every real leak with it. Verified: a database with an
+      // unpopulated matview and a genuinely anon-readable table reported nothing
+      // at all, because the whole run aborted.
+      await query('savepoint tg_r', []);
+      try {
+        const s = readSurfaceSql(t.schema, t.name, role);
+        const row = (await q(s.text, s.values))[0];
+        t.canSelect = row.can_select === true || row.can_select === 't';
+        t.total = row.total ?? 0;
+        await query('release savepoint tg_r', []);
+      } catch (err) {
+        try { await query('rollback to savepoint tg_r', []); await query('release savepoint tg_r', []); }
+        catch { /* the outer rollback still discards everything */ }
+        t.introspectError = err.message;
+        t.canSelect = false;
+        t.total = null;
+      }
     }
 
     // Negative control: `anon` must be subject to RLS.
@@ -208,6 +224,15 @@ export async function check({ query, config = {} }) {
     }
 
     for (const t of tables) {
+      // A relation we could not read privileged was never examined — say so
+      // rather than counting it as clean.
+      if (t.introspectError) {
+        notes.push({
+          where: `${t.schema}.${t.name}`,
+          message: `not examined — reading it as the privileged role failed (${String(t.introspectError).slice(0, 110)}). A materialized view created WITH NO DATA does this. Isolation is NOT proven here.`,
+        });
+        continue;
+      }
       scanned++;
       let anonVisible = 0;
       // Probe whenever anon holds a grant and the structural rule doesn't already

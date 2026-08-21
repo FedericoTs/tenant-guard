@@ -99,7 +99,7 @@ test('netWriteGrants seeds the views, so a schema-wide revoke reaches one with n
     { name: '002.sql', sql: 'revoke insert, update, delete on all tables in schema public from anon;' },
   ];
   const state = netWriteGrants(files, ['anon', 'authenticated'], ['public_profiles']);
-  const entry = state.get('public_profiles');
+  const entry = state.get('public.public_profiles');
   assert.ok(entry, 'the view must be tracked even with no GRANT naming it');
   assert.ok(entry.revoked.has('update'));
 });

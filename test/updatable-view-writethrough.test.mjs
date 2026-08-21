@@ -81,14 +81,17 @@ test('a WHERE clause does not make a view read-only', () => {
 
 // ── grants ───────────────────────────────────────────────────────────
 
+// netWriteGrants keys by schema.name — an unqualified object name defaults to
+// public — because two same-named views in different schemas are different
+// objects, and collapsing them let one hide the other.
 test('netWriteGrants: GRANT adds, REVOKE takes away, in migration order', () => {
   const files = [
     { name: '001_a.sql', sql: 'GRANT ALL ON public.v TO anon;' },
     { name: '002_b.sql', sql: 'REVOKE INSERT, UPDATE, DELETE ON public.v FROM anon;' },
   ];
   const state = netWriteGrants(files, ['anon', 'authenticated']);
-  assert.deepEqual([...state.get('v').granted], []);
-  assert.deepEqual([...state.get('v').revoked].sort(), ['delete', 'insert', 'update']);
+  assert.deepEqual([...state.get('public.v').granted], []);
+  assert.deepEqual([...state.get('public.v').revoked].sort(), ['delete', 'insert', 'update']);
 });
 
 test('netWriteGrants: SELECT-only grants are not write grants', () => {
@@ -98,7 +101,7 @@ test('netWriteGrants: SELECT-only grants are not write grants', () => {
 
 test('netWriteGrants: a grant to PUBLIC counts, since the exposed roles inherit it', () => {
   const state = netWriteGrants([{ name: '001.sql', sql: 'GRANT UPDATE ON v TO PUBLIC;' }], ['anon']);
-  assert.deepEqual([...state.get('v').granted], ['update']);
+  assert.deepEqual([...state.get('public.v').granted], ['update']);
 });
 
 test('detectDefaultWriteGrants: an explicit ALTER DEFAULT PRIVILEGES is the strongest evidence', () => {

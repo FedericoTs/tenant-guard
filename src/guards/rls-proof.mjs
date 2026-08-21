@@ -492,6 +492,7 @@ export async function prove({ query, config = {} }) {
   const notes = [];
   let scanned = 0;
   let provenCount = 0;
+  let readOnlyProven = 0;
 
   const q = async (text, values) => (await query(text, values)).rows;
 
@@ -792,11 +793,26 @@ export async function prove({ query, config = {} }) {
           continue;
         }
         let seen = 0;
+        let foreignWrote = 0;
         let failed = null;
         try {
           for (const s of buildBecomeTenant(cfg.becomeTenant, foreign)) await query(s.text, s.values);
           const c = tenantRowCountSql(t.schema, t.table, t.tenantColumn, mine);
           seen = (await q(c.text, c.values))[0].n;
+
+          // The WRITE path, which this branch never probed. It counted toward
+          // "proven isolated (read + write)" on nothing but a read — so a table
+          // holding one tenant with `FOR UPDATE USING (true)` was reported as
+          // proven on both. Verified: 2/2 proven, wide open.
+          //
+          // Acting as the foreign tenant, a whole-table UPDATE or DELETE that
+          // affects anything is touching rows that belong to `mine`, because
+          // that is the only tenant in this table.
+          if (probedWrites) {
+            const u = updateProbeSql(t.schema, t.table, t.tenantColumn, foreign); // hop mine -> foreign
+            const d = deleteProbeSql(t.schema, t.table);
+            foreignWrote = Math.max(await probeWrite(u.text, u.values), await probeWrite(d.text, d.values));
+          }
         } catch (err) {
           if (!isPermissionDenied(err)) failed = err.message;
         }
@@ -816,8 +832,30 @@ export async function prove({ query, config = {} }) {
             crossVisible: seen,
             rlsEnabled: t.rlsEnabled,
           });
+        } else if (foreignWrote > 0) {
+          violations.push({
+            where: `${t.schema}.${t.table} (${t.tenantColumn})`,
+            kind: 'write',
+            message:
+              `this table holds only tenant "${mine}", and a session acting as a DIFFERENT tenant wrote ${foreignWrote} of its row(s) — a cross-tenant WRITE. ` +
+              `The read side is correctly scoped, which is what makes this easy to miss: RLS is per-command, so a SELECT policy protects none of the write path.`,
+            fix:
+              `Add write coverage scoped by the tenant column, and check for a permissive write policy that is not — permissive policies OR together, so one of those keeps granting everything:\n` +
+              `  SELECT polname, polcmd, pg_get_expr(polqual, polrelid) FROM pg_policy WHERE polrelid = '${qualified(t.schema, t.table)}'::regclass;\n` +
+              `  DROP POLICY "<the unscoped one>" ON ${qualified(t.schema, t.table)};\n` +
+              `  CREATE POLICY tenant_all ON ${qualified(t.schema, t.table)} FOR ALL\n` +
+              `    USING (${tenantComparison(quoteIdent(t.tenantColumn), t.tenantColumnType)})\n` +
+              `    WITH CHECK (${tenantComparison(quoteIdent(t.tenantColumn), t.tenantColumnType)});`,
+            writeAffected: foreignWrote,
+            rlsEnabled: t.rlsEnabled,
+          });
         } else {
-          provenCount++;
+          // Only counts as fully proven when the writes were actually probed.
+          if (probedWrites) provenCount++;
+          else {
+            readOnlyProven++;
+            notes.push({ where: `${t.schema}.${t.table}`, message: `no cross-tenant READ from a foreign tenant — but the write path was not probed here, so this table is proven for reads only.` });
+          }
         }
         continue;
       }

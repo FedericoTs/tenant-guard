@@ -242,6 +242,33 @@ export function anonDeleteSql(schema, table) {
   return `delete from ${qualified(schema, table)}`;
 }
 
+/**
+ * A constraint violation raised BY the probe is evidence the policy allowed it.
+ *
+ * An unqualified `DELETE FROM t` on a table some other table references raises
+ * 23503 — and that error can only be reached by rows that survived RLS, because
+ * a policy that hides every row deletes nothing and raises nothing. So 23503
+ * means the write was permitted and something downstream stopped it, not that
+ * the policy blocked it. Swallowing it as "0 rows affected" is why a freely
+ * anon-deletable table was reported as UPDATE-only.
+ *
+ * Verified, same table with one child row present:
+ *
+ *     policy permits the delete        -> ERROR 23503
+ *     policy blocks it (no rows)       -> affected 0, no error
+ *     no DELETE policy at all          -> affected 0, no error
+ *
+ * Adding a WHERE to dodge the FK would have been the wrong fix: a predicate is
+ * evaluated after the SELECT policy, so a filtered probe cannot target the rows
+ * that matter. The whole-table form is deliberate.
+ */
+export function impliesWritePermitted(err) {
+  const code = String(err?.code ?? '');
+  // 23xxx = integrity constraint violation: FK, NOT NULL, CHECK, unique.
+  // 2D000 / 25xxx are transaction-state errors and say nothing either way.
+  return /^23\d\d\d$/.test(code);
+}
+
 /** Build a violation for a flagged table. */
 export function violationFor(t, commands, viaRls) {
   return {
@@ -321,6 +348,10 @@ export async function check({ query, config = {} }) {
       }
     }
 
+    // Returns { n, blocked, reason }. Returning a bare 0 for EVERY error was the
+    // bug: a foreign-key violation, a NOT NULL, a check constraint — none of
+    // which say anything about whether the policy would have allowed the write —
+    // all read as "the policy blocked it", which is a silent false negative.
     const probeWrite = async (sql) => {
       await query('savepoint tg_a', []);
       try {
@@ -328,10 +359,17 @@ export async function check({ query, config = {} }) {
         const n = res.rowCount ?? res.affectedRows ?? 0;
         await query('rollback to savepoint tg_a', []);
         await query('release savepoint tg_a', []);
-        return n;
-      } catch {
+        return { n, blocked: false };
+      } catch (err) {
         try { await query('rollback to savepoint tg_a', []); await query('release savepoint tg_a', []); } catch { /* ignore */ }
-        return 0;
+        const msg = String(err?.message ?? '');
+        const denied = err?.code === '42501' || /violates row-level security policy|permission denied/i.test(msg);
+        // A constraint violation proves rows got past the policy — see
+        // impliesWritePermitted. Treat it as a write the policy allowed.
+        if (!denied && impliesWritePermitted(err)) {
+          return { n: 1, blocked: false, viaConstraint: `${err?.code} ${msg.slice(0, 70)}` };
+        }
+        return { n: 0, blocked: denied, reason: denied ? null : `${err?.code ?? '?'} ${msg.slice(0, 90)}` };
       }
     };
 
@@ -345,9 +383,20 @@ export async function check({ query, config = {} }) {
       }
       // RLS on: probe the real policy as the role. (INSERT-under-RLS not probed yet.)
       const cmds = [];
-      if (t.probeCol && t.canUpdate && (await probeWrite(anonUpdateSql(t.schema, t.table, t.probeCol))) > 0) cmds.push('UPDATE');
-      if (t.canDelete && (await probeWrite(anonDeleteSql(t.schema, t.table))) > 0) cmds.push('DELETE');
+      const inconclusive = [];
+      const record = (label, r) => {
+        if (r.n > 0) cmds.push(label);
+        else if (!r.blocked && r.reason) inconclusive.push(`${label} (${r.reason})`);
+      };
+      if (t.probeCol && t.canUpdate) record('UPDATE', await probeWrite(anonUpdateSql(t.schema, t.table, t.probeCol)));
+      if (t.canDelete) record('DELETE', await probeWrite(anonDeleteSql(t.schema, t.table)));
       if (cmds.length) violations.push(violationFor(t, cmds, true));
+      if (inconclusive.length) {
+        notes.push({
+          where: `${t.schema}.${t.table}`,
+          message: `could not settle ${inconclusive.join(', ')} — the statement failed for a reason unrelated to policy (a constraint, not a denial), so this command is NOT proven blocked.`,
+        });
+      }
     }
 
     // Views. Probed exactly like the tables above, and inside the same
@@ -355,8 +404,8 @@ export async function check({ query, config = {} }) {
     for (const v of viewPlan) {
       scanned++;
       const cmds = [];
-      if (v.canUpdate && v.probeCol && (await probeWrite(viewUpdateSql(v.schema, v.table, v.probeCol))) > 0) cmds.push('UPDATE');
-      if (v.canDelete && (await probeWrite(anonDeleteSql(v.schema, v.table))) > 0) cmds.push('DELETE');
+      if (v.canUpdate && v.probeCol && (await probeWrite(viewUpdateSql(v.schema, v.table, v.probeCol))).n > 0) cmds.push('UPDATE');
+      if (v.canDelete && (await probeWrite(anonDeleteSql(v.schema, v.table))).n > 0) cmds.push('DELETE');
       if (cmds.length) violations.push(violationForView(v, cmds, role));
     }
   } finally {

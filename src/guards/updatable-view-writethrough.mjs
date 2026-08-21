@@ -53,6 +53,21 @@ const WRITE_PRIVS = ['insert', 'update', 'delete'];
 const bare = (name) => String(name ?? '').replace(/"/g, '').split('.').pop().toLowerCase();
 
 /**
+ * `schema.name`, defaulting an unqualified name to `public`.
+ *
+ * Views were keyed by bare name, so `public.profiles` and `reporting.profiles`
+ * collapsed into one entry and the later definition overwrote the earlier — a
+ * reporting view could silently replace, and hide, a real write-through. The
+ * emitted REVOKE was unqualified too, which is ambiguous to paste.
+ */
+export const qualifiedName = (name) => {
+  const parts = String(name ?? '').replace(/"/g, '').toLowerCase().split('.');
+  const table = parts.pop() ?? '';
+  const schema = parts.pop() || 'public';
+  return `${schema}.${table}`;
+};
+
+/**
  * Every view a migration defines, with the two properties that decide whether a
  * write can pass through it.
  */
@@ -64,6 +79,7 @@ export function extractViews(sql) {
   while ((m = re.exec(text)) !== null) {
     const isMaterialized = Boolean(m[1]);
     const name = bare(m[2]);
+    const qualified = qualifiedName(m[2]);
     const options = m[3] || '';
     const start = m.index + m[0].length;
     const end = text.indexOf(';', start);
@@ -76,6 +92,7 @@ export function extractViews(sql) {
 
     out.push({
       name,
+      qualified,
       isMaterialized,
       securityInvoker,
       body: body.trim(),
@@ -154,7 +171,7 @@ export function netWriteGrants(files, exposedRoles, viewNames = []) {
     if (!state.has(name)) state.set(name, { granted: new Set(), revoked: new Set() });
     return state.get(name);
   };
-  for (const v of viewNames) touch(bare(v));
+  for (const v of viewNames) touch(qualifiedName(v));
 
   const hitsRole = (targets) =>
     [...roles].some((r) => new RegExp(`\\b${r}\\b`).test(targets)) || /\bpublic\b/.test(targets);
@@ -187,13 +204,28 @@ export function netWriteGrants(files, exposedRoles, viewNames = []) {
       if (/^all$/i.test(m[3])) continue; // the schema-wide form, handled above
       if (!hitsRole(m[4].toLowerCase())) continue;
       const applies = privsOf(m[2].toLowerCase());
-      if (applies.length) events.push({ at: m.index, verb: m[1].toLowerCase(), applies, obj: bare(m[3]) });
+      if (applies.length) events.push({ at: m.index, verb: m[1].toLowerCase(), applies, obj: qualifiedName(m[3]) });
     }
+
+    // DROP VIEW wipes the object's ACL. A recreated view gets FRESH default
+    // privileges, so a REVOKE issued before the drop protects nothing — and the
+    // guard was carrying that stale revoke forward and reporting the view clean.
+    // The shape is completely ordinary: revoke on create, then `drop view` +
+    // `create view` in a later migration to add a column.
+    const dropRe = /\bdrop\s+(?:materialized\s+)?view\s+(?:if\s+exists\s+)?([a-z0-9_."]+)/gi;
+    let d;
+    while ((d = dropRe.exec(text)) !== null) events.push({ at: d.index, drop: qualifiedName(d[1]) });
 
     events.sort((x, y) => x.at - y.at);
     for (const ev of events) {
-      if (ev.all) for (const entry of state.values()) apply(entry, ev.verb, ev.applies);
-      else apply(touch(ev.obj), ev.verb, ev.applies);
+      if (ev.drop) {
+        const entry = state.get(ev.drop);
+        if (entry) { entry.granted.clear(); entry.revoked.clear(); }
+      } else if (ev.all) {
+        for (const entry of state.values()) apply(entry, ev.verb, ev.applies);
+      } else {
+        apply(touch(ev.obj), ev.verb, ev.applies);
+      }
     }
   }
   return state;
@@ -308,7 +340,7 @@ export function run(config = {}) {
     .map((f) => ({ name: f, sql: readFileSync(join(dir, f), 'utf8') }));
 
   const allow = new Set(cfg.allowlist.map((n) => bare(n)));
-  const viewsForGrants = extractViews(files.map((f) => f.sql).join('\n')).map((v) => v.name);
+  const viewsForGrants = extractViews(files.map((f) => f.sql).join('\n')).map((v) => v.qualified);
   const grants = netWriteGrants(files, cfg.exposedRoles, viewsForGrants);
   const detected = detectDefaultWriteGrants(files, cfg.exposedRoles);
   const assumeDefaults = cfg.assumeDefaultWriteGrants === 'auto'
@@ -319,16 +351,21 @@ export function run(config = {}) {
   // The final definition of each view across history wins, as elsewhere.
   const views = new Map();
   for (const { name: file, sql } of [...files].sort(compareMigrations)) {
-    for (const v of extractViews(sql)) views.set(v.name, { ...v, file });
+    // Keyed by schema.name: two views of the same name in different schemas are
+    // different objects, and collapsing them let a reporting view overwrite —
+    // and hide — a real write-through.
+    for (const v of extractViews(sql)) views.set(v.qualified, { ...v, file });
   }
 
   const violations = [];
   const notes = [];
-  for (const [name, view] of views) {
-    if (allow.has(name)) continue;
+  for (const [key, view] of views) {
+    // An allowlist entry may be written either way; a bare name still matches,
+    // for the configs that were written before views were keyed by schema.
+    if (allow.has(key) || allow.has(view.name)) continue;
     const verdict = classifyView({
       view,
-      grants: grants.get(name),
+      grants: grants.get(key),
       assumeDefaults,
       evidence,
       exposedRoles: cfg.exposedRoles,

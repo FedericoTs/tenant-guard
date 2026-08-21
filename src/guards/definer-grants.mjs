@@ -143,12 +143,22 @@ export function extractFunctionDefs(sql) {
         : /\bvolatile\b/.test(header) ? 'volatile' : null;
 
     const body = extractFunctionBody(segment);
-    // Postgres will not let a non-volatile function write, so this is settled.
-    const mutates = volatility === 'stable' || volatility === 'immutable'
-      ? false
-      : body !== null
-        ? bodyMutates(body)
-        : /\b(insert\s+into|delete\s+from|update\s+[a-z_"])/.test(header);
+    // Declared volatility is NOT proof the function cannot write. Postgres blocks
+    // DML written directly in a non-volatile body, but a STABLE function that
+    // calls a VOLATILE helper writes perfectly well — verified, the row landed.
+    // So STABLE means "no DIRECT DML", never "cannot write", and the body still
+    // has to be read.
+    const directDml = body !== null
+      ? bodyMutates(body)
+      : /\b(insert\s+into|delete\s+from|update\s+[a-z_"])/.test(header);
+    const nonVolatile = volatility === 'stable' || volatility === 'immutable';
+    // A non-volatile function cannot successfully run direct DML, so a direct
+    // hit there is dead code rather than a live mutation. What it CAN do is
+    // reach a volatile helper, and that is unknowable from this file alone —
+    // reported as a separate, softer signal so it never drives the REVOKE advice
+    // that took a database down in 0.26.0.
+    const mutates = nonVolatile ? false : directDml;
+    const callsUserFunction = body !== null && bodyCallsUserFunction(body);
 
     const searchPath = functionSearchPath(segment);
     out.push({
@@ -156,6 +166,10 @@ export function extractFunctionDefs(sql) {
       isDefiner: /security\s+definer/.test(header),
       returnsTrigger: /returns\s+trigger/.test(header),
       mutates,
+      // STABLE/IMMUTABLE + a call out to another function: Postgres will not stop
+      // it writing through that callee. Not a violation on its own; surfaced so
+      // the volatility claim is not mistaken for a proof.
+      mutationUnknown: nonVolatile && callsUserFunction,
       volatility,
       bodyKnown: body !== null,
       searchPath,
@@ -242,6 +256,33 @@ export function policyReferencedFunctions(sql) {
     names.delete(kw);
   }
   return names;
+}
+
+/**
+ * Does the body call out to another function?
+ *
+ * Matters because `STABLE` is enforced on the statements in THIS body, not on
+ * what it reaches: a `STABLE` function that does `PERFORM helper()` where the
+ * helper is `VOLATILE` writes without complaint. Verified — the row landed.
+ *
+ * Built-ins and the obvious read-only helpers are excluded, or every RLS
+ * predicate in the schema would match. This is a signal for a note, never for a
+ * violation, so a loose match here costs a sentence rather than a wrong REVOKE.
+ */
+export function bodyCallsUserFunction(body) {
+  const text = stripSqlComments(String(body ?? '')).toLowerCase();
+  const BUILTIN = new Set([
+    'coalesce', 'nullif', 'greatest', 'least', 'count', 'sum', 'min', 'max', 'avg',
+    'now', 'current_setting', 'set_config', 'concat', 'format', 'array_agg', 'jsonb_build_object',
+    'json_build_object', 'to_jsonb', 'exists', 'lower', 'upper', 'trim', 'length', 'cast',
+    'uid', 'jwt', 'role', 'email', 'nextval', 'currval', 'gen_random_uuid', 'random',
+    'if', 'while', 'for', 'case', 'return', 'select', 'values', 'and', 'or', 'not', 'in', 'any', 'all',
+  ]);
+  for (const m of text.matchAll(/([a-z_][a-z0-9_]*)\s*\(/g)) {
+    const name = m[1].includes('.') ? m[1].split('.').pop() : m[1];
+    if (!BUILTIN.has(name)) return true;
+  }
+  return false;
 }
 
 /** The SECURITY DEFINER functions in `sql` (a filtered view of extractFunctionDefs). */
@@ -435,6 +476,22 @@ export function run(config = {}) {
         `      If it is intentionally pre-auth, add "${v.fn}" to definerGrants.allowlist[] in your tenant-guard config.`,
     }));
 
+  const volatilityNotes = [];
+  // Non-volatile definer functions that reach another function: the volatility
+  // says nothing about what the callee does.
+  for (const file of [...files].sort(compareMigrations)) {
+    if (migrationNumber(file.name) <= baseline) continue;
+    for (const fn of extractFunctionDefs(file.sql ?? '')) {
+      if (!fn.isDefiner || fn.returnsTrigger || !fn.mutationUnknown) continue;
+      if ((config.allowlist ?? []).includes(fn.name)) continue;
+      volatilityNotes.push({
+        where: file.name,
+        message:
+          `"${fn.name}" is SECURITY DEFINER and declared ${fn.volatility}, and it calls another function. ${fn.volatility?.toUpperCase()} only stops DML written in THIS body — a call out to a VOLATILE function writes without complaint, verified. So the volatility does not prove this function cannot mutate; check what it calls.`,
+      });
+    }
+  }
+
   // ── search_path, statically ────────────────────────────────────────
   // Notes rather than failures on purpose: whether an unpinned path is
   // EXPLOITABLE depends on who holds CREATE, which migrations cannot tell you.
@@ -494,7 +551,8 @@ export function run(config = {}) {
         `"${h.fn}" is a SECURITY DEFINER ${h.volatility ?? 'non-mutating'} predicate referenced by a policy — an RLS helper, which is the correct pattern. ` +
         `Not flagged, and its EXECUTE grant must stay: revoking it would break every read the policy guards.`,
     }))
-    .concat(spNotes);
+    .concat(spNotes)
+    .concat(volatilityNotes);
 
   return {
     id: meta.id,

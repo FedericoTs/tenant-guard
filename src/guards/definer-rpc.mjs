@@ -225,13 +225,43 @@ export function searchPathSchemas(config) {
  *
  * Returns the writable schemas that are actually reachable, [] if the pin holds.
  */
-export function shadowableSchemas(config, writableSchemas = []) {
+export function shadowableSchemas(config, writableSchemas = [], ownSchema = null) {
   const writable = new Set(writableSchemas);
+  const path = searchPathSchemas(config);
   const out = [];
-  for (const schema of searchPathSchemas(config)) {
-    if (schema.toLowerCase() === 'pg_catalog') break; // no longer hijackable past here
+
+  // Where does the body's unqualified name actually resolve? The function's own
+  // schema is the best available answer, and it is the one that matters: a
+  // writable schema only helps an attacker if it comes BEFORE the schema that
+  // really holds the object.
+  //
+  // Two things this has to get right at once.
+  //
+  //  * `pg_catalog` must not stop the walk. It holds system catalogs and none of
+  //    your tables, so an unqualified name never resolves there. Stopping was a
+  //    false negative: `pg_catalog, public, app` with `public` writable and the
+  //    table in `app` reported nothing, and that path is hijackable — verified,
+  //    the definer function ran a table planted in public.
+  //
+  //  * `public` on `pg_catalog, public` must NOT be reported when the function
+  //    lives in public. Nothing precedes the real object, and an attacker cannot
+  //    shadow a name in the same schema that already has it — the CREATE
+  //    collides. Reporting it would fire on essentially every Supabase project,
+  //    which is the cry-wolf outcome this tool is most damaged by.
+  const target = String(ownSchema ?? '').toLowerCase();
+  const stopAt = target
+    ? path.findIndex((x) => x.toLowerCase() === target)
+    : path.length - 1; // no better information: treat the last entry as the home
+  const limit = stopAt < 0 ? path.length : stopAt;
+
+  for (let i = 0; i < limit; i++) {
+    const schema = path[i];
+    if (schema.toLowerCase() === 'pg_catalog') continue;
     if (writable.has(schema)) out.push(schema);
-    else break; // the real object resolves here; nothing later can be shadowed
+    // A non-writable schema ahead of the target may itself hold the object, and
+    // resolution stops at the first schema that has it, so nothing later can be
+    // shadowed.
+    else break;
   }
   return out;
 }
@@ -473,7 +503,7 @@ export async function check({ query, config = {} }) {
         // A pin that names a writable schema is not a pin. Verified: pinned
         // `= public, app` with `public` writable returned the attacker's planted
         // table; `= app, public` returned the real one.
-        const shadowable = pinned ? shadowableSchemas(fn.config, writableSchemas) : [];
+        const shadowable = pinned ? shadowableSchemas(fn.config, writableSchemas, fn.schema) : [];
         const tempOpen = pinned && shadowable.length === 0 && temporarilyShadowable(fn.config);
         if ((!pinned && writableSchemas.length > 0) || shadowable.length > 0 || tempOpen) {
           const reachable = pinned ? shadowable : writableSchemas;

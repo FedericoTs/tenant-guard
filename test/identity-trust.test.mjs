@@ -239,14 +239,44 @@ test('classifySelfEscalation: column NOT writable (column-level GRANT) -> safe',
   assert.equal(v.status, 'safe');
 });
 
-test('classifySelfEscalation: writable column that no policy reads -> safe (not every column is authority)', () => {
+test('classifySelfEscalation: an authorization-named column no policy reads -> NOTE', () => {
+  // The database does not authorize from "plan", so this is not conclusive at
+  // the SQL level — but the column is named for a decision the app makes, and a
+  // user who can rewrite it upgrades themselves. Calling that "safe" was wrong.
   const v = classifySelfEscalation({
     schema: 'public', table: 'profiles',
     columns: [{ name: 'plan', canUpdate: true, isTenant: false }],
     updatePolicies: [{ policy: 'self', cmd: 'UPDATE' }],
     referencedColumns: [],
   });
-  assert.equal(v.status, 'safe');
+  assert.equal(v.status, 'note');
+  assert.match(v.message, /No policy authorizes from it/);
+  assert.match(v.message, /your application does/);
+  assert.deepEqual(v.columns, ['plan']);
+});
+
+test('classifySelfEscalation: a column the role CANNOT update is safe, whatever its name', () => {
+  const v = classifySelfEscalation({
+    schema: 'public', table: 'profiles',
+    columns: [{ name: 'is_admin', canUpdate: false, isTenant: false }],
+    updatePolicies: [{ policy: 'self', cmd: 'UPDATE' }],
+    referencedColumns: ['is_admin'],
+  });
+  assert.equal(v.status, 'safe'); // a column-level GRANT is the actual fix
+});
+
+test('classifySelfEscalation: a policy-read column outranks a merely-named one', () => {
+  const v = classifySelfEscalation({
+    schema: 'public', table: 'profiles',
+    columns: [
+      { name: 'is_admin', canUpdate: true, isTenant: false },
+      { name: 'plan', canUpdate: true, isTenant: false },
+    ],
+    updatePolicies: [{ policy: 'self', cmd: 'UPDATE' }],
+    referencedColumns: ['is_admin'],
+  });
+  assert.equal(v.status, 'leak');
+  assert.deepEqual(v.columns, ['is_admin']); // the conclusive one is the finding
 });
 
 test('classifySelfEscalation: no UPDATE-applicable policy -> safe (nothing can be updated at all)', () => {

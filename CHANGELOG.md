@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.25.0
+
+Fixes a coverage gap in `identity-trust` that the documentation did not have:
+the threat model claimed self-row privilege escalation was covered, with
+`profiles.is_admin` as the example, and that exact example was not detected.
+
+- **fix: self-row escalation now runs over every table with an UPDATE-applicable
+  policy.** It was scoped to tables reached through `pg_depend` — so it only
+  examined a `profiles` table when *another* table's policy consulted it. Two
+  shapes, both common, were therefore never looked at:
+  - `profiles.is_admin` read by a policy **on `profiles` itself**
+  - an admin flag the **application** checks, which no policy mentions at all
+
+  Both are now reported. Verified before and after: with only a same-table
+  policy the old code found nothing; the new code names `is_admin` and
+  `organization_id` and gives the column-GRANT fix.
+
+- **The wrong source was the root cause.** The candidate list came from a query
+  scoped to tables *carrying a tenant column* — correct for tenant questions, and
+  wrong here, because a `profiles` table usually has no tenant column and is
+  exactly where escalation lives. There is now a query for every policy in scope.
+
+- **A third severity tier.** A column named like an authorization field
+  (`is_admin`, `role`, `plan`, `tier`…) that **no policy reads** is now a
+  **note** rather than silence: the database does not treat it as a boundary, but
+  the name says the application does, and RLS cannot restrict columns either way.
+  A column the role cannot UPDATE stays silent — a column-level GRANT is the fix,
+  and the guard recognises it as one.
+
+- **docs: the threat model's §3.8 row now describes what the code does.** A
+  security tool claiming coverage it does not have is the worst defect it can
+  ship, and this one had shipped since 0.12.0.
+
+- 531 tests (was 527), 20 guards.
+
 ## 0.24.2
 
 A bug hunt across the guards written this week. Nothing was failing — these were

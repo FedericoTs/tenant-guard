@@ -34,6 +34,55 @@ const SEED = `
 `;
 
 if (PGlite) {
+  // ── 3.8, the commonest shape: an admin flag on the table whose OWN policy
+  //    reads it. No cross-table dependency exists, so the dependency-driven
+  //    lookup never examined this table at all.
+  test('CATCHES a self-settable admin flag when the policy is on the same table', async () => {
+    const { query } = await fresh(`
+      create table profiles (
+        id uuid primary key default gen_random_uuid(),
+        organization_id text not null,
+        is_admin boolean not null default false
+      );
+      grant select, update on profiles to authenticated;
+      alter table profiles enable row level security;
+      create policy self_update on profiles for update
+        using (id = (current_setting('request.jwt.claims', true)::json ->> 'sub')::uuid)
+        with check (id = (current_setting('request.jwt.claims', true)::json ->> 'sub')::uuid);
+      create policy admin_reads_all on profiles for select
+        using (is_admin or organization_id = current_setting('app.current_tenant', true));
+      insert into profiles (organization_id) values ('org_A'), ('org_B');
+    `);
+    const res = await check({ query, config: { claim: 'org_id' } });
+    const v = res.violations.find((x) => x.kind === 'self-escalation');
+    assert.ok(v, JSON.stringify(res.violations, null, 2));
+    assert.match(v.message, /is_admin/);
+    assert.match(v.message, /RLS is ROW-level/);
+    assert.match(v.fix, /GRANT UPDATE \(/);
+  });
+
+  test('a column-level GRANT is recognised as the fix — no finding once applied', async () => {
+    const { query } = await fresh(`
+      create table profiles (
+        id uuid primary key default gen_random_uuid(),
+        organization_id text not null,
+        is_admin boolean not null default false,
+        display_name text
+      );
+      grant select on profiles to authenticated;
+      grant update (display_name) on profiles to authenticated;   -- the fix
+      alter table profiles enable row level security;
+      create policy self_update on profiles for update
+        using (id = (current_setting('request.jwt.claims', true)::json ->> 'sub')::uuid)
+        with check (id = (current_setting('request.jwt.claims', true)::json ->> 'sub')::uuid);
+      create policy admin_reads_all on profiles for select
+        using (is_admin or organization_id = current_setting('app.current_tenant', true));
+      insert into profiles (organization_id) values ('org_A'), ('org_B');
+    `);
+    const res = await check({ query, config: { claim: 'org_id' } });
+    assert.equal(res.violations.filter((v) => v.kind === 'self-escalation').length, 0);
+  });
+
   test('PROVES the user_metadata leak: forging the claim reads another tenant', async () => {
     const { query } = await fresh(`
       ${SEED}

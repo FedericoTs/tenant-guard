@@ -290,7 +290,13 @@ export function writePoliciesSql(qualifiedNames) {
  * USING expression as the check.
  */
 export function effectiveCheck(policy) {
-  return policy.with_check ?? (policy.cmd === 'ALL' ? policy.qual : null);
+  // Postgres reuses USING as the WITH CHECK when none is given — for UPDATE as
+  // well as ALL, not just ALL. Verified: an UPDATE policy with USING only raises
+  // 42501 "new row violates row-level security policy" on a tenant hop, so the
+  // USING clause IS the check. Treating that as "no check" read a correctly
+  // constrained policy as unconstrained.
+  const inheritsUsing = policy.cmd === 'ALL' || policy.cmd === 'UPDATE';
+  return policy.with_check ?? (inheritsUsing ? policy.qual : null);
 }
 
 /**

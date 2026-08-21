@@ -20,6 +20,38 @@
 import { readdirSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 
+/**
+ * Order migrations the way the tools that apply them do: by FULL FILENAME,
+ * lexicographically.
+ *
+ * This used to sort on the numeric prefix alone. For two files sharing a prefix
+ * — `20260531_a_create.sql` and `20260531_b_drop.sql`, which is the ordinary
+ * Supabase date convention — the comparator returned 0, so a stable sort kept
+ * `readdirSync` order, i.e. **filesystem order**. Net-state-of-history reasoning
+ * (a REVOKE here, a re-GRANT there; which CREATE VIEW is the final one) was
+ * therefore machine-dependent on exactly the input shape it flags, and could be
+ * evaluated in the opposite order from the one Postgres will see.
+ */
+export function compareMigrations(a, b) {
+  return String(a?.name ?? a).localeCompare(String(b?.name ?? b), 'en');
+}
+
+/**
+ * Does lexicographic order disagree with numeric order? That happens with
+ * UNPADDED numbering (`9_x.sql` sorts after `10_y.sql`), where the filenames say
+ * one thing and the numbering another — worth saying out loud, because both this
+ * tool and the migration runner follow the filenames.
+ */
+export function lexicographicDisagreesWithNumeric(filenames) {
+  const sql = [...(filenames ?? [])].filter((f) => f.endsWith('.sql'));
+  const byName = [...sql].sort((a, b) => a.localeCompare(b, 'en'));
+  const byNumber = [...sql].sort((a, b) => {
+    const d = (migrationNumber(a) ?? 0) - (migrationNumber(b) ?? 0);
+    return d !== 0 ? d : a.localeCompare(b, 'en');
+  });
+  return byName.some((f, i) => f !== byNumber[i]);
+}
+
 /** Leading numeric prefix of a migration filename, or null. */
 export function migrationNumber(filename) {
   const m = filename.match(/^(\d+)/);
@@ -185,7 +217,7 @@ export function revokesAnonExecute(sql, name) {
  */
 export function findDefinerGrantViolations(files, { baseline = 0, allowlist = [] } = {}) {
   const allow = new Set(allowlist);
-  const sorted = [...files].sort((a, b) => (migrationNumber(a.name) ?? 0) - (migrationNumber(b.name) ?? 0));
+  const sorted = [...files].sort(compareMigrations);
 
   // The latest definition of each function name across all history.
   const latest = new Map(); // name -> { isDefiner, returnsTrigger, mutates, file, num }
@@ -231,7 +263,7 @@ export function findDefinerGrantViolations(files, { baseline = 0, allowlist = []
  * Surfaced as notes so the category is visible rather than silently skipped.
  */
 export function findRlsHelpers(files, { baseline = 0 } = {}) {
-  const sorted = [...files].sort((a, b) => (migrationNumber(a.name) ?? 0) - (migrationNumber(b.name) ?? 0));
+  const sorted = [...files].sort(compareMigrations);
   const referenced = new Set();
   for (const { sql } of sorted) for (const n of policyReferencedFunctions(sql)) referenced.add(n);
 

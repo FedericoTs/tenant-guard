@@ -27,7 +27,7 @@
  */
 import { readdirSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { migrationNumber, stripSqlComments } from './definer-grants.mjs';
+import { migrationNumber, stripSqlComments, compareMigrations } from './definer-grants.mjs';
 import { definedOnly } from '../config.mjs';
 
 export const meta = {
@@ -135,7 +135,7 @@ export function netWriteGrants(files, exposedRoles) {
     return state.get(name);
   };
 
-  const sorted = [...files].sort((a, b) => (migrationNumber(a.name) ?? 0) - (migrationNumber(b.name) ?? 0));
+  const sorted = [...files].sort(compareMigrations);
   for (const { sql } of sorted) {
     const text = stripSqlComments(sql);
     const re = /\b(grant|revoke)\s+([\s\S]*?)\s+on\s+(?:table\s+)?([a-z0-9_."]+)\s+(?:to|from)\s+([^;]+)/gi;
@@ -279,7 +279,7 @@ export function run(config = {}) {
 
   // The final definition of each view across history wins, as elsewhere.
   const views = new Map();
-  for (const { name: file, sql } of [...files].sort((a, b) => (migrationNumber(a.name) ?? 0) - (migrationNumber(b.name) ?? 0))) {
+  for (const { name: file, sql } of [...files].sort(compareMigrations)) {
     for (const v of extractViews(sql)) views.set(v.name, { ...v, file });
   }
 

@@ -146,11 +146,16 @@ test('authorityDepsSql: reads policy dependencies from pg_depend and excludes th
   assert.deepEqual(values, [['public']]);
 });
 
-test('effectiveCheck: FOR ALL with no WITH CHECK falls back to USING; FOR INSERT does not', () => {
+test('effectiveCheck: ALL *and UPDATE* fall back to USING; INSERT and SELECT do not', () => {
   assert.equal(effectiveCheck({ cmd: 'ALL', qual: 'q', with_check: null }), 'q');
   assert.equal(effectiveCheck({ cmd: 'ALL', qual: 'q', with_check: 'wc' }), 'wc');
   assert.equal(effectiveCheck({ cmd: 'INSERT', qual: null, with_check: 'wc' }), 'wc');
-  assert.equal(effectiveCheck({ cmd: 'UPDATE', qual: 'q', with_check: null }), null);
+  // This line used to assert null, which was wrong. Postgres reuses USING as the
+  // WITH CHECK for UPDATE too — proven against a real database: an UPDATE policy
+  // with USING only raises 42501 "new row violates row-level security policy" on
+  // a tenant hop. Reading that as "no check" flagged a correct policy.
+  assert.equal(effectiveCheck({ cmd: 'UPDATE', qual: 'q', with_check: null }), 'q');
+  assert.equal(effectiveCheck({ cmd: 'SELECT', qual: 'q', with_check: null }), null);
 });
 
 test('classifyAuthority: RLS off + write grant -> leak (structural, conclusive)', () => {

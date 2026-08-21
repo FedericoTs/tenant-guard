@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.29.0
+
+More of the MonkeyTravel brief — and reviewing it turned up **two real bugs in
+this tool**, one of which had been silently corrupting the guards' reasoning
+about migration history.
+
+### fix: history was being read in filesystem order
+
+Every guard that reasons about "the net state of history" — `definer-grants`,
+`updatable-view-writethrough` — sorted with
+`(migrationNumber(a) ?? 0) - (migrationNumber(b) ?? 0)`. For two files sharing a
+prefix, which is the ordinary Supabase date convention
+(`20260531_a.sql`, `20260531_b.sql`), that comparator returns **0**, so a stable
+sort preserved `readdirSync` order — **filesystem order**, which is not
+alphabetical and differs by platform.
+
+So "a REVOKE here, a re-GRANT there" and "which `CREATE VIEW` is the final one"
+could be evaluated in the **opposite order from the one Postgres will see** — on
+exactly the input shape `migration-collisions` was flagging. There is now one
+shared `compareMigrations`, ordering by full filename the way the migration
+runner does.
+
+### fix: `effectiveCheck` misread every UPDATE policy without a WITH CHECK
+
+Postgres reuses a policy's `USING` as its `WITH CHECK` when none is given — for
+`UPDATE` as well as `ALL`. `identity-trust` only did that for `ALL`, so a
+correctly constrained `FOR UPDATE ... USING (tenant = ...)` policy read as having
+**no check at all**, and its authority-table analysis treated a safe policy as
+unconstrained. Proven against a real database:
+
+```
+stays 'A': no error, rowCount=1
+hops  'B': ERROR 42501 new row violates row-level security policy
+```
+
+The old unit test asserted the wrong answer; it now asserts the right one, with
+that reproduction recorded next to it.
+
+### `migration-collisions` recalibrated (brief §9)
+
+It failed a real repository on eleven historical same-DATE prefix groups.
+Migrations apply in lexicographic full-filename order, so a shared prefix is
+deterministic — a naming choice, not a hazard, and failing on it hands
+date-prefixed repos a large grandfather list on day one.
+
+It now fails on **dependency inversion**: within a tied group, a migration that
+applies FIRST referencing an object a LATER one creates. That is not a surprising
+order, it is a migration that cannot apply against a fresh database — and it
+passes locally, because the local database already has the object. Ties without
+an inversion are a note; unpadded numbering (`9_x.sql` sorting after
+`10_y.sql`) gets its own note, because the filenames win.
+
+### Decided NOT to build (brief §6), recorded in the threat model
+
+The **PostgREST embed null-on-deny** and **write-vs-read policy mismatch**
+classes are now ⛔ *by decision* rather than absent. The symptom is real, but the
+only fixes a tool could emit for the first are "loosen the RLS on the embedded
+table" or "drop the embed" — and *weaken your RLS* is precisely the shape of
+advice that caused the 0.26.0 outage. It is also not a database fact: the catalog
+holds every FK, an app embeds a handful, and which ones the client requests is
+not visible. Modelled on a purpose-built 58-table per-user app where every table
+was correctly scoped, the proposed rule fires on **165 of 165 FK edges**. The
+second half would re-report by inference what §3.1–3.4 already prove by probe.
+
+- 613 tests (was 602), 22 guards.
+
 ## 0.28.0
 
 Three items off the MonkeyTravel brief, plus a new guard for a question that came

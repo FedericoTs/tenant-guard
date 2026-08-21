@@ -1,0 +1,36 @@
+# Keep the moving `v0` tag pointing at the newest v0.x.y release.
+#
+# GitHub Actions are consumed as `uses: owner/repo@v0`, and every example in the
+# README and docs/CI.md is written that way. Without a `v0` tag those snippets
+# fail as written — reported from a real run, which had to pin an exact version
+# to work around it. Doing this by hand would rot the moment a release is cut in
+# a hurry, so it moves on its own whenever a version tag is pushed.
+name: major tag
+
+on:
+  push:
+    tags:
+      - 'v0.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  move-v0:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Point v0 at ${{ github.ref_name }}
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # -f on both: the whole point is that this tag moves.
+          git tag -f -a v0 -m "tenant-guard v0 — moving major tag, currently $TAG" "$TAG^{commit}"
+          git push -f origin v0
+          echo "v0 now points at $TAG"

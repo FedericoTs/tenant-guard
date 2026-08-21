@@ -6,3 +6,8 @@ node_modules/
 .tg_*.cjs
 .tg_*.txt
 spike.mjs
+
+# scratch files from ad-hoc verification runs
+probe-*.mjs
+*scratch*.mjs
+_scratch*

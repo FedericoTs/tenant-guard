@@ -37,6 +37,32 @@ export const DEFAULTS = {
   idFilterPattern: `\\.eq\\(\\s*['"\\\`](id|[a-z_]*_id)['"\\\`]|where:\\s*\\{\\s*id\\b|\\beq\\(\\s*[\\w$]+\\.(id|[a-z_]*_id)\\b`,
   // A tenant-scoping mention (any of these makes the file safe).
   tenantSignals: ['organization_id', 'organizationId', 'tenant_id', 'tenantId', 'org_id', 'account_id', 'workspace_id'],
+  /**
+   * Filter VALUES that come from the verified session rather than the request.
+   *
+   * `.eq('user_id', user.id)` is a per-user scope, not an IDOR — the value is
+   * whoever is logged in, so the row cannot be somebody else's. But `user_id`
+   * matches the bare-id pattern, and the pattern stopped at the column name, so
+   * every "my notifications" and "my settings" route in the Next.js + Supabase
+   * stack these defaults target failed the build. Verified: `.eq('user_id',
+   * user.id)`, `.eq('id', user.id)` and the genuine IDOR `.eq('id', params.id)`
+   * all classified identically as leak:true.
+   *
+   * The documented workaround made it worse — putting `user_id` in
+   * `tenantSignals` also silences `.eq('user_id', params.userId)`, which IS an
+   * IDOR. Verified too. So the VALUE has to be read, not just the column name.
+   */
+  sessionValueSignals: ['user.id', 'session.user.id', 'session.userId', 'auth.uid()', 'claims.sub', 'currentUser.id'],
+  /**
+   * Call arguments that are a PROJECTION, not a filter.
+   *
+   * `.select('id, organization_id, total').eq('id', params.id)` names the tenant
+   * column in the column list and nowhere else, and that counted as scoping — so
+   * the guard's own canonical service-role IDOR reported clean, with the summary
+   * "all tenant-scoped or authless". Verified end to end: that same query
+   * returned another tenant's row over a service-role connection.
+   */
+  projectionCalls: ['select', 'order', 'returns'],
 };
 
 /**
@@ -54,6 +80,49 @@ export function enclosingStatement(text, index) {
   const start = Math.max(text.lastIndexOf(';', index) + 1, 0);
   const end = text.indexOf(';', index);
   return text.slice(start, end === -1 ? text.length : end);
+}
+
+/**
+ * Blank out the ARGUMENTS of projection calls, keeping everything else.
+ *
+ * A balanced-paren scan rather than a regex, because Drizzle and Prisma pass
+ * object literals with nested parens. The call name is left in place so the
+ * statement's shape is unchanged; only what is inside the parens goes.
+ */
+export function stripProjections(stmt, calls = DEFAULTS.projectionCalls) {
+  let out = String(stmt ?? '');
+  for (const call of calls) {
+    const re = new RegExp(`\\.${call}\\s*\\(`, 'gi');
+    let m;
+    while ((m = re.exec(out)) !== null) {
+      let depth = 1;
+      let i = m.index + m[0].length;
+      const from = i;
+      for (; i < out.length && depth > 0; i++) {
+        if (out[i] === '(') depth++;
+        else if (out[i] === ')') depth--;
+      }
+      const to = depth === 0 ? i - 1 : out.length;
+      out = out.slice(0, from) + ' '.repeat(to - from) + out.slice(to);
+      re.lastIndex = m.index + m[0].length;
+    }
+  }
+  return out;
+}
+
+/**
+ * Is this id-filter's VALUE derived from the verified session?
+ *
+ * The value span is whatever follows the matched column literal up to the
+ * closing paren of the filter call. `.eq('user_id', user.id)` is a per-user
+ * scope; `.eq('user_id', params.userId)` is an IDOR, and the only thing that
+ * separates them is what comes after the comma.
+ */
+export function isSessionDerived(text, match, sessionValues = DEFAULTS.sessionValueSignals) {
+  const from = match.index + match[0].length;
+  const close = text.indexOf(')', from);
+  const span = text.slice(from, close === -1 ? Math.min(from + 120, text.length) : close);
+  return sessionValues.some((s) => span.includes(s));
 }
 
 /**
@@ -75,19 +144,29 @@ export function classifyRouteFile(text, opts = {}) {
   const authSignals = opts.authSignals ?? DEFAULTS.authSignals;
   const tenantSignals = opts.tenantSignals ?? DEFAULTS.tenantSignals;
   const pattern = opts.idFilterPattern ?? DEFAULTS.idFilterPattern;
+  const sessionValues = opts.sessionValueSignals ?? DEFAULTS.sessionValueSignals;
+  const projectionCalls = opts.projectionCalls ?? DEFAULTS.projectionCalls;
   const idFilter = new RegExp(pattern, 'i');
 
   const authenticated = authSignals.some((s) => text.includes(s));
   const mentionsTenant = tenantSignals.some((s) => text.includes(s));
-  const filtersById = idFilter.test(text);
 
-  // Does at least one bare-id filter sit in a statement that also names a tenant?
+  // Decided PER MATCH, not once for the file: an id-filter whose value comes
+  // from the verified session is a per-user scope, not an IDOR. A file whose
+  // only id-filters are session-derived is therefore not a leak, while
+  // `.eq('id', params.id)` in that same file still is.
+  const matches = [...text.matchAll(new RegExp(pattern, 'gi'))];
+  const requestScoped = matches.filter((m) => !isSessionDerived(text, m, sessionValues));
+  const filtersById = requestScoped.length > 0;
+
+  // Does at least one bare-id filter sit in a statement that also FILTERS by a
+  // tenant? Projections are blanked first — naming the tenant column in a
+  // `.select(…)` list is not scoping, and treating it as such made the guard's
+  // own canonical IDOR report clean.
   let scopedInQuery = false;
-  if (filtersById) {
-    for (const m of text.matchAll(new RegExp(pattern, 'gi'))) {
-      const stmt = enclosingStatement(text, m.index);
-      if (tenantSignals.some((sig) => stmt.includes(sig))) { scopedInQuery = true; break; }
-    }
+  for (const m of requestScoped) {
+    const stmt = stripProjections(enclosingStatement(text, m.index), projectionCalls);
+    if (tenantSignals.some((sig) => stmt.includes(sig))) { scopedInQuery = true; break; }
   }
 
   return {

@@ -7,7 +7,22 @@ node_modules/
 .tg_*.txt
 spike.mjs
 
-# scratch files from ad-hoc verification runs
+# Scratch files from ad-hoc verification runs.
+#
+# Audit agents write throwaway probes into the repo ROOT, because that is where
+# `import { PGlite } from '@electric-sql/pglite'` resolves from. They are
+# supposed to delete them and mostly do; six were committed by a `git add -A`
+# once, so the patterns are deliberately broad. Real source lives in src/, bin/
+# and test/, none of which this touches.
 probe-*.mjs
 *scratch*.mjs
 _scratch*
+zz-*.mjs
+zz_*.mjs
+tmp-*.mjs
+repro-*.mjs
+*-repro*.mjs
+verify-*.mjs
+check-*.mjs
+fix-*.py
+patch-*.py

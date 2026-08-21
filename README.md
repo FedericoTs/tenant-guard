@@ -524,6 +524,18 @@ the user, add it to both signals:
 }
 ```
 
+> **You probably no longer need the `routeOrgScoping` half.** A route filtering
+> by the session user's own id — `.eq('user_id', user.id)`, `.eq('id', user.id)` —
+> is recognised as a per-user scope on its own since 0.41.0, because the guard
+> reads the filter's *value* and not just its column name. Adding `user_id` to
+> `tenantSignals` also silences `.eq('user_id', params.userId)`, which **is** an
+> IDOR — verified — so reach for it only if your session value is spelled in a way
+> the defaults miss, and prefer `sessionValueSignals` for that:
+>
+> ```json
+> { "routeOrgScoping": { "sessionValueSignals": ["ctx.viewer.id"] } }
+> ```
+
 Then **allowlist genuinely shared tables/routes** — a Google-Places cache, a
 public reference table — with a one-line reason, rather than scoping data that is
 supposed to be global.

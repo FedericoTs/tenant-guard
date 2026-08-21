@@ -103,11 +103,49 @@ export function isPermissive(row) {
   return String(row?.permissive ?? 'PERMISSIVE').toUpperCase() !== 'RESTRICTIVE';
 }
 
-/** The policies that mention the assurance level, split by whether they can enforce it. */
+/**
+ * Does another PERMISSIVE policy already grant the same rows for the same
+ * command and role?
+ *
+ * This is the precondition the guard was missing, and without it the finding is
+ * wrong on correct code. "A permissive policy cannot restrict" is only half the
+ * rule; the accurate half is that it can only ever ADD access. If the aal2 gate
+ * is the ONLY permissive policy on the table, then it is the sole grant, and an
+ * aal1 session reads nothing — the policy enforces exactly what it looks like it
+ * enforces. Verified:
+ *
+ *     aal2 gate + a tenancy policy   aal2 sees 1, aal1 sees 1   <- enforces nothing
+ *     aal2 gate alone                aal2 sees 1, aal1 sees 0   <- enforces
+ *
+ * Reporting the second case would be telling someone to change a policy that is
+ * already doing its job, which is the advice shape that caused an outage in
+ * 0.26.0.
+ */
+export function hasOtherPermissiveGrant(gate, allPolicies) {
+  const applies = (a, b) => a === 'ALL' || b === 'ALL' || a === b;
+  return (allPolicies ?? []).some((p) =>
+    p.schema === gate.schema &&
+    p.table === gate.table &&
+    p.policy !== gate.policy &&
+    isPermissive(p) &&
+    applies(String(p.cmd ?? 'ALL').toUpperCase(), String(gate.cmd ?? 'ALL').toUpperCase()) &&
+    !(referencesAal(p.qual) || referencesAal(p.with_check)));
+}
+
+/**
+ * The policies that mention the assurance level, split by whether they can
+ * enforce it. A permissive gate is only reported when something else already
+ * grants the rows — see hasOtherPermissiveGrant.
+ */
 export function classifyAalPolicies(rows) {
-  const gates = (rows ?? []).filter((r) => referencesAal(r.qual) || referencesAal(r.with_check));
+  const all = rows ?? [];
+  const gates = all.filter((r) => referencesAal(r.qual) || referencesAal(r.with_check));
+  const permissive = gates.filter(isPermissive);
   return {
-    permissive: gates.filter(isPermissive),
+    permissive: permissive.filter((g) => hasOtherPermissiveGrant(g, all)),
+    // A lone permissive gate IS the grant, so it restricts. Tracked separately
+    // so the coverage note can still count it as enforcement that exists.
+    soleGrant: permissive.filter((g) => !hasOtherPermissiveGrant(g, all)),
     restrictive: gates.filter((r) => !isPermissive(r)),
   };
 }
@@ -123,10 +161,11 @@ export function classifyPermissiveGate({ row, role = 'authenticated' }) {
     kind: 'permissive-mfa-gate',
     where: `${id} (policy "${row.policy}")`,
     message:
-      `policy "${row.policy}" on ${id} checks the MFA assurance level but is PERMISSIVE, so it enforces nothing. ` +
-      `Postgres ORs permissive policies together — this one can only ADD access alongside your other policies, never remove it. ` +
+      `policy "${row.policy}" on ${id} checks the MFA assurance level but is PERMISSIVE, and another permissive policy on this table already grants the same rows — so this one enforces nothing. ` +
+      `Postgres ORs permissive policies together, so a permissive policy can only ever ADD access, never remove it. ` +
       `A session that never passed the second factor reads exactly what it would have read without this policy. ` +
-      `Verified against a real database: with a permissive gate an aal1 session sees every row; with AS RESTRICTIVE it sees none.`,
+      `Verified against a real database: with a tenancy policy alongside it, an aal1 session sees every row; with AS RESTRICTIVE it sees none. ` +
+      `(A permissive aal2 policy that is the ONLY policy on a table is not reported — it is the sole grant, so it does restrict.)`,
     fix:
       `A gate has to be restrictive, because only restrictive policies are ANDed:\n` +
       `        DROP POLICY "${row.policy}" ON ${id};\n` +
@@ -142,7 +181,8 @@ export function classifyPermissiveGate({ row, role = 'authenticated' }) {
 export function classifyCoverage({ verifiedFactors = 0, gates, tenantTables = [], allow = new Set() }) {
   const notes = [];
 
-  if (gates.restrictive.length === 0 && gates.permissive.length === 0) {
+  const sole = gates.soleGrant ?? [];
+  if (gates.restrictive.length === 0 && gates.permissive.length === 0 && sole.length === 0) {
     if (verifiedFactors > 0) {
       notes.push({
         where: '(project)',
@@ -157,7 +197,8 @@ export function classifyCoverage({ verifiedFactors = 0, gates, tenantTables = []
   }
 
   // Some enforcement exists — so which tenant tables are left out of it?
-  const covered = new Set(gates.restrictive.map((r) => `${r.schema}.${r.table}`));
+  // A lone permissive gate restricts, so it counts as covered.
+  const covered = new Set([...gates.restrictive, ...sole].map((r) => `${r.schema}.${r.table}`));
   const uncovered = tenantTables
     .map((t) => `${t.schema}.${t.table}`)
     .filter((id) => !covered.has(id) && !allow.has(id));
@@ -225,7 +266,7 @@ export async function check({ query, config = {} }) {
     ok: violations.length === 0,
     violations,
     notes,
-    scanned: gates.permissive.length + gates.restrictive.length,
+    scanned: gates.permissive.length + gates.restrictive.length + (gates.soleGrant?.length ?? 0),
     summary:
       violations.length > 0
         ? `${violations.length} MFA gate(s) are PERMISSIVE and enforce nothing`

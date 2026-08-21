@@ -4,8 +4,14 @@
  * The first integration test is the demonstration rather than an assertion about
  * the guard: a uniqueness trigger in invoker mode does not merely fail to
  * report the collision — the duplicate row is INSERTED. The identical trigger
- * marked SECURITY DEFINER raises. Hardening the table is what breaks the
- * guarantee, which makes this the purest form of the silent-failure shape.
+ * raises once its function runs as a role EXEMPT from the table's policies.
+ * Hardening the table is what breaks the guarantee, which makes this the purest
+ * form of the silent-failure shape.
+ *
+ * SECURITY DEFINER on its own is not the fix and there is a test for that below:
+ * it changes which role RLS is evaluated for, not whether RLS applies, so a
+ * definer function owned by a role that merely holds GRANTs still lets the
+ * duplicate through.
  *
  * The calibration tests carry the weight. Every schema is full of triggers that
  * read the table they are attached to — `set_updated_at`, an audit stamp, a
@@ -113,7 +119,7 @@ if (PGlite) {
     assert.equal(await insertAs(db, 'u_me', 'taken'), 'inserted');
   });
 
-  test('…and SECURITY DEFINER is what makes the same trigger work', async () => {
+  test('…and it raises when the definer function is owned by an RLS-exempt role', async () => {
     const { db } = await fresh({ definer: 'security definer' });
     assert.match(await insertAs(db, 'u_me', 'taken'), /blocked/);
   });
@@ -124,6 +130,55 @@ if (PGlite) {
     assert.equal(res.ok, false, JSON.stringify(res, null, 2));
     assert.equal(res.violations[0].kind, 'trigger-reads-hidden-rows');
     assert.match(res.violations[0].where, /t_username/);
+  });
+
+  test('SECURITY DEFINER alone does NOT fix it — the function owner has to be RLS-exempt', async () => {
+    // The fix text used to say `ALTER FUNCTION ... SECURITY DEFINER` flatly.
+    // SECURITY DEFINER does not bypass RLS; it changes which role RLS is
+    // evaluated FOR. Owned by a role that merely holds GRANTs on the table, the
+    // duplicate still goes in — so the guard now leads with a constraint and
+    // states the ownership precondition on the definer route.
+    const db = new PGlite();
+    await db.exec(`
+      create role authenticated nologin;
+      create role appowner nologin;
+      create table profiles (id serial primary key, user_id text, username text);
+      insert into profiles (user_id, username) values ('u_other','taken');
+      alter table profiles enable row level security;
+      create policy own on profiles for all
+        using (user_id = current_setting('app.uid', true))
+        with check (user_id = current_setting('app.uid', true));
+      grant select, insert on profiles to authenticated, appowner;
+      grant usage on sequence profiles_id_seq to authenticated, appowner;
+      create function check_username() returns trigger language plpgsql security definer
+      as $fn$ begin
+        if exists (select 1 from profiles where username = new.username) then
+          raise exception 'username taken'; end if; return new; end; $fn$;
+      alter function check_username() owner to appowner;
+      create trigger t before insert on profiles for each row execute function check_username();
+    `);
+    await db.query('begin');
+    let out;
+    try {
+      await db.query(`select set_config('app.uid','u_me',true)`);
+      await db.query('set local role authenticated');
+      await db.query(`insert into profiles (user_id, username) values ('u_me','taken')`);
+      out = 'inserted';
+    } catch { out = 'blocked'; }
+    await db.query('rollback');
+    assert.equal(out, 'inserted', 'a definer function owned by a non-exempt role fixes nothing');
+  });
+
+  test('the fix leads with the constraint and states the definer precondition', () => {
+    const v = classifyTrigger({
+      trigger: { schema: 'public', table: 'profiles', trigger: 't', function: 'f' },
+      hidden: [{ table: 'public.profiles', visible: 1, total: 9 }],
+      role: 'authenticated',
+    });
+    assert.match(v.fix, /^Prefer a constraint/);
+    assert.match(v.fix, /does not bypass RLS/);
+    assert.match(v.fix, /FORCE ROW LEVEL SECURITY/);
+    assert.match(v.fix, /pg_temp/);
   });
 
   test('a SECURITY DEFINER trigger is not reported — it already sees everything', async () => {

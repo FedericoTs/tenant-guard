@@ -83,7 +83,7 @@ test('the fix names AS RESTRICTIVE, because that is the whole difference', () =>
   const v = classifyPermissiveGate({ row: { schema: 'public', table: 'notes', policy: 'require_aal2' } });
   assert.equal(v.status, 'leak');
   assert.match(v.fix, /AS RESTRICTIVE/);
-  assert.match(v.message, /can only ADD access/);
+  assert.match(v.message, /can only ever ADD access/);
 });
 
 if (PGlite) {
@@ -141,6 +141,43 @@ if (PGlite) {
     const { query } = await fresh('permissive');
     const res = await check({ query, config: { allowlist: ['public.notes.require_aal2'] } });
     assert.equal(res.ok, true);
+  });
+
+    test('does NOT report a LONE permissive aal2 gate — that one does restrict', async () => {
+    // The precondition the guard was missing. With no other permissive policy the
+    // gate IS the grant, so an aal1 session reads nothing. Verified:
+    //   aal2 gate + tenancy policy  ->  aal2 sees 1, aal1 sees 1  (enforces nothing)
+    //   aal2 gate alone             ->  aal2 sees 1, aal1 sees 0  (enforces)
+    // Reporting the second is telling someone to fix working code.
+    const db = new PGlite();
+    await db.exec(`
+      create role authenticated nologin;
+      create schema if not exists auth;
+      create table auth.mfa_factors (id int primary key, status text);
+      insert into auth.mfa_factors values (1, 'verified');
+      create table notes (id int primary key, organization_id text, body text);
+      insert into notes values (1, 'org_A', 'secret');
+      grant select on notes to authenticated;
+      alter table notes enable row level security;
+      create policy require_aal2 on notes for select to authenticated
+        using (current_setting('app.aal', true) = 'aal2');
+    `);
+    const q = (t, v) => db.query(t, Array.isArray(v) && v.length ? v : undefined);
+
+    // prove it actually restricts before asserting the guard stays quiet
+    const read = async (aal) => {
+      await db.query('begin');
+      await db.query(`select set_config('app.aal', $1, true)`, [aal]);
+      await db.query('set local role authenticated');
+      const r = await db.query('select * from notes');
+      await db.query('rollback');
+      return r.rows.length;
+    };
+    assert.equal(await read('aal2'), 1);
+    assert.equal(await read('aal1'), 0, 'a lone permissive gate IS the grant');
+
+    const res = await check({ query: q });
+    assert.equal(res.ok, true, JSON.stringify(res, null, 2));
   });
 
   test('a project with no MFA at all skips cleanly — a skip is not a pass', async () => {

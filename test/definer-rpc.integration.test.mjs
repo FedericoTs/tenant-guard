@@ -251,13 +251,13 @@ if (PGlite) {
     assert.ok(res.notes.some((n) => /Not exploitable here/.test(n.message)));
   });
 
-  test('does NOT flag a function whose search_path IS pinned', async () => {
+  test('does NOT flag a function whose search_path is pinned COMPLETELY (pg_temp named)', async () => {
     const { query } = await fresh(`
       ${SECURED}
       grant create on schema public to authenticated;
       create function helper() returns setof invoices
         language sql security definer stable
-        set search_path = pg_catalog, public
+        set search_path = pg_catalog, public, pg_temp
         as $$ select * from invoices where organization_id = current_setting('app.current_tenant', true) $$;
       grant execute on function helper() to authenticated;
     `);

@@ -213,6 +213,31 @@ export function shadowableSchemas(config, writableSchemas = []) {
   return out;
 }
 
+/**
+ * The hole in every "just pin it" answer, including the one this guard used to
+ * print: **`pg_temp` is searched BEFORE every schema you list unless you name it
+ * explicitly.** `TEMP` on the database is granted to `PUBLIC` by default in every
+ * Postgres version, so any role that can open a session can create a temp table
+ * and shadow an unqualified name inside the function — with no CREATE anywhere.
+ *
+ * Measured, with `CREATE ON SCHEMA public` revoked so the attacker had nowhere
+ * else to plant:
+ *
+ *     SET search_path = pg_catalog, app              -> TEMP-HIJACKED
+ *     SET search_path = pg_catalog, app, pg_temp     -> legit
+ *     SET search_path = ''  (unqualified body)       -> the function BREAKS
+ *     SET search_path = ''  (qualified body)         -> legit
+ *
+ * So naming `pg_temp` last is the fix that is safe to apply without also editing
+ * the body — and `search_path = ''` is NOT, which is worth knowing before
+ * repeating the advice that is usually given for this.
+ */
+export function temporarilyShadowable(config) {
+  const schemas = searchPathSchemas(config);
+  if (!schemas.length) return false; // unpinned: reported by the caller anyway
+  return !schemas.some((x) => x.toLowerCase() === 'pg_temp');
+}
+
 export function isReadOnlyVolatility(volatility) {
   return volatility === 's' || volatility === 'i';
 }
@@ -426,22 +451,29 @@ export async function check({ query, config = {} }) {
         // `= public, app` with `public` writable returned the attacker's planted
         // table; `= app, public` returned the real one.
         const shadowable = pinned ? shadowableSchemas(fn.config, writableSchemas) : [];
-        if ((!pinned && writableSchemas.length > 0) || shadowable.length > 0) {
+        const tempOpen = pinned && shadowable.length === 0 && temporarilyShadowable(fn.config);
+        if ((!pinned && writableSchemas.length > 0) || shadowable.length > 0 || tempOpen) {
           const reachable = pinned ? shadowable : writableSchemas;
           violations.push({
             where: fqn,
             kind: 'search-path',
-            message: pinned
+            message: tempOpen
+              ? `SECURITY DEFINER function whose search_path is pinned, but does not name pg_temp — so the pin is incomplete. ` +
+                `Postgres searches pg_temp BEFORE every schema you list unless you name it, and TEMP on the database is granted to PUBLIC by default, so any role that can open a session can create a temp table and shadow an unqualified name inside this function. It needs no CREATE privilege anywhere. ` +
+                `Measured with CREATE ON SCHEMA public revoked: pinned "pg_catalog, ${fn.schema}" the function ran the attacker's temp table; with pg_temp named last it ran the real one.`
+              : pinned
               ? `SECURITY DEFINER function whose search_path is pinned to ${shadowable.map((s) => `"${s}"`).join(', ')} — which "${role}" can CREATE objects in, so the pin protects nothing. ` +
                 `Resolution walks the pinned path in order and reaches a schema they can plant in before it reaches yours, so an unqualified name in the body finds THEIR object, executing as the owner with RLS bypassed. ` +
                 `Verified against a real database: a function pinned to a writable schema returned a planted table; the same function pinned to its own schema first returned the real one.`
               : `SECURITY DEFINER function with no pinned search_path, and "${role}" can CREATE objects in ${writableSchemas.slice(0, 3).map((s) => `"${s}"`).join(', ')}. ` +
                 `Unqualified names inside the function resolve through the CALLER's search_path, so a caller who creates a table or function earlier on that path makes this function operate on THEIR object — executing as the definer's owner, with RLS bypassed.`,
             fix:
-              `Pin it to a path they cannot plant on — pg_catalog first, then the function's own schema:\n` +
-              `        ALTER FUNCTION ${fn.schema}.${fn.name}(${fn.args || ''}) SET search_path = pg_catalog, ${fn.schema};\n` +
-              `      Listing pg_catalog first is what makes it a pin rather than a preference; ${reachable.map((s) => `"${s}"`).join(', ')} must not come before your own schema.\n` +
-              `      And revoke the ability to create objects on the shared path: REVOKE CREATE ON SCHEMA public FROM ${role};`,
+              `Pin it to a path nobody can plant on, and name pg_temp so it is searched LAST:\n` +
+              `        ALTER FUNCTION ${fn.schema}.${fn.name}(${fn.args || ''}) SET search_path = pg_catalog, ${fn.schema}, pg_temp;\n` +
+              `      pg_temp is the part that gets left out. Postgres searches it BEFORE everything you list unless you name it, and TEMP is granted to PUBLIC by default — so without it the pin is defeated by a temp table, needing no CREATE privilege anywhere.\n` +
+              `      Verified: pinned "pg_catalog, ${fn.schema}" the function ran a planted temp table; with pg_temp named last it ran the real one.\n` +
+              (reachable.length ? `      ${reachable.map((s) => `"${s}"`).join(', ')} must also not come before your own schema — "${role}" can CREATE there.\n` : '') +
+              `      The strictest form is SET search_path = '' with every reference schema-qualified inside the body. Do NOT apply that one blindly: with an unqualified body the function stops working ("relation does not exist").`,
           });
         } else if (!pinned) {
           notes.push({ where: fqn, message: `SECURITY DEFINER function with no pinned search_path. Not exploitable here — "${role}" cannot CREATE objects in any schema, so it has nowhere to plant a shadowing object — but pinning it (SET search_path = pg_catalog, ${fn.schema}) keeps it that way.` });

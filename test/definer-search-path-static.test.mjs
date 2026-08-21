@@ -68,7 +68,7 @@ test('searchPathReachesPublicFirst is about ORDER, not membership', () => {
 });
 
 test('extractFunctionDefs carries the verdict, not just the clause', () => {
-  const [good] = extractFunctionDefs(definer('a', 'set search_path = pg_catalog, public'));
+  const [good] = extractFunctionDefs(definer('a', 'set search_path = pg_catalog, public, pg_temp'));
   const [bad] = extractFunctionDefs(definer('b', 'set search_path = public'));
   const [none] = extractFunctionDefs(definer('c', ''));
   assert.equal(good.searchPathPinned, true);
@@ -81,7 +81,7 @@ test('extractFunctionDefs carries the verdict, not just the clause', () => {
 test('findUnpinnedDefiners splits the three states and counts the good ones', () => {
   const files = [{
     name: '001.sql',
-    sql: definer('safe', 'set search_path = pg_catalog, public')
+    sql: definer('safe', 'set search_path = pg_catalog, public, pg_temp')
        + definer('weak', 'set search_path = public')
        + definer('none', ''),
   }];
@@ -89,6 +89,7 @@ test('findUnpinnedDefiners splits the three states and counts the good ones', ()
   assert.deepEqual(r.pinned.map((f) => f.name), ['safe']);
   assert.deepEqual(r.publicFirst.map((f) => f.name), ['weak']);
   assert.deepEqual(r.unpinned.map((f) => f.name), ['none']);
+  assert.deepEqual(r.noTemp.map((f) => f.name), []);
 });
 
 test('a TRIGGER function is skipped — it has no caller path to hijack', () => {
@@ -130,8 +131,8 @@ test('the unpinned note hands off to the guards that can settle it', () => {
 
 test('functions that pin correctly are COUNTED, not passed over in silence', () => {
   withMigrations({
-    '001_fns.sql': definer('a', 'set search_path = pg_catalog, public')
-                 + definer('b', 'set search_path = pg_catalog, public')
+    '001_fns.sql': definer('a', 'set search_path = pg_catalog, public, pg_temp')
+                 + definer('b', 'set search_path = pg_catalog, public, pg_temp')
                  + definer('none', ''),
   }, (dir) => {
     const note = run({ dir }).notes.find((n) => n.where === '(search_path)');
@@ -141,7 +142,7 @@ test('functions that pin correctly are COUNTED, not passed over in silence', () 
 });
 
 test('an all-pinned migration set says nothing at all about search_path', () => {
-  withMigrations({ '001_fns.sql': definer('a', 'set search_path = pg_catalog, public') }, (dir) => {
+  withMigrations({ '001_fns.sql': definer('a', 'set search_path = pg_catalog, public, pg_temp') }, (dir) => {
     const res = run({ dir });
     assert.equal(res.notes.some((n) => /search_path/.test(n.message ?? '')), false);
   });

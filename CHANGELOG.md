@@ -61,7 +61,7 @@ table" or "drop the embed" — and *weaken your RLS* is precisely the shape of
 advice that caused the 0.26.0 outage. It is also not a database fact: the catalog
 holds every FK, an app embeds a handful, and which ones the client requests is
 not visible. Modelled on a purpose-built 58-table per-user app where every table
-was correctly scoped, the proposed rule fires on **165 of 165 FK edges**. The
+was correctly scoped, the proposed rule fires on **every FK edge in the schema**. The
 second half would re-report by inference what §3.1–3.4 already prove by probe.
 
 - 613 tests (was 602), 22 guards.
@@ -188,8 +188,7 @@ REVOKE EXECUTE ON FUNCTION public.user_is_trip_owner(...) FROM PUBLIC, anon;
 That function is called inside nine RLS policies. **Postgres requires the
 CALLING role to hold EXECUTE even for a `SECURITY DEFINER` function invoked in a
 policy**, so the revoke denied `anon` the ability to evaluate its own row policy
-and every anonymous read started failing with `42501`. Reproduced in this repo's
-tests against a real database, before and after.
+and every anonymous read started failing with `42501`. Reproduced against a real database, before and after.
 
 ### Two bugs behind it
 

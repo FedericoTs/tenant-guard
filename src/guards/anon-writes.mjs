@@ -161,14 +161,15 @@ export function violationForView(v, commands, role) {
     kind: 'anon-writable-view',
     message:
       `"${role}" performed ${commands.join(' and ')} through the view ${id}, and the write reached the base table. ` +
-      `A view has no RLS of its own, and this one has security_invoker off, so it executes as its owner (${v.ownerRole ?? 'the view owner'}) — the base table's policies are never consulted. ` +
+      `A view has no RLS of its own, and this one has security_invoker off, so it executes as its owner (${v.ownerRole ?? 'the view owner'}) The write escapes RLS because that owner is exempt from the base table policies — it owns the table without FORCE ROW LEVEL SECURITY, or is a superuser. On Supabase that is the default, since objects created in the SQL editor are owned by postgres. ` +
       `Proven by probing, in a rolled-back transaction: rows were actually affected. ` +
       `The usual cause is ALTER DEFAULT PRIVILEGES granting writes on TABLES, which covers views created afterwards, so nothing in any migration reads like a security change.`,
     fix:
       `Take the write grant away — a view meant for reading needs only SELECT:\n` +
       `        REVOKE INSERT, UPDATE, DELETE ON ${id} FROM ${role}, authenticated;\n` +
-      `      If writes through it are intended, make it run as the CALLER so the base table's RLS applies (verified: the same write is then refused with 42501):\n` +
+      `      If writes through it are intended, make it run as the CALLER so the base table's RLS applies (Postgres 15+; on 14 and earlier the option does not exist, so the REVOKE is your only choice):\n` +
       `        ALTER VIEW ${id} SET (security_invoker = true);\n` +
+      `      Measure what that actually gives you. Verified both ways: if ${role} holds no privilege on the BASE table the write is refused with 42501 — but if it does, which is the usual case here because ALTER DEFAULT PRIVILEGES granted the table too, the write is not refused at all. It silently affects zero rows, since RLS is now evaluated as ${role} and matches nothing. Safe, but silent, which is why the REVOKE is the fix that tells you it worked.\n` +
       `      And check what else inherited it:  ALTER DEFAULT PRIVILEGES IN SCHEMA ${v.schema} REVOKE INSERT, UPDATE, DELETE ON TABLES FROM ${role};`,
   };
 }

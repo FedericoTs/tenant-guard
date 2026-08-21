@@ -271,6 +271,21 @@ export function revokesAnonExecute(sql, name) {
  * @param {{ baseline?: number, allowlist?: string[] }} opts
  */
 /**
+ * A pinned path that never names `pg_temp` is incomplete, whatever else is on it.
+ *
+ * Postgres searches `pg_temp` BEFORE every schema you list unless you name it,
+ * and `TEMP` on the database is granted to `PUBLIC` by default — so a temp table
+ * shadows an unqualified name inside the function with no CREATE privilege
+ * anywhere. Measured: `pg_catalog, app` ran the attacker's temp table;
+ * `pg_catalog, app, pg_temp` ran the real one.
+ */
+export function omitsTempSchema(schemas) {
+  const list = schemas ?? [];
+  if (!list.length) return false; // unpinned is a separate, louder finding
+  return !list.some((x) => String(x).toLowerCase() === 'pg_temp');
+}
+
+/**
  * SECURITY DEFINER functions whose `search_path` is not pinned to a path that
  * protects them — reported as NOTES, deliberately.
  *
@@ -280,12 +295,12 @@ export function revokesAnonExecute(sql, name) {
  * nothing at all — it shows up on the pull request that introduces the function,
  * in a repository that has never wired up a test database.
  *
- * Returns { unpinned, publicFirst, pinned } so the ones that DO pin can be
- * counted rather than silently ignored.
+ * Returns { unpinned, publicFirst, noTemp, pinned } so the ones that DO pin
+ * correctly can be counted rather than silently ignored.
  */
 export function findUnpinnedDefiners(files, { baseline = 0, allowlist = [] } = {}) {
   const skip = new Set(allowlist);
-  const unpinned = [], publicFirst = [], pinned = [];
+  const unpinned = [], publicFirst = [], noTemp = [], pinned = [];
 
   for (const file of [...(files ?? [])].sort(compareMigrations)) {
     if (migrationNumber(file.name) <= baseline) continue;
@@ -295,10 +310,11 @@ export function findUnpinnedDefiners(files, { baseline = 0, allowlist = [] } = {
       const at = { name: fn.name, file: file.name, searchPath: fn.searchPath };
       if (fn.searchPath === null) unpinned.push(at);
       else if (!fn.searchPathPinned) publicFirst.push(at);
+      else if (omitsTempSchema(fn.searchPath)) noTemp.push(at);
       else pinned.push(at);
     }
   }
-  return { unpinned, publicFirst, pinned };
+  return { unpinned, publicFirst, noTemp, pinned };
 }
 
 export function findDefinerGrantViolations(files, { baseline = 0, allowlist = [] } = {}) {
@@ -435,7 +451,18 @@ export function run(config = {}) {
         `"${fn.name}" is SECURITY DEFINER and pins search_path = ${fn.searchPath.join(', ')} — which resolves through "public" first, so the pin protects nothing. ` +
         `Verified against a real database: a definer function pinned this way returned a table planted by a lower-privileged role; the same function with its own schema first returned the real one. ` +
         `On Postgres 14 and earlier "public" is writable by every role out of the box (CREATE is granted to PUBLIC by default; changed in 15).`,
-      fix: `Put a schema nobody can plant in first:  ALTER FUNCTION public.${fn.name}(<args>) SET search_path = pg_catalog, public;`,
+      fix: `Put a schema nobody can plant in first, and name pg_temp so it is searched last:  ALTER FUNCTION public.${fn.name}(<args>) SET search_path = pg_catalog, public, pg_temp;`,
+    });
+  }
+
+  for (const fn of sp.noTemp ?? []) {
+    spNotes.push({
+      where: fn.file,
+      message:
+        `"${fn.name}" is SECURITY DEFINER and pins search_path = ${fn.searchPath.join(', ')}, which does not name pg_temp — so the pin is incomplete. ` +
+        `Postgres searches pg_temp BEFORE every schema you list unless you name it, and TEMP on the database is granted to PUBLIC by default, so a temp table shadows an unqualified name inside the function with no CREATE privilege needed anywhere. ` +
+        `Measured: pinned "pg_catalog, app" the function ran a planted temp table; with pg_temp named last it ran the real one.`,
+      fix: `ALTER FUNCTION public.${fn.name}(<args>) SET search_path = ${fn.searchPath.join(', ')}, pg_temp;`,
     });
   }
 
@@ -445,11 +472,11 @@ export function run(config = {}) {
       message:
         `"${fn.name}" is SECURITY DEFINER with no SET search_path. Unqualified names inside it resolve through the CALLER's path, so a caller who can create objects makes it operate on THEIRS — running as the owner, with RLS bypassed. ` +
         `Whether anyone can is not visible from migrations: run \`tenant-guard rpc\` against a database to settle it, and \`tenant-guard creates\` for the CREATE grants that are the precondition.`,
-      fix: `ALTER FUNCTION public.${fn.name}(<args>) SET search_path = pg_catalog, public;`,
+      fix: `ALTER FUNCTION public.${fn.name}(<args>) SET search_path = pg_catalog, public, pg_temp;`,
     });
   }
 
-  if (sp.pinned.length > 0 && (sp.unpinned.length > 0 || sp.publicFirst.length > 0)) {
+  if (sp.pinned.length > 0 && (sp.unpinned.length > 0 || sp.publicFirst.length > 0 || (sp.noTemp ?? []).length > 0)) {
     // The ones that got it right, counted rather than passed over in silence —
     // a report that only ever lists failures reads as if nothing is working.
     spNotes.push({

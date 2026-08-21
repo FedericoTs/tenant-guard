@@ -13,6 +13,14 @@
  * went in; the identical trigger marked SECURITY DEFINER raised the exception.
  * Nothing errors, nothing logs, and the constraint you believe you have is gone.
  *
+ * SECURITY DEFINER is the mechanism but NOT an unconditional fix, and the fix
+ * text says so: it does not bypass RLS, it changes which role RLS is evaluated
+ * for. It only helps when that role is exempt from the policies on the table —
+ * the owner without FORCE ROW LEVEL SECURITY, a superuser, or BYPASSRLS. Also
+ * verified: the same definer trigger owned by a role that merely holds GRANTs on
+ * the table still let the duplicate through. A unique constraint has no such
+ * precondition, which is why it is recommended first.
+ *
  * This is the silent-failure shape the whole tool is aimed at, in its purest
  * form: hardening the database is what breaks the guarantee, so the safer your
  * RLS gets, the more thoroughly the trigger stops working.
@@ -32,7 +40,7 @@ import { safeRole, DEFAULTS as PROOF_DEFAULTS } from './rls-proof.mjs';
 export const meta = {
   id: 'trigger-visibility',
   title: 'Triggers that enforce a rule by reading a table RLS hides from them',
-  why: "A trigger function runs as the INVOKER unless declared SECURITY DEFINER, so a uniqueness or existence check inside one sees only the rows RLS shows the writing role. Locking the table down — the correct thing to do — makes the check stop finding collisions and silently start passing. Verified: the duplicate row was inserted with the trigger in invoker mode and rejected with SECURITY DEFINER.",
+  why: "A trigger function runs as the INVOKER unless declared SECURITY DEFINER, so a uniqueness or existence check inside one sees only the rows RLS shows the writing role. Locking the table down — the correct thing to do — makes the check stop finding collisions and silently start passing. Verified: the duplicate row was inserted with the trigger in invoker mode and rejected once the function ran as a role exempt from the table policies. SECURITY DEFINER alone is not sufficient — it changes which role RLS is evaluated for, not whether RLS applies.",
 };
 
 export const DEFAULTS = {
@@ -119,13 +127,14 @@ export function classifyTrigger({ trigger, hidden, role }) {
       `Verified end to end on this exact shape: a uniqueness trigger in invoker mode let the duplicate INSERT through, and the identical trigger marked SECURITY DEFINER raised the exception. ` +
       `Nothing errors and nothing logs — hardening the table is what breaks the guarantee, so the better your RLS gets, the more completely this stops working.`,
     fix:
-      `A trigger that enforces a rule across rows the writer cannot see has to run with the owner's view:\\n` +
-      `        ALTER FUNCTION ${trigger.schema}.${trigger.function}() SECURITY DEFINER;\\n` +
-      `        ALTER FUNCTION ${trigger.schema}.${trigger.function}() SET search_path = pg_catalog, ${trigger.schema};\\n` +
-      `      Pin the search_path in the same breath — a SECURITY DEFINER function without one is the hijack \`definer-rpc\` reports.\\n` +
-      `      Where the rule is plain uniqueness, a constraint is better than a trigger: it is enforced below RLS and cannot be evaded.\\n` +
-      `        CREATE UNIQUE INDEX ON ${id} (<column>);\\n` +
-      `      (Note that a unique constraint on a tenant table is itself readable as an existence oracle — see the constraint-oracles guard — so scope it by the tenant column where that matters.)\\n` +
+      `Prefer a constraint. It does not depend on who is writing, so it cannot be defeated the way the trigger just was:\n` +
+      `        CREATE UNIQUE INDEX ON ${id} (<column>);\n` +
+      `      Scope it by the tenant column where the value is only unique per tenant — and note that a unique constraint on a tenant table is itself readable as an existence oracle, which the constraint-oracles guard covers.\n` +
+      `      If it has to stay a trigger, SECURITY DEFINER is the mechanism, but it is NOT unconditional:\n` +
+      `        ALTER FUNCTION ${trigger.schema}.${trigger.function}() SECURITY DEFINER;\n` +
+      `        ALTER FUNCTION ${trigger.schema}.${trigger.function}() SET search_path = pg_catalog, ${trigger.schema}, pg_temp;\n` +
+      `      SECURITY DEFINER does not bypass RLS — it changes which role RLS is evaluated for. It only fixes this if that role is EXEMPT from the policies on ${id}: the table owner without FORCE ROW LEVEL SECURITY, a superuser, or a BYPASSRLS role. Verified: the same definer trigger owned by a role that merely holds GRANTs on the table still let the duplicate through, so check who owns the function.\n` +
+      `      Pin the search_path in the same breath and name pg_temp — a SECURITY DEFINER function without a complete pin is the hijack \`definer-rpc\` reports.\n` +
       `      If this trigger is MEANT to see only the writer's own rows, add "${trigger.trigger}" to triggerVisibility.allowlist[] with that reason.`,
   };
 }

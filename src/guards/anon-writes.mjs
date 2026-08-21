@@ -66,7 +66,11 @@ export function surfaceSql(schemas, role) {
               order by a.attnum limit 1) as probe_col
     from pg_catalog.pg_class c
     join pg_catalog.pg_namespace n on n.oid = c.relnamespace
-    where c.relkind = 'r' and n.nspname = any($1)
+    -- 'p' as well as 'r': a PARTITIONED parent is where the grant usually lives,
+    -- and excluding it was a live false negative — anon updated every row through
+    -- the parent while this guard reported clean. Same class as threat-model 4.7,
+    -- which was fixed in rls-proof and never here.
+    where c.relkind in ('r', 'p') and n.nspname = any($1)
     order by n.nspname, c.relname`;
   return { text, values: [schemas, role] };
 }

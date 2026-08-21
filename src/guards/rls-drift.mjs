@@ -103,7 +103,7 @@ export function actualRlsSql(schemas) {
     text:
       `select n.nspname as schema, c.relname as "table" ` +
       `from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace ` +
-      `where c.relkind = 'r' and c.relrowsecurity = true and n.nspname = any($1)`,
+      `where c.relkind in ('r', 'p') and c.relrowsecurity = true and n.nspname = any($1)`,
     values: [schemas],
   };
 }

@@ -31,7 +31,8 @@ npx tenant-guard all      # everything: static guards + every runtime proof
 ```
 
 Or run one at a time: `prove`, `drift`, `anon-reads`, `anon-writes`, `identity`,
-`rpc`, `views`, `storage`, `realtime`, `oracles`, `shadows`, `caps`, `schemas`, `pooler`, `defaults`, `fks`, `creates`, `mfa`.
+`rpc`, `views`, `storage`, `realtime`, `oracles`, `shadows`, `caps`, `schemas`, `pooler`, `defaults`, `fks`, `creates`, `mfa`,
+`columns`, `triggers`.
 The view write-through check runs inside `run`, with no database.
 `npx tenant-guard list` describes each, and `--help` documents the rest.
 
@@ -91,6 +92,38 @@ tenant-guard  â€” guard tests for multi-tenant isolation
 
 (That output is real — it's `examples/leaky-demo/`. Reproduce it:
 `cd examples/leaky-demo && node ../../bin/tenant-guard.mjs run`.)
+
+## Every one of these fails silently
+
+That is the thing they have in common, and it is why a passing test suite is not
+evidence. An isolation bug does not throw. It returns fewer rows.
+
+- RLS denies a read → **`0 rows`**, which is indistinguishable from "no data yet".
+- A PostgREST embed is denied → **`null`**, which renders as a blank name.
+- A trigger's uniqueness check cannot see the colliding row → **it passes**, and
+  the duplicate is written.
+- A policy is too tight → the app writes a row and then cannot read it back.
+  Nothing errors; the page just renders empty.
+
+None of that shows up in an error log, and some of it gets *worse* as you harden
+the database: lock a table down correctly and the trigger that guarded it
+silently stops guarding. Reproduced exactly that way — in invoker mode the
+duplicate row was inserted, and the identical trigger marked `SECURITY DEFINER`
+raised.
+
+So the guards are built to make the silence loud, and to be honest about which
+kind of statement each one is making:
+
+- **A skip is never a pass.** No database, no `pg`, no second tenant to compare
+  against — each says so, by name, instead of reporting green.
+- **"Not proven" is its own verdict.** RLS on with zero policies looks exactly
+  like perfect isolation from the outside; it is reported as unfinished.
+- **Both directions are checked.** Isolation fails by leaking *and* by being too
+  tight, and most tools only name the first.
+- **Findings are proven, not inferred.** Where a catalog fact could be read two
+  ways, the guard performs the write in a rolled-back transaction and reports
+  what actually happened — because a fix you apply blind has to be safe, and
+  advice built on inference once caused an outage in a real database.
 
 ## The guards
 

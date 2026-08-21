@@ -115,6 +115,8 @@ The highest-severity blind spot of any table-only scanner.
 | 4.8 | Legacy `INHERITS` children don't inherit parent policies | 🔜 | same enumeration |
 | 4.9 | Triggers/rules writing tenant rows into an un-RLS'd audit/outbox table | ✅ | `shadow-tables` follows triggers on tenant tables to their write targets. Detection reads the function **body**, because plpgsql records no `pg_depend` for what it writes — so a dynamically-assembled target isn't followed, and unresolvable ones are listed rather than dropped |
 
+| 4.11 | A definer function's `search_path` is **pinned to a schema the attacker can write to** | ✅ | `definer-rpc` (runtime, conclusive) + `definer-grants` (static, note). **Was a false negative in this tool**: `searchPathPinned` matched `/^search_path=/` and called the function protected. It is not — a pin only helps if resolution reaches a schema nobody can plant in. Verified end to end: a definer function pinned `SET search_path = public, app`, with `public` writable by a lower-privileged role, returned that role's planted table; pinned `= app, public` it returned the real one. Note the caveat found while proving it — **plpgsql caches a resolved plan per session**, so a function already called in that session keeps resolving correctly. The hijack is deterministic in a fresh session and a race in a warm one, and PostgREST/pgbouncer sessions turn over constantly, so a lucky green run is not evidence the pin held |
+
 ## 5. Supabase surfaces
 
 | # | Failure | Status | How |
@@ -207,7 +209,7 @@ callable GUC-setting definer functions, 4.7 partitions, 3.9 TRUNCATE (0.10.0);
 inside them (0.16.0–0.17.0); 4.9 shadow tables, 7.1 role capabilities (0.18.0);
 2.14 schema-per-tenant (0.19.0); 6.1 session-scoped tenant GUCs (0.21.0);
 7.2 inherited default privileges (0.22.0); 3.11 cross-tenant foreign keys (0.23.0); 7.3 CREATE grants (0.24.0);
-2.15 untenanted sensitive columns (0.31.0).*
+2.15 untenanted sensitive columns (0.31.0); 4.11 pinned-but-writable search_path (0.32.0).*
 
 *Three of these are worth learning from. **4.7** was a false NEGATIVE in the
 flagship guard, found by writing the failure surface down rather than by waiting

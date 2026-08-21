@@ -150,6 +150,7 @@ export function extractFunctionDefs(sql) {
         ? bodyMutates(body)
         : /\b(insert\s+into|delete\s+from|update\s+[a-z_"])/.test(header);
 
+    const searchPath = functionSearchPath(segment);
     out.push({
       name,
       isDefiner: /security\s+definer/.test(header),
@@ -157,9 +158,63 @@ export function extractFunctionDefs(sql) {
       mutates,
       volatility,
       bodyKnown: body !== null,
+      searchPath,
+      // Pinned to a path that reaches `public` first is not pinned in any way
+      // that helps — see searchPathReachesPublicFirst.
+      searchPathPinned: searchPath !== null && !searchPathReachesPublicFirst(searchPath),
     });
   }
   return out;
+}
+
+/**
+ * The `SET search_path` clause on a `CREATE FUNCTION`, if it has one.
+ *
+ * Read from the HEADER only. A plpgsql body can contain its own
+ * `set search_path` statement, which is a different thing entirely — it runs at
+ * call time and does not attach to the function — so the segment is cut at the
+ * body marker (`AS $tag$`, `AS '...'`, `BEGIN ATOMIC`) before matching.
+ *
+ * Returns the schema list, or null when the function is not pinned at all.
+ */
+export function functionSearchPath(segment) {
+  const text = stripSqlComments(String(segment ?? ''));
+  const bodyAt = text.search(/\bas\s*(?:\$[a-z0-9_]*\$|'|begin\s+atomic)/i);
+  const header = bodyAt > 0 ? text.slice(0, bodyAt) : text;
+
+  const m = header.match(
+    /\bset\s+search_path\s*(?:=|\bto\b)\s*((?:"[^"]*"|[a-z0-9_$]+)(?:\s*,\s*(?:"[^"]*"|[a-z0-9_$]+))*)/i,
+  );
+  if (!m) return null;
+  return m[1]
+    .split(',')
+    .map((x) => x.trim().replace(/^"(.*)"$/, '$1'))
+    .filter(Boolean);
+}
+
+/**
+ * Is a pinned path one that actually protects the function?
+ *
+ * Statically we cannot know which roles hold CREATE, so this answers the
+ * narrower question that does not need a database: does resolution reach
+ * `public` before it reaches anything else? That is the shape proven not to
+ * protect — a definer function pinned `SET search_path = public, app`, with
+ * `public` writable, returned an attacker's planted table. And `public` is
+ * writable by default on Postgres 14 and earlier, where `CREATE` on it is
+ * granted to `PUBLIC` out of the box (changed in 15).
+ *
+ * `pg_catalog` first is the canonical safe pin: it cannot be planted in, and
+ * resolution stops being hijackable once it reaches a schema nobody can write.
+ */
+export function searchPathReachesPublicFirst(schemas) {
+  for (const raw of schemas ?? []) {
+    const schema = String(raw).toLowerCase();
+    if (schema === 'pg_catalog') return false;
+    if (schema === 'public') return true;
+    if (schema === '$user') continue; // resolves to the owner's own schema
+    return false; // some other named schema resolves first
+  }
+  return false;
 }
 
 /**
@@ -215,6 +270,37 @@ export function revokesAnonExecute(sql, name) {
  * @param {{name:string, sql:string}[]} files
  * @param {{ baseline?: number, allowlist?: string[] }} opts
  */
+/**
+ * SECURITY DEFINER functions whose `search_path` is not pinned to a path that
+ * protects them — reported as NOTES, deliberately.
+ *
+ * Whether this is exploitable depends on who holds CREATE, which no static read
+ * of migrations can answer: `definer-rpc` proves it against a real database, and
+ * `create-grants` reports the precondition. What this adds is that it needs
+ * nothing at all — it shows up on the pull request that introduces the function,
+ * in a repository that has never wired up a test database.
+ *
+ * Returns { unpinned, publicFirst, pinned } so the ones that DO pin can be
+ * counted rather than silently ignored.
+ */
+export function findUnpinnedDefiners(files, { baseline = 0, allowlist = [] } = {}) {
+  const skip = new Set(allowlist);
+  const unpinned = [], publicFirst = [], pinned = [];
+
+  for (const file of [...(files ?? [])].sort(compareMigrations)) {
+    if (migrationNumber(file.name) <= baseline) continue;
+    for (const fn of extractFunctionDefs(file.sql ?? '')) {
+      if (!fn.isDefiner || fn.returnsTrigger) continue; // a trigger has no caller path to hijack
+      if (skip.has(fn.name)) continue;
+      const at = { name: fn.name, file: file.name, searchPath: fn.searchPath };
+      if (fn.searchPath === null) unpinned.push(at);
+      else if (!fn.searchPathPinned) publicFirst.push(at);
+      else pinned.push(at);
+    }
+  }
+  return { unpinned, publicFirst, pinned };
+}
+
 export function findDefinerGrantViolations(files, { baseline = 0, allowlist = [] } = {}) {
   const allow = new Set(allowlist);
   const sorted = [...files].sort(compareMigrations);
@@ -333,6 +419,45 @@ export function run(config = {}) {
         `      If it is intentionally pre-auth, add "${v.fn}" to definerGrants.allowlist[] in your tenant-guard config.`,
     }));
 
+  // ── search_path, statically ────────────────────────────────────────
+  // Notes rather than failures on purpose: whether an unpinned path is
+  // EXPLOITABLE depends on who holds CREATE, which migrations cannot tell you.
+  // `definer-rpc` proves it against a database and `create-grants` reports the
+  // precondition; the value here is that it needs neither, so it lands on the
+  // pull request that introduces the function.
+  const sp = findUnpinnedDefiners(files, { baseline, allowlist: config.allowlist ?? [] });
+  const spNotes = [];
+
+  for (const fn of sp.publicFirst) {
+    spNotes.push({
+      where: fn.file,
+      message:
+        `"${fn.name}" is SECURITY DEFINER and pins search_path = ${fn.searchPath.join(', ')} — which resolves through "public" first, so the pin protects nothing. ` +
+        `Verified against a real database: a definer function pinned this way returned a table planted by a lower-privileged role; the same function with its own schema first returned the real one. ` +
+        `On Postgres 14 and earlier "public" is writable by every role out of the box (CREATE is granted to PUBLIC by default; changed in 15).`,
+      fix: `Put a schema nobody can plant in first:  ALTER FUNCTION public.${fn.name}(<args>) SET search_path = pg_catalog, public;`,
+    });
+  }
+
+  for (const fn of sp.unpinned) {
+    spNotes.push({
+      where: fn.file,
+      message:
+        `"${fn.name}" is SECURITY DEFINER with no SET search_path. Unqualified names inside it resolve through the CALLER's path, so a caller who can create objects makes it operate on THEIRS — running as the owner, with RLS bypassed. ` +
+        `Whether anyone can is not visible from migrations: run \`tenant-guard rpc\` against a database to settle it, and \`tenant-guard creates\` for the CREATE grants that are the precondition.`,
+      fix: `ALTER FUNCTION public.${fn.name}(<args>) SET search_path = pg_catalog, public;`,
+    });
+  }
+
+  if (sp.pinned.length > 0 && (sp.unpinned.length > 0 || sp.publicFirst.length > 0)) {
+    // The ones that got it right, counted rather than passed over in silence —
+    // a report that only ever lists failures reads as if nothing is working.
+    spNotes.push({
+      where: '(search_path)',
+      message: `${sp.pinned.length} other SECURITY DEFINER function(s) pin search_path to a path that holds. That is the pattern to copy.`,
+    });
+  }
+
   // The safe, common pattern, named so it reads as recognised rather than missed.
   const notes = findRlsHelpers(files, { baseline })
     .filter((h) => !h.mutates)
@@ -341,7 +466,8 @@ export function run(config = {}) {
       message:
         `"${h.fn}" is a SECURITY DEFINER ${h.volatility ?? 'non-mutating'} predicate referenced by a policy — an RLS helper, which is the correct pattern. ` +
         `Not flagged, and its EXECUTE grant must stay: revoking it would break every read the policy guards.`,
-    }));
+    }))
+    .concat(spNotes);
 
   return {
     id: meta.id,

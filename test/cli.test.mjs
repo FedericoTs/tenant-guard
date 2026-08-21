@@ -80,7 +80,10 @@ test('--sarif puts NOTHING on stdout but SARIF', () => {
   const { out } = cli(['run', '--sarif']);
   const parsed = JSON.parse(out);
   assert.equal(parsed.version, '2.1.0');
-  assert.equal(parsed.runs[0].results.length, 3);
+  // Errors, not total results: notes are also SARIF results (level "note"), so
+  // counting everything makes a purity test fail whenever a guard learns to say
+  // something new. The invariant that matters here is that stdout parsed at all.
+  assert.equal(parsed.runs[0].results.filter((r) => r.level === 'error').length, 3);
 });
 
 test('--json and --sarif cannot both take stdout — it exits 2 instead of interleaving', () => {

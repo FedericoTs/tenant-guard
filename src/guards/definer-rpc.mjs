@@ -166,6 +166,53 @@ export function searchPathPinned(config) {
   return Array.isArray(config) && config.some((c) => /^search_path=/i.test(String(c)));
 }
 
+/**
+ * The schemas a pinned `search_path` actually resolves through.
+ *
+ * `proconfig` stores the clause verbatim - `search_path=public, app` - so the
+ * entries have to be split back out. `$user` is dropped: it resolves to a schema
+ * named after the CURRENT user, which for a definer function is the owner, and
+ * it is not a fixed name that can be checked against a grant list.
+ */
+export function searchPathSchemas(config) {
+  const entry = (config ?? []).map(String).find((c) => /^search_path=/i.test(c));
+  if (!entry) return [];
+  return entry
+    .slice(entry.indexOf('=') + 1)
+    .split(',')
+    .map((x) => x.trim().replace(/^"(.*)"$/, '$1'))
+    .filter((x) => x && x.toLowerCase() !== '$user');
+}
+
+/**
+ * Is the pin worth anything?
+ *
+ * A pin that names a schema the attacker can CREATE in is not protection - it
+ * just fixes the path they were going to be on anyway. **Verified**: a definer
+ * function pinned `SET search_path = public, app`, with `public` writable by a
+ * lower-privileged role, returned that role's planted table instead of the
+ * owner's. Pinned `= app, public` returned the real one. The ORDER matters and
+ * the writability matters; the presence of a `SET` clause on its own means
+ * nothing, which is exactly what this used to check.
+ *
+ * Only entries BEFORE the first schema the role cannot write to can be
+ * shadowed - once resolution reaches a schema they cannot plant in, the real
+ * object wins. `pg_catalog` is not writable, which is why
+ * `SET search_path = pg_catalog, ...` is the canonical fix.
+ *
+ * Returns the writable schemas that are actually reachable, [] if the pin holds.
+ */
+export function shadowableSchemas(config, writableSchemas = []) {
+  const writable = new Set(writableSchemas);
+  const out = [];
+  for (const schema of searchPathSchemas(config)) {
+    if (schema.toLowerCase() === 'pg_catalog') break; // no longer hijackable past here
+    if (writable.has(schema)) out.push(schema);
+    else break; // the real object resolves here; nothing later can be shadowed
+  }
+  return out;
+}
+
 export function isReadOnlyVolatility(volatility) {
   return volatility === 's' || volatility === 'i';
 }
@@ -374,19 +421,29 @@ export async function check({ query, config = {} }) {
               `      If it must be interpolated, escape it explicitly — quote_literal(${inj.param}) for a value, quote_ident(${inj.param}) for an identifier, or format('… %L …', ${inj.param}). Note that format's %s does NO escaping at all.`,
           });
         }
-        if (!searchPathPinned(fn.config) && writableSchemas.length > 0) {
+        const pinned = searchPathPinned(fn.config);
+        // A pin that names a writable schema is not a pin. Verified: pinned
+        // `= public, app` with `public` writable returned the attacker's planted
+        // table; `= app, public` returned the real one.
+        const shadowable = pinned ? shadowableSchemas(fn.config, writableSchemas) : [];
+        if ((!pinned && writableSchemas.length > 0) || shadowable.length > 0) {
+          const reachable = pinned ? shadowable : writableSchemas;
           violations.push({
             where: fqn,
             kind: 'search-path',
-            message:
-              `SECURITY DEFINER function with no pinned search_path, and "${role}" can CREATE objects in ${writableSchemas.slice(0, 3).map((s) => `"${s}"`).join(', ')}. ` +
-              `Unqualified names inside the function resolve through the CALLER's search_path, so a caller who creates a table or function earlier on that path makes this function operate on THEIR object — executing as the definer's owner, with RLS bypassed.`,
+            message: pinned
+              ? `SECURITY DEFINER function whose search_path is pinned to ${shadowable.map((s) => `"${s}"`).join(', ')} — which "${role}" can CREATE objects in, so the pin protects nothing. ` +
+                `Resolution walks the pinned path in order and reaches a schema they can plant in before it reaches yours, so an unqualified name in the body finds THEIR object, executing as the owner with RLS bypassed. ` +
+                `Verified against a real database: a function pinned to a writable schema returned a planted table; the same function pinned to its own schema first returned the real one.`
+              : `SECURITY DEFINER function with no pinned search_path, and "${role}" can CREATE objects in ${writableSchemas.slice(0, 3).map((s) => `"${s}"`).join(', ')}. ` +
+                `Unqualified names inside the function resolve through the CALLER's search_path, so a caller who creates a table or function earlier on that path makes this function operate on THEIR object — executing as the definer's owner, with RLS bypassed.`,
             fix:
-              `Pin it, so the body always resolves the objects you meant:\n` +
+              `Pin it to a path they cannot plant on — pg_catalog first, then the function's own schema:\n` +
               `        ALTER FUNCTION ${fn.schema}.${fn.name}(${fn.args || ''}) SET search_path = pg_catalog, ${fn.schema};\n` +
+              `      Listing pg_catalog first is what makes it a pin rather than a preference; ${reachable.map((s) => `"${s}"`).join(', ')} must not come before your own schema.\n` +
               `      And revoke the ability to create objects on the shared path: REVOKE CREATE ON SCHEMA public FROM ${role};`,
           });
-        } else if (!searchPathPinned(fn.config)) {
+        } else if (!pinned) {
           notes.push({ where: fqn, message: `SECURITY DEFINER function with no pinned search_path. Not exploitable here — "${role}" cannot CREATE objects in any schema, so it has nowhere to plant a shadowing object — but pinning it (SET search_path = pg_catalog, ${fn.schema}) keeps it that way.` });
         }
       }

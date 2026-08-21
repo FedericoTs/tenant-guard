@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.26.0
+
+**`definer-grants` recommended a fix that caused a production outage.** Reported
+from a real run against a live Supabase app, reproduced here, fixed, and pinned
+by tests. If you have applied a `REVOKE EXECUTE` this guard suggested, read on —
+you may need to put it back.
+
+### What happened
+
+It flagged `user_is_trip_owner` — a pure `STABLE SELECT EXISTS` predicate — as
+"SECURITY DEFINER + mutates", and advised:
+
+```sql
+REVOKE EXECUTE ON FUNCTION public.user_is_trip_owner(...) FROM PUBLIC, anon;
+```
+
+That function is called inside nine RLS policies. **Postgres requires the
+CALLING role to hold EXECUTE even for a `SECURITY DEFINER` function invoked in a
+policy**, so the revoke denied `anon` the ability to evaluate its own row policy
+and every anonymous read started failing with `42501`. Reproduced in this repo's
+tests against a real database, before and after.
+
+### Two bugs behind it
+
+- **fix: the parser read the file, not the function.** It sliced from each
+  `CREATE FUNCTION` to the *next one*, so every statement that followed the last
+  function was swallowed into its segment — and a neighbouring
+  `CREATE POLICY … FOR INSERT` made a read-only predicate match
+  `/\b(insert|update|delete)\b/`. The body is now extracted from its own `AS`
+  clause (dollar-quoted with or without a tag, quoted, or `BEGIN ATOMIC`), SQL
+  comments are stripped, and mutation is judged on statements rather than bare
+  words — `FOR UPDATE` is a lock and `updated_at` is a column.
+
+- **fix: volatility is now authoritative.** Postgres *enforces* that a `STABLE`
+  or `IMMUTABLE` function cannot write — it rejects the statement at runtime. So
+  a non-volatile function is provably non-mutating, and no regex gets a vote.
+  This alone clears the reported case.
+
+- **fix: a function referenced by a `CREATE POLICY` expression is never told to
+  revoke.** Recognised as an *RLS helper* — the correct, necessary pattern — and
+  reported as a note saying its EXECUTE grant is load-bearing. A helper that
+  genuinely mutates is still flagged, but with different advice: split it into a
+  `STABLE` predicate for the policy and a `VOLATILE` function for the writes,
+  because revoking would break the policy either way.
+
+### Why this mattered more than the finding
+
+A security linter's fixes get applied blind — that is the point of printing
+them. So they have to be safe to apply blind. This one was not, and the guard
+was wrong about the fact it was reasoning from.
+
+- 563 tests (was 551), 20 guards.
+
 ## 0.25.1
 
 Documents the self-escalation check properly, and fixes a config option that

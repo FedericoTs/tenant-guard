@@ -118,6 +118,8 @@ The highest-severity blind spot of any table-only scanner.
 
 | 4.11 | A definer function's `search_path` is **pinned to a schema the attacker can write to** | ✅ | `definer-rpc` (runtime, conclusive) + `definer-grants` (static, note). **Was a false negative in this tool**: `searchPathPinned` matched `/^search_path=/` and called the function protected. It is not — a pin only helps if resolution reaches a schema nobody can plant in. Verified end to end: a definer function pinned `SET search_path = public, app`, with `public` writable by a lower-privileged role, returned that role's planted table; pinned `= app, public` it returned the real one. Note the caveat found while proving it — **plpgsql caches a resolved plan per session**, so a function already called in that session keeps resolving correctly. The hijack is deterministic in a fresh session and a race in a warm one, and PostgREST/pgbouncer sessions turn over constantly, so a lucky green run is not evidence the pin held |
 
+| 4.12 | **Effective** write grants on a VIEW that already exists — not what a new object would inherit | ✅ | `anon-writes` (runtime) alongside `updatable-view-writethrough` (static). The static half reads migrations; this reads what the database grants right now, which is how the reported bug arrived — `ALTER DEFAULT PRIVILEGES ... ON TABLES` armed a view created afterwards, so no migration reads like a security change and the grant exists only in the catalog. Was a false negative: `anon-writes` scanned `relkind in ('r','p')` and returned OK on a database where `anon` could DELETE through a view over an RLS-protected table. Three catalog facts settle it and all three are needed — `pg_relation_is_updatable` (0 for an aggregate or join view, so a grant-only check fires on every reporting view), `security_invoker` (verified: 1 row affected with it off, 42501 with it on), and the privilege itself — then it PROBES to prove it |
+
 ## 5. Supabase surfaces
 
 | # | Failure | Status | How |
@@ -210,7 +212,7 @@ callable GUC-setting definer functions, 4.7 partitions, 3.9 TRUNCATE (0.10.0);
 inside them (0.16.0–0.17.0); 4.9 shadow tables, 7.1 role capabilities (0.18.0);
 2.14 schema-per-tenant (0.19.0); 6.1 session-scoped tenant GUCs (0.21.0);
 7.2 inherited default privileges (0.22.0); 3.11 cross-tenant foreign keys (0.23.0); 7.3 CREATE grants (0.24.0);
-2.15 untenanted sensitive columns (0.31.0); 4.11 pinned-but-writable search_path (0.32.0); 1.9 over-restriction positive control (0.33.0).*
+2.15 untenanted sensitive columns (0.31.0); 4.11 pinned-but-writable search_path (0.32.0); 1.9 over-restriction positive control (0.33.0); 4.12 effective view write grants (0.34.0).*
 
 *Three of these are worth learning from. **4.7** was a false NEGATIVE in the
 flagship guard, found by writing the failure surface down rather than by waiting

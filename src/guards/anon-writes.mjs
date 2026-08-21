@@ -78,6 +78,101 @@ export function surfaceSql(schemas, role) {
 const bool = (v) => v === true || v === 't';
 
 /** Normalise a surface row and drop grandfathered/allowlisted tables. */
+/**
+ * The VIEW write surface — the half of "what can anon write" that no amount of
+ * RLS review covers, because a view has no RLS of its own.
+ *
+ * A view created after `ALTER DEFAULT PRIVILEGES ... GRANT ... ON TABLES` inherits
+ * the write grant silently, and unless it was declared `security_invoker = true`
+ * it executes as its OWNER — so an UPDATE through it reaches the base table with
+ * that table's policies never consulted. Reported from a real run as the worst
+ * bug found: `PATCH`/`DELETE` on a public profiles view returned 200.
+ *
+ * Three catalog facts settle it, and all three are needed:
+ *
+ *   • `pg_relation_is_updatable(oid, true)` — Postgres's own answer to whether
+ *     writes pass through. Non-zero for an auto-updatable view, 0 for one with
+ *     an aggregate or a join. Measured: a grant-only check calls those writable
+ *     too, so it false-positives on every reporting view in the schema.
+ *   • `security_invoker` — with it on, the base table's RLS applies to the
+ *     caller and the write is refused. Verified both ways: 1 row affected with
+ *     it off, 42501 with it on.
+ *   • the role's actual privilege.
+ */
+export function viewSurfaceSql(schemas, role) {
+  return {
+    text: `
+      select n.nspname as schema,
+             c.relname as table,
+             c.relkind::text as relkind,
+             c.relowner::regrole::text as owner_role,
+             pg_catalog.pg_relation_is_updatable(c.oid, true) as updatable_mask,
+             coalesce((select option_value from pg_catalog.pg_options_to_table(c.reloptions)
+                       where option_name = 'security_invoker'), 'false') as security_invoker,
+             pg_catalog.has_table_privilege($2::text, c.oid, 'INSERT') as can_insert,
+             pg_catalog.has_table_privilege($2::text, c.oid, 'UPDATE') as can_update,
+             pg_catalog.has_table_privilege($2::text, c.oid, 'DELETE') as can_delete,
+             (select a.attname from pg_catalog.pg_attribute a
+               where a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
+               order by a.attnum limit 1) as probe_col
+      from pg_catalog.pg_class c
+      join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+      where c.relkind = 'v' and n.nspname = any($1)
+      order by n.nspname, c.relname
+    `,
+    values: [schemas, role],
+  };
+}
+
+/** True when `security_invoker` is off, i.e. the view runs as its owner. */
+export function runsAsOwner(row) {
+  return String(row?.security_invoker ?? 'false').toLowerCase() !== 'true';
+}
+
+/**
+ * The views worth probing: writes pass through, the view runs as its owner, and
+ * the role holds a write privilege. Anything else is silent — a reporting view
+ * with a grant it cannot use is not a finding.
+ */
+export function planViewSurface(rows, allowlist = []) {
+  const skip = new Set(allowlist);
+  return (rows ?? [])
+    .filter((r) => Number(r.updatable_mask ?? 0) !== 0)
+    .filter(runsAsOwner)
+    .filter((r) => r.can_insert === true || r.can_update === true || r.can_delete === true)
+    .filter((r) => !skip.has(r.table) && !skip.has(`${r.schema}.${r.table}`))
+    .map((r) => ({
+      schema: r.schema,
+      table: r.table,
+      isView: true,
+      ownerRole: r.owner_role ?? null,
+      canUpdate: r.can_update === true,
+      canDelete: r.can_delete === true,
+      canInsert: r.can_insert === true,
+      probeCol: r.probe_col ?? null,
+    }));
+}
+
+/** The verdict for one writable view. */
+export function violationForView(v, commands, role) {
+  const id = `${v.schema}.${v.table}`;
+  return {
+    where: id,
+    kind: 'anon-writable-view',
+    message:
+      `"${role}" performed ${commands.join(' and ')} through the view ${id}, and the write reached the base table. ` +
+      `A view has no RLS of its own, and this one has security_invoker off, so it executes as its owner (${v.ownerRole ?? 'the view owner'}) — the base table's policies are never consulted. ` +
+      `Proven by probing, in a rolled-back transaction: rows were actually affected. ` +
+      `The usual cause is ALTER DEFAULT PRIVILEGES granting writes on TABLES, which covers views created afterwards, so nothing in any migration reads like a security change.`,
+    fix:
+      `Take the write grant away — a view meant for reading needs only SELECT:\n` +
+      `        REVOKE INSERT, UPDATE, DELETE ON ${id} FROM ${role}, authenticated;\n` +
+      `      If writes through it are intended, make it run as the CALLER so the base table's RLS applies (verified: the same write is then refused with 42501):\n` +
+      `        ALTER VIEW ${id} SET (security_invoker = true);\n` +
+      `      And check what else inherited it:  ALTER DEFAULT PRIVILEGES IN SCHEMA ${v.schema} REVOKE INSERT, UPDATE, DELETE ON TABLES FROM ${role};`,
+  };
+}
+
 export function planSurface(rows, allowlist = []) {
   const skip = new Set(allowlist);
   return rows
@@ -109,6 +204,17 @@ export function anonUpdateSql(schema, table, col) {
   return `update ${qualified(schema, table)} set ${c} = ${c}`;
 }
 /** Whole-table DELETE (no WHERE, USING-only). */
+/**
+ * UPDATE probe for a view. The table probe writes the tenant column back onto
+ * itself; a view may not expose one, so this rewrites the view's first column to
+ * its own value — a no-op that still has to pass every check a real write does.
+ * Rolled back regardless, like every other probe here.
+ */
+export function viewUpdateSql(schema, table, column) {
+  const c = quoteIdent(column);
+  return `update ${qualified(schema, table)} set ${c} = ${c}`;
+}
+
 export function anonDeleteSql(schema, table) {
   return `delete from ${qualified(schema, table)}`;
 }
@@ -147,8 +253,17 @@ export async function check({ query, config = {} }) {
 
   const s = surfaceSql(cfg.schemas, role);
   const plan = planSurface(await q(s.text, s.values), cfg.allowlist).map((t) => ({ ...t, role }));
-  if (plan.length === 0) {
-    return OK({ skipped: true, reason: `no tables in ${cfg.schemas.join(', ')}`, summary: 'skipped — no tables' });
+
+  // Views are selected from the catalog rather than probed blind: writes must
+  // actually pass through, and the view must run as its owner. See viewSurfaceSql.
+  let viewPlan = [];
+  try {
+    const vs = viewSurfaceSql(cfg.schemas, role);
+    viewPlan = planViewSurface(await q(vs.text, vs.values), cfg.allowlist);
+  } catch { /* older server or no permission on the catalog — tables still checked */ }
+
+  if (plan.length === 0 && viewPlan.length === 0) {
+    return OK({ skipped: true, reason: `no tables or writable views in ${cfg.schemas.join(', ')}`, summary: 'skipped — no tables' });
   }
 
   const violations = [];
@@ -210,6 +325,16 @@ export async function check({ query, config = {} }) {
       if (t.probeCol && t.canUpdate && (await probeWrite(anonUpdateSql(t.schema, t.table, t.probeCol))) > 0) cmds.push('UPDATE');
       if (t.canDelete && (await probeWrite(anonDeleteSql(t.schema, t.table))) > 0) cmds.push('DELETE');
       if (cmds.length) violations.push(violationFor(t, cmds, true));
+    }
+
+    // Views. Probed exactly like the tables above, and inside the same
+    // transaction, so a clean result means the same thing here as there.
+    for (const v of viewPlan) {
+      scanned++;
+      const cmds = [];
+      if (v.canUpdate && v.probeCol && (await probeWrite(viewUpdateSql(v.schema, v.table, v.probeCol))) > 0) cmds.push('UPDATE');
+      if (v.canDelete && (await probeWrite(anonDeleteSql(v.schema, v.table))) > 0) cmds.push('DELETE');
+      if (cmds.length) violations.push(violationForView(v, cmds, role));
     }
   } finally {
     try { await query('rollback', []); } catch { /* ignore */ }

@@ -46,7 +46,10 @@ if (PGlite) {
     const v = res.violations.find((x) => x.where === 'public:anon');
     assert.ok(v, JSON.stringify(res.violations, null, 2));
     assert.equal(v.kind, 'anon-create');
-    assert.match(v.message, /nothing is exploitable today/);
+    // Scoped to what was scanned. The old wording ("nothing is exploitable
+    // today") asserted global safety off the back of a presence-only pin check.
+    assert.match(v.message, /no SECURITY DEFINER functions in "public"/);
+    assert.match(v.message, /nothing there is hijackable through this grant today/);
     assert.match(v.message, /arms the next one/);
   });
 
@@ -64,6 +67,9 @@ if (PGlite) {
   });
 
   test('a PINNED definer is not counted as armed', async () => {
+    // `pg_catalog, public` with the function and its objects in `public`:
+    // nothing anon can plant in comes BEFORE where the name resolves, so the
+    // pin genuinely holds. This is the calibration case — it must stay quiet.
     const { query } = await freshDb(`
       grant create on schema public to anon;
       create function public.safe() returns int language sql security definer
@@ -71,7 +77,8 @@ if (PGlite) {
     `);
     const res = await check({ query });
     const v = res.violations.find((x) => x.where === 'public:anon');
-    assert.match(v.message, /nothing is exploitable today/);
+    assert.match(v.message, /none of them is hijackable through this grant today/);
+    assert.doesNotMatch(v.message, /may already work TODAY/);
   });
 
   test('CATCHES a grant to PUBLIC as one finding about the schema, not one per role', async () => {

@@ -76,6 +76,186 @@ export function policyGucsSql(schemas) {
 }
 
 /**
+ * The user functions each policy calls, with their bodies.
+ *
+ * Measured against pglite: a policy written `using (org = current_tenant())`
+ * deparses in `pg_policies.qual` as exactly that — the `current_setting('app.tenant')`
+ * inside the helper never appears. Reading only the deparsed expression therefore
+ * reported "no policy authorizes from a custom GUC" on a schema where the bleed
+ * was live and provable. `pg_depend` records the policy→function edge exactly, so
+ * this is a lookup rather than a guess: no parsing of the deparsed expression, and
+ * pinned system functions (`current_setting`, casts, operators) are not recorded
+ * there at all, so the result is only the user's own helpers.
+ */
+export function policyFunctionsSql(schemas) {
+  return {
+    text: `
+      select ns.nspname   as schema,
+             c.relname    as table,
+             p.polname    as policy,
+             p.polcmd     as polcmd,
+             fnn.nspname  as fn_schema,
+             fn.proname   as fn_name,
+             l.lanname    as lang,
+             fn.prosrc    as body
+      from pg_catalog.pg_depend d
+      join pg_catalog.pg_policy p     on p.oid = d.objid
+      join pg_catalog.pg_class c      on c.oid = p.polrelid
+      join pg_catalog.pg_namespace ns on ns.oid = c.relnamespace
+      join pg_catalog.pg_proc fn      on fn.oid = d.refobjid
+      join pg_catalog.pg_namespace fnn on fnn.oid = fn.pronamespace
+      join pg_catalog.pg_language l   on l.oid = fn.prolang
+      where d.classid = 'pg_catalog.pg_policy'::regclass
+        and d.refclassid = 'pg_catalog.pg_proc'::regclass
+        and ns.nspname = any($1)
+    `,
+    values: [schemas],
+  };
+}
+
+/**
+ * Bodies of functions by bare name, for following one helper into the next.
+ *
+ * `pg_depend` records the policy→function edge but NOT function→function for
+ * plain SQL/plpgsql bodies (verified: a two-level chain produced zero fn→fn rows),
+ * so the second hop has to be resolved by name. System schemas are excluded
+ * because nothing there is the app's to leave lying around.
+ */
+export function functionBodiesSql(names) {
+  return {
+    text: `
+      select n.nspname as fn_schema, p.proname as fn_name,
+             l.lanname as lang, p.prosrc as body
+      from pg_catalog.pg_proc p
+      join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+      join pg_catalog.pg_language l  on l.oid = p.prolang
+      where p.proname = any($1)
+        and n.nspname not in ('pg_catalog', 'information_schema')
+    `,
+    values: [names],
+  };
+}
+
+/** `pg_policy.polcmd` is a single char; `pg_policies.cmd` is the word. */
+const POLCMD = { '*': 'ALL', r: 'SELECT', a: 'INSERT', w: 'UPDATE', d: 'DELETE' };
+
+// Words that appear before `(` in SQL/plpgsql bodies and are never the user's
+// own helper. Anything not on this list is looked up in pg_proc, and a name that
+// resolves to nothing costs one row in an `= any($1)` query.
+const NOT_A_HELPER = new Set([
+  'select', 'from', 'where', 'and', 'or', 'not', 'case', 'when', 'then', 'else', 'end',
+  'coalesce', 'nullif', 'cast', 'current_setting', 'set_config', 'array', 'row', 'exists',
+  'in', 'values', 'if', 'elsif', 'return', 'begin', 'declare', 'using', 'on', 'as', 'is',
+  'null', 'true', 'false', 'count', 'min', 'max', 'sum', 'avg', 'trim', 'lower', 'upper',
+  'substring', 'concat', 'format', 'any', 'all', 'into', 'language', 'function', 'returns',
+]);
+
+/** Bare identifiers called as functions inside a body — the next hop to resolve. */
+export function calledFunctionNames(body) {
+  const out = new Set();
+  for (const m of String(body ?? '').matchAll(/([A-Za-z_][A-Za-z_0-9$]*)\s*\(/g)) {
+    const name = m[1].toLowerCase();
+    if (!NOT_A_HELPER.has(name)) out.add(name);
+  }
+  return [...out];
+}
+
+/** A body we can actually read. `c` and `internal` store a symbol name, not SQL. */
+export function bodyIsReadable(row) {
+  const lang = String(row?.lang ?? '').toLowerCase();
+  return (lang === 'sql' || lang === 'plpgsql') && typeof row?.body === 'string' && row.body.length > 0;
+}
+
+/**
+ * Fold GUCs read inside policy-called functions into `byGuc`, in place.
+ *
+ * Broadening the *input* set cannot broaden the *verdict*: `classifyGuc` only
+ * returns 'leak' when a session-scoped write to that same GUC is also found in
+ * the source. A codebase using `set_config(…, true)` gets 'ok'; a GUC nothing
+ * writes gets a note. The worst case of over-collecting here is an extra note.
+ *
+ * Returns what was measured, so the caller can report what it could NOT see
+ * instead of calling it absence.
+ */
+export async function resolveGucsThroughFunctions(q, cfg, byGuc, maxDepth = 4) {
+  const stats = { resolved: 0, unreadable: [], error: null };
+  let rows;
+  try {
+    const spec = policyFunctionsSql(cfg.schemas);
+    rows = await q(spec.text, spec.values);
+  } catch (err) {
+    stats.error = err.message;
+    return stats;
+  }
+  if (!Array.isArray(rows)) {
+    stats.error = 'the policy→function catalog query returned no row set';
+    return stats;
+  }
+
+  // seed: one entry per (policy, function) edge, carrying the calling policy
+  let frontier = [];
+  for (const r of rows) {
+    if (!r || typeof r.fn_name !== 'string' || typeof r.qual === 'string') continue; // shape guard
+    frontier.push({
+      policy: { id: `${r.schema}.${r.table}`, policy: r.policy, cmd: POLCMD[r.polcmd] ?? r.polcmd ?? 'ALL' },
+      via: `${r.fn_schema}.${r.fn_name}()`,
+      row: r,
+    });
+  }
+
+  const seen = new Set();
+  for (let depth = 0; depth < maxDepth && frontier.length > 0; depth++) {
+    const next = [];
+    const wanted = new Map(); // bare name -> [{policy, via}]
+    for (const node of frontier) {
+      const key = `${node.row.fn_schema}.${node.row.fn_name}|${node.policy.id}|${node.policy.policy}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      if (!bodyIsReadable(node.row)) {
+        const label = `${node.row.fn_schema}.${node.row.fn_name} (language ${node.row.lang})`;
+        if (!stats.unreadable.includes(label)) stats.unreadable.push(label);
+        continue;
+      }
+      stats.resolved++;
+
+      for (const guc of classifyIdentitySource(node.row.body).settableGucs) {
+        if (!byGuc.has(guc)) byGuc.set(guc, []);
+        const entry = { ...node.policy, via: node.via };
+        const already = byGuc.get(guc).some((p) => p.id === entry.id && p.policy === entry.policy && p.via === entry.via);
+        if (!already) byGuc.get(guc).push(entry);
+      }
+
+      for (const name of calledFunctionNames(node.row.body)) {
+        if (!wanted.has(name)) wanted.set(name, []);
+        // The chain so far; the resolved schema-qualified name is appended once
+        // the lookup says which function this bare name actually was.
+        wanted.get(name).push({ policy: node.policy, viaPrefix: node.via });
+      }
+    }
+    if (wanted.size === 0) break;
+
+    let bodies;
+    try {
+      const spec = functionBodiesSql([...wanted.keys()]);
+      bodies = await q(spec.text, spec.values);
+    } catch (err) {
+      stats.error = stats.error ?? `nested helper lookup failed: ${err.message}`;
+      break;
+    }
+    if (!Array.isArray(bodies)) break;
+    for (const b of bodies) {
+      if (!b || typeof b.fn_name !== 'string') continue;
+      for (const caller of wanted.get(b.fn_name.toLowerCase()) ?? []) {
+        next.push({ policy: caller.policy, via: `${caller.viaPrefix} → ${b.fn_schema}.${b.fn_name}()`, row: b });
+      }
+    }
+    frontier = next;
+  }
+  return stats;
+}
+
+/**
  * Which custom GUCs the policies authorize from, and which policies use each.
  *
  * The `request.jwt.*` exclusion is inherited from `identity-trust`, deliberately
@@ -140,6 +320,128 @@ const snippetAt = (text, index) => {
   return text.slice(from, to === -1 ? text.length : to).trim().slice(0, 160);
 };
 
+// ── comments and strings ─────────────────────────────────────────────
+
+/**
+ * Comment syntax per file extension.
+ *
+ * Per-language, not one union, because being wrong costs something in both
+ * directions. Applying SQL's `--` rule to JavaScript would blank the rest of a
+ * line after `i--` and could hide a live `set_config` sitting on it; not
+ * applying it to `.sql` is the false positive this table exists to fix —
+ * measured: a migration whose only mention of the GUC was the prose
+ * `-- Never SET app.tenant = ... session-wide` produced a build-failing
+ * violation, and a `client.ts` doing the right thing while documenting the
+ * anti-pattern in a `//` comment did the same, with the correct
+ * `set_config(…, true)` on the next line masked by it.
+ *
+ * An extension not in this table masks NOTHING. Guessing the comment syntax of
+ * an unknown language would hide real writes, and a false negative here is the
+ * one thing worse than the false positive.
+ */
+const JS_LIKE = { line: ['//'], block: [['/*', '*/']], quotes: ["'", '"', '`'], escape: '\\' };
+const C_LIKE = { line: ['//'], block: [['/*', '*/']], quotes: ["'", '"'], escape: '\\' };
+const HASH_LIKE = { line: ['#'], block: [], quotes: ["'", '"'], escape: '\\' };
+/** Strings only, no comments: what an unknown extension gets. */
+const STRINGS_ONLY = { line: [], block: [], quotes: ["'", '"', '`'], escape: '\\' };
+
+export const COMMENT_SYNTAX = {
+  // `--` and `/* */`; `''`/`""` double to escape; `$tag$…$tag$` bodies are opaque.
+  '.sql': { line: ['--'], block: [['/*', '*/']], quotes: ["'", '"'], escape: null, doubling: true, dollarQuote: true },
+  '.ts': JS_LIKE, '.tsx': JS_LIKE, '.js': JS_LIKE, '.jsx': JS_LIKE, '.mjs': JS_LIKE, '.cjs': JS_LIKE,
+  '.go': { line: ['//'], block: [['/*', '*/']], quotes: ["'", '"', '`'], escape: '\\' },
+  '.rs': C_LIKE, '.java': C_LIKE, '.kt': C_LIKE,
+  '.php': { line: ['//', '#'], block: [['/*', '*/']], quotes: ["'", '"', '`'], escape: '\\' },
+  '.py': { ...HASH_LIKE, triple: true },
+  '.rb': HASH_LIKE, '.ex': HASH_LIKE, '.exs': HASH_LIKE,
+};
+
+/**
+ * One pass over a file, producing both things the scanners need:
+ *   `masked`  — same length as the input, comment bodies replaced by spaces
+ *               (newlines kept), so line numbers and offsets still line up with
+ *               the original and the reported `line:`/`snippet:` stay right.
+ *   `strings` — the spans of string literals, which is where a host language
+ *               keeps the SQL it actually executes.
+ *
+ * Comment starts are only recognised outside string literals, so `"http://…"`
+ * is not a comment. Every ambiguity resolves toward *not* masking: an
+ * unterminated block comment or an unterminated quote is left as ordinary text
+ * rather than swallowing the rest of the file, because under-masking only
+ * restores today's behaviour while over-masking hides a real write.
+ */
+export function tokenize(text, ext) {
+  const src = String(text ?? '');
+  const syn = COMMENT_SYNTAX[String(ext ?? '').toLowerCase()] ?? STRINGS_ONLY;
+  const out = src.split('');
+  const strings = [];
+  const blank = (from, to) => {
+    for (let i = from; i < to && i < out.length; i++) if (out[i] !== '\n' && out[i] !== '\r') out[i] = ' ';
+  };
+
+  let i = 0;
+  outer: while (i < src.length) {
+    for (const [open, close] of syn.block) {
+      if (src.startsWith(open, i)) {
+        const end = src.indexOf(close, i + open.length);
+        if (end === -1) return { masked: out.join(''), strings }; // unterminated: leave it
+        blank(i, end + close.length);
+        i = end + close.length;
+        continue outer;
+      }
+    }
+    for (const open of syn.line) {
+      if (src.startsWith(open, i)) {
+        let end = src.indexOf('\n', i);
+        if (end === -1) end = src.length;
+        blank(i, end);
+        i = end;
+        continue outer;
+      }
+    }
+    if (syn.dollarQuote && src[i] === '$') {
+      const m = /^\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$/.exec(src.slice(i));
+      if (m) {
+        const tag = m[0];
+        const end = src.indexOf(tag, i + tag.length);
+        if (end !== -1) {
+          strings.push({ start: i + tag.length, end, content: src.slice(i + tag.length, end) });
+          i = end + tag.length;
+          continue;
+        }
+      }
+    }
+    const quote = syn.quotes.find((qq) => src.startsWith(qq, i));
+    if (quote) {
+      const triple = syn.triple && src.startsWith(quote.repeat(3), i) ? quote.repeat(3) : null;
+      const open = triple ?? quote;
+      let j = i + open.length;
+      let closed = -1;
+      while (j < src.length) {
+        if (syn.escape && src[j] === syn.escape) { j += 2; continue; }
+        if (src.startsWith(open, j)) {
+          // SQL doubles a quote to escape it: '' inside '…' is one character.
+          if (syn.doubling && !triple && src.startsWith(open, j + open.length)) { j += open.length * 2; continue; }
+          closed = j;
+          break;
+        }
+        j++;
+      }
+      if (closed === -1) { i += open.length; continue; } // unterminated: ordinary text
+      strings.push({ start: i + open.length, end: closed, content: src.slice(i + open.length, closed) });
+      i = closed + open.length;
+      continue;
+    }
+    i++;
+  }
+  return { masked: out.join(''), strings };
+}
+
+/** `tokenize`'s masked half, for callers that only want the comments gone. */
+export function maskComments(text, ext) {
+  return tokenize(text, ext).masked;
+}
+
 /**
  * Every `set_config(...)` call naming one of `gucs`, classified by scope.
  *
@@ -147,7 +449,7 @@ const snippetAt = (text, index) => {
  * `false` = the rest of the connection (the bug). Anything else — a variable, a
  * ternary — is `unknown`, and reported as a note rather than guessed at.
  */
-export function setConfigCalls(text, gucs) {
+export function setConfigCalls(text, gucs, original = text) {
   const wanted = new Set(gucs ?? []);
   const out = [];
   const re = /\bset_config\s*\(/gi;
@@ -160,7 +462,9 @@ export function setConfigCalls(text, gucs) {
     if (!name || (wanted.size > 0 && !wanted.has(name))) continue;
     const isLocal = (args[2] ?? '').trim().toLowerCase();
     const scope = isLocal === 'false' ? 'session' : isLocal === 'true' ? 'local' : 'unknown';
-    out.push({ guc: name, scope, via: 'set_config', line: lineOf(text, m.index), snippet: snippetAt(text, m.index) });
+    // `original` is the unmasked file: masking preserves offsets, so the index
+    // is valid in both, and the snippet stays legible.
+    out.push({ guc: name, scope, via: 'set_config', line: lineOf(text, m.index), snippet: snippetAt(original, m.index) });
   }
   return out;
 }
@@ -171,7 +475,7 @@ export function setConfigCalls(text, gucs) {
  * Restricted to GUCs the policies actually use, which is what keeps this from
  * matching arbitrary `set x.y =` in application code.
  */
-export function setStatements(text, gucs) {
+export function setStatements(text, gucs, original = text) {
   const out = [];
   for (const guc of gucs ?? []) {
     const escaped = guc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -184,30 +488,73 @@ export function setStatements(text, gucs) {
         scope: modifier === 'local' ? 'local' : 'session',
         via: modifier === 'local' ? 'SET LOCAL' : modifier === 'session' ? 'SET SESSION' : 'SET',
         line: lineOf(text, m.index),
-        snippet: snippetAt(text, m.index),
+        snippet: snippetAt(original, m.index),
       });
     }
   }
   return out;
 }
 
-/** Both scanners over one file's text. */
-export function scanText(text, gucs) {
-  return [...setConfigCalls(text, gucs), ...setStatements(text, gucs)];
+/**
+ * Both scanners over one file's text.
+ *
+ * Pass `ext` and comments are masked first, so prose about the anti-pattern is
+ * not read as the anti-pattern. Without `ext` nothing is masked — a caller that
+ * does not know the language gets the raw scan, and a commented-out write still
+ * matches. `scanSources` always supplies it.
+ */
+export function scanText(text, gucs, ext) {
+  const scanned = ext === undefined ? text : maskComments(text, ext);
+  return [...setConfigCalls(scanned, gucs, text), ...setStatements(scanned, gucs, text)];
 }
 
+// A reset that is actually *issued* is the whole of a query string
+// (`client.query('DISCARD ALL')`) or the whole of a line in a .sql file. Prose
+// that merely mentions it — `"...ask ops whether RESET ALL is configured."` —
+// is not, and neither is a comment saying the pooler does NOT issue it.
+const RESET_ALL = /^\s*(discard\s+all|reset\s+all)\s*;?\s*$/i;
+const resetGucRe = (guc) => new RegExp(`^\\s*reset\\s+${guc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*;?\\s*$`, 'i');
+
 /**
- * Does this source reset connection state on release?
+ * Where this file issues `DISCARD ALL` / `RESET ALL` / `RESET <guc>`.
  *
- * `DISCARD ALL` / `RESET ALL` on checkin is the other correct fix, and a
- * codebase that does it has closed the hole a different way. Detected so the
- * finding can be downgraded rather than argued with.
+ * `DISCARD ALL` on checkin is the other correct fix, and a codebase that does it
+ * has closed the hole a different way — so this downgrades the only build-failing
+ * verdict in the guard, and therefore has to be evidence, not a substring.
+ *
+ * Measured before this was tightened: a single file whose entire content was the
+ * comment `// TODO(infra): our pgbouncer config does not currently issue DISCARD
+ * ALL on release.` flipped a proven session-scoped tenant-GUC leak from
+ * `ok:false, 1 violation` to `ok:true, 0 violations`. A comment stating the
+ * opposite of what it was read as suppressed the finding.
+ *
+ * Returns the sites, not a boolean, so the note can name file:line and the
+ * maintainer can check whether the reset really runs on connection release —
+ * which is the part no scanner can decide.
  */
-export function resetsConnectionState(text, guc) {
-  if (/\b(discard\s+all|reset\s+all)\b/i.test(text)) return true;
-  if (!guc) return false;
-  const escaped = guc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`\\breset\\s+${escaped}\\b`, 'i').test(text);
+export function findConnectionResets(text, gucs, ext) {
+  const src = String(text ?? '');
+  const { masked, strings } = tokenize(src, ext);
+  const found = [];
+  const pairs = (gucs ?? []).map((g) => [g, resetGucRe(g)]);
+  const push = (guc, index, statement) => found.push({ guc, line: lineOf(src, index), statement: statement.trim().slice(0, 120) });
+
+  let offset = 0;
+  for (const rawLine of masked.split('\n')) {
+    if (RESET_ALL.test(rawLine)) push('*', offset, rawLine);
+    else for (const [g, re] of pairs) if (re.test(rawLine)) push(g, offset, rawLine);
+    offset += rawLine.length + 1;
+  }
+  for (const s of strings) {
+    if (RESET_ALL.test(s.content)) push('*', s.start, s.content);
+    else for (const [g, re] of pairs) if (re.test(s.content)) push(g, s.start, s.content);
+  }
+  return found;
+}
+
+/** Boolean form of `findConnectionResets`, kept for callers that only ask yes/no. */
+export function resetsConnectionState(text, guc, ext) {
+  return findConnectionResets(text, guc ? [guc] : [], ext).length > 0;
 }
 
 /**
@@ -218,22 +565,26 @@ export function resetsConnectionState(text, guc) {
  * other outcome is a note, because it turns on something not observed here.
  */
 export function classifyGuc({ guc, policies = [], sets = [], resets = false, scannedFiles = 0 }) {
-  const where = policies.map((p) => `${p.id} (policy "${p.policy}")`);
+  const where = policies.map((p) => `${p.id} (policy "${p.policy}"${p.via ? `, via ${p.via}` : ''})`);
   const used = policies.length === 1 ? where[0] : `${policies.length} policies, incl. ${where[0]}`;
 
   const session = sets.filter((s) => s.scope === 'session');
   const unknown = sets.filter((s) => s.scope === 'unknown');
   const local = sets.filter((s) => s.scope === 'local');
 
+  // `resets` is a list of sites; `true` is still accepted from older callers.
+  const resetSites = Array.isArray(resets) ? resets : resets ? [{}] : [];
+
   if (session.length > 0) {
     const at = session.map((s) => `${s.file}:${s.line}`).join(', ');
-    if (resets) {
+    if (resetSites.length > 0) {
+      const resetAt = resetSites.filter((r) => r.file).map((r) => `${r.file}:${r.line} (${r.statement})`).join(', ');
       return {
         status: 'note',
         message:
           `"${guc}" authorizes ${used} and is set for the whole CONNECTION at ${at}, ` +
-          `but this codebase also issues DISCARD ALL / RESET — which closes the hole if it runs on every ` +
-          `connection release. Confirm that it does; the scope of the write itself is still wrong.`,
+          `but this codebase also issues DISCARD ALL / RESET${resetAt ? ` at ${resetAt}` : ''} — which closes the hole ` +
+          `only if it runs on every connection release. Confirm that it does; the scope of the write itself is still wrong.`,
       };
     }
     return {
@@ -243,11 +594,23 @@ export function classifyGuc({ guc, policies = [], sets = [], resets = false, sca
         `"${guc}" authorizes ${used}, and is set for the whole CONNECTION (not the transaction) at ${at}. ` +
         `On a pooled connection the next request inherits the previous request's tenant and reads their rows ` +
         `— the policy works exactly as designed. Every single-request test passes; the leak lives between requests.`,
+      // Both forms are transaction-scoped, and neither works outside an explicit
+      // transaction. Measured on the flagged shape: with `set_config('app.tenant',
+      // 'A', false)` as a standalone statement the next query returned 1 row;
+      // changing only the third argument to true returned 0 rows and
+      // current_setting was "" — the identity was gone before the query ran. The
+      // same statement inside BEGIN returned the row. The one-character change is
+      // the one a reader will copy, so the caveat has to govern it too.
       fix:
-        `Make the write transaction-scoped: set_config('${guc}', $1, true)  — the third argument is is_local — ` +
-        `or SET LOCAL ${guc} = $1 inside the request's transaction.\n` +
-        `      SET LOCAL only takes effect inside a transaction, so the request must open one.\n` +
-        `      Alternatively issue DISCARD ALL when the connection returns to the pool.\n` +
+        `Make the write transaction-scoped AND run it in the request's transaction:\n` +
+        `        BEGIN;  select set_config('${guc}', $1, true);  -- …the request's queries…  COMMIT;\n` +
+        `      or SET LOCAL ${guc} = $1 in that same transaction.\n` +
+        `      The third argument to set_config is is_local, and true means "this transaction", exactly as ` +
+        `SET LOCAL does — so flipping false to true WITHOUT opening a transaction leaves "${guc}" unset by the ` +
+        `time the next statement runs and your policies then match nothing. The implicit transaction ends at the semicolon.\n` +
+        `      Alternatively issue DISCARD ALL when the connection returns to the pool. tenant-guard recognises that ` +
+        `only when the statement is the whole of a query string (client.query('DISCARD ALL')) or a whole line in a .sql ` +
+        `file; if yours is issued some other way it will not have been seen here.\n` +
         `      If "${guc}" is session-scoped on purpose, add it to poolerBleed.allowlist[] with a reason.`,
     };
   }
@@ -322,11 +685,27 @@ export function collectSourceFiles(cwd, cfg) {
   return [...new Set(files)];
 }
 
-/** Scan the tree for writes to any of `gucs`. */
+/** The extension of a path, lowercased, or '' when it has none. */
+const extOf = (p) => {
+  const dot = p.lastIndexOf('.');
+  const slash = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
+  return dot > slash ? p.slice(dot).toLowerCase() : '';
+};
+
+/**
+ * Scan the tree for writes to any of `gucs`, and for resets that undo them.
+ *
+ * `resets` is a Map keyed by GUC with `'*'` for `DISCARD ALL` / `RESET ALL`,
+ * carrying the sites. It used to be one boolean ORed across every file, which
+ * meant any file mentioning the words anywhere silenced the finding for every
+ * GUC. `RESET <guc>` also only closes the hole for that one GUC, which the
+ * single boolean could not express — and the parameter that would have carried
+ * it was never passed at the only production call site.
+ */
 export function scanSources(cwd, gucs, cfg) {
   const files = collectSourceFiles(cwd, cfg);
   const sets = [];
-  let resets = false;
+  const resets = new Map();
   let scanned = 0;
 
   for (const abs of files) {
@@ -339,8 +718,12 @@ export function scanSources(cwd, gucs, cfg) {
     }
     scanned++;
     const rel = relative(cwd, abs).replace(/\\/g, '/');
-    for (const hit of scanText(text, gucs)) sets.push({ ...hit, file: rel });
-    if (!resets && resetsConnectionState(text)) resets = true;
+    const ext = extOf(abs);
+    for (const hit of scanText(text, gucs, ext)) sets.push({ ...hit, file: rel });
+    for (const r of findConnectionResets(text, gucs, ext)) {
+      if (!resets.has(r.guc)) resets.set(r.guc, []);
+      resets.get(r.guc).push({ file: rel, line: r.line, statement: r.statement });
+    }
   }
   return { sets, resets, scannedFiles: scanned };
 }
@@ -389,15 +772,44 @@ export async function check({ query, config = {}, cwd = process.cwd() }) {
   const notes = [];
 
   const spec = policyGucsSql(cfg.schemas);
-  const byGuc = gucsFromPolicies(await q(spec.text, spec.values));
+  const policyRows = await q(spec.text, spec.values);
+  const byGuc = gucsFromPolicies(policyRows);
+
+  // A policy that reads its GUC through a helper — `org = current_tenant()` —
+  // shows nothing in the deparsed qual, so the deparsed expression alone is not
+  // evidence of absence. Follow the policy→function edges before deciding.
+  const viaFns = await resolveGucsThroughFunctions(q, cfg, byGuc);
+  if (viaFns.error) {
+    notes.push({
+      where: '(functions)',
+      message:
+        `policies that read their GUC through a helper function could not be resolved (${viaFns.error}), ` +
+        `so only the deparsed policy expressions were checked.`,
+    });
+  }
+  if (viaFns.unreadable.length > 0) {
+    notes.push({
+      where: '(functions)',
+      message:
+        `${viaFns.unreadable.length} function(s) called by a policy have no readable body — ` +
+        `${viaFns.unreadable.join(', ')}. Whether they read a custom GUC was not determined.`,
+    });
+  }
 
   if (byGuc.size === 0) {
     // The common Supabase case: policies read auth.uid()/auth.jwt(), which
     // PostgREST sets per transaction from a verified token. Nothing to bleed.
+    // Stated as what was measured, not as proof of absence: dynamic SQL inside a
+    // plpgsql body, or a body this connection cannot read, would not show here.
+    const unread = viaFns.unreadable.length ? `; ${viaFns.unreadable.length} function body(ies) could not be read (${viaFns.unreadable.join(', ')})` : '';
+    const failed = viaFns.error ? `; the helper-function walk failed (${viaFns.error})` : '';
     return OK({
       skipped: true,
-      reason: 'no policy authorizes from a custom GUC — nothing that can outlive a request',
+      reason:
+        `no policy authorizes from a custom GUC — checked ${policyRows?.length ?? 0} policy expression(s) and ` +
+        `${viaFns.resolved} body(ies) of the functions they call for a current_setting() literal${unread}${failed}`,
       summary: 'skipped — no custom-GUC policies',
+      notes,
     });
   }
 
@@ -410,7 +822,8 @@ export async function check({ query, config = {}, cwd = process.cwd() }) {
       guc,
       policies: byGuc.get(guc),
       sets: sets.filter((s) => s.guc === guc),
-      resets,
+      // DISCARD ALL / RESET ALL closes it for every GUC; RESET <guc> for one.
+      resets: [...(resets.get('*') ?? []), ...(resets.get(guc) ?? [])],
       scannedFiles,
     });
     if (verdict.status === 'leak') {

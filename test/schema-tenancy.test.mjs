@@ -86,7 +86,11 @@ test('classify: reaching two or more tenant schemas -> leak', () => {
   assert.equal(v.status, 'leak');
   assert.match(v.message, /GRANTs are the entire boundary/);
   assert.match(v.message, /proven by reading from/);
-  assert.match(v.fix, /REVOKE ALL ON SCHEMA tenant_b/);
+  // The revoke has to name the grantees that HOLD the access. It used to say
+  // `REVOKE ALL ON SCHEMA tenant_b FROM tenant_a_app` — the role the fix creates
+  // one line earlier, which holds nothing, so it was inert in every case.
+  // See test/schema-tenancy-audit.test.mjs for the measured proof.
+  assert.match(v.fix, /REVOKE ALL ON SCHEMA tenant_a, tenant_b FROM PUBLIC, "app_user";/);
 });
 
 test('classify: reaching exactly one -> isolated (the correct per-tenant-role setup)', () => {

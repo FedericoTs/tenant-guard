@@ -16,16 +16,32 @@
  * logged-in user calls `get_invoices('<someone else>')` and gets their data,
  * because PostgREST exposes every such function at `/rest/v1/rpc/<name>`.
  *
- * **Why this is safe to probe, which is the part that kept it unbuilt.** Calling
- * an arbitrary definer function is genuinely dangerous: the body is unknown, and
+ * **What calling a definer function costs, stated accurately.** Calling an
+ * arbitrary definer function is genuinely dangerous: the body is unknown, and
  * side effects (an autonomous commit through dblink, a NOTIFY, a consumed
  * sequence) survive the rollback that makes every other guard here harmless. The
- * resolution is in the catalog: Postgres **enforces** that a non-`VOLATILE`
- * function cannot write — attempting an INSERT inside a `STABLE` function raises
- * *"INSERT is not allowed in a non-volatile function"*. So:
+ * volatility declaration narrows that, and this file used to claim it closed it.
+ * It does not. Two things are true and were measured on PG 18.3:
  *
- *   • `STABLE` / `IMMUTABLE` definer functions are **called** — the engine
- *     guarantees they cannot modify anything;
+ *   • Postgres does refuse a direct write inside a non-`VOLATILE` function —
+ *     an INSERT in a `STABLE` body raises *"INSERT is not allowed in a
+ *     non-volatile function"*, and a table write reached that way is undone by
+ *     the rollback (audit_log stayed at 0 rows).
+ *   • The flag is per-function and is **not** inherited. `provolatile` is an
+ *     author declaration Postgres never verifies against the body. A `STABLE`
+ *     function whose body calls a `VOLATILE` helper executes that helper's
+ *     INSERT, and a `STABLE` body may call `nextval` directly. Running this
+ *     guard's own `check()` over `select * from invoices where
+ *     nextval('setof_seq') > 0` left the sequence at {last_value: 3,
+ *     is_called: true} after the rollback, up from {1, false}. The same
+ *     mechanism reaches `dblink_exec`.
+ *
+ * So the rule is a risk budget, not a guarantee:
+ *
+ *   • `STABLE` / `IMMUTABLE` definer functions are **called**. The rollback
+ *     contains table writes. It does not contain sequence consumption, NOTIFY,
+ *     or anything a called `VOLATILE` helper commits out of band. Point this at a
+ *     disposable database — README and docs/CI.md say so for the same reason.
  *   • `VOLATILE` definer functions are **never called**. They are reported from a
  *     read of their body, as a note, with that limitation stated — because an
  *     unprovable finding presented as proven is worse than no finding.
@@ -100,7 +116,8 @@ export function sentinelFor(argType) {
  * Every SECURITY DEFINER function in `schemas`, with what we need to decide
  * whether it is safe to call and whether the caller can even reach it.
  * `provolatile` is the load-bearing column: 'v' = volatile (never called),
- * 's'/'i' = stable/immutable, which Postgres guarantees cannot write.
+ * 's'/'i' = stable/immutable, which Postgres refuses to let write DIRECTLY. It is
+ * an author declaration, not a verified property — see the header.
  */
 export function definerRpcSql(schemas, role) {
   const text = `
@@ -124,11 +141,16 @@ export function definerRpcSql(schemas, role) {
   return { text, values: [schemas, role] };
 }
 
-/** Postgres guarantees a non-volatile function cannot modify the database. */
 /**
  * Does the app role hold CREATE on any schema? That is the precondition for
- * exploiting an unpinned `search_path` — you can only shadow an object if you can
- * create one. Without it, an unpinned search_path is untidy rather than dangerous.
+ * planting a **permanent** shadow on an unpinned `search_path`.
+ *
+ * It is NOT the precondition for the hijack in general, and this used to be
+ * written as if it were. `pg_temp` is searched before everything else and `TEMP`
+ * on the database is granted to `PUBLIC` by default, so the shadow can be a temp
+ * table with no CREATE grant anywhere — measured, see `tempCreateSql` and the
+ * note branch in `check`. This query answers one question only: where could they
+ * plant something that outlives the session.
  */
 export function schemaCreateSql(role) {
   return {
@@ -138,6 +160,235 @@ export function schemaCreateSql(role) {
               and pg_catalog.has_schema_privilege($1::text, n.oid, 'CREATE')`,
     values: [role],
   };
+}
+
+/**
+ * Can the role create temp objects? `TEMP` on the database is granted to `PUBLIC`
+ * by default in every Postgres version, so this is almost always true — which is
+ * exactly why the "cannot CREATE anywhere, therefore safe" claim this replaces
+ * was wrong. Measured on PG 18.3 with `CREATE` revoked on every schema and
+ * `has_schema_privilege(...,'CREATE')` returning the empty set: `create temp
+ * table invoices(...)` still made an unpinned definer function read the planted
+ * table instead of the owner's.
+ */
+export function tempCreateSql(role) {
+  return {
+    text: `select pg_catalog.has_database_privilege($1::text, current_database(), 'TEMP') as temp`,
+    values: [role],
+  };
+}
+
+/** Every relation in the scanned schemas — what an unqualified name could mean. */
+export function relationsSql(schemas) {
+  return {
+    text: `select n.nspname as schema, c.relname as name
+             from pg_catalog.pg_class c
+             join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+            where c.relkind in ('r','p','v','m','f')
+              and n.nspname = any($1)`,
+    values: [schemas],
+  };
+}
+
+/**
+ * Unqualified references in the body to relations that really exist.
+ *
+ * This exists to make the emitted `ALTER FUNCTION … SET search_path` **runnable**.
+ * The fix used to interpolate `fn.schema` — where the FUNCTION lives, which is
+ * not where its tables live. Measured: a definer function in `public` whose body
+ * reads an unqualified `invoices` that lives in `app` worked before the guard's
+ * own fix and raised `42P01 relation "invoices" does not exist` after it. Pasting
+ * that ALTER into production takes the function down.
+ *
+ * Only names that match a real relation are returned, so this is a resolution and
+ * not a guess. CTE names are dropped — they resolve inside the query, never
+ * through `search_path` — and a name already carrying a schema prefix is skipped.
+ * Quoted identifiers are not matched: a miss here costs a less specific fix, a
+ * wrong hit costs a broken ALTER.
+ *
+ * @returns {Array<{name:string, schemas:string[]}>}
+ */
+export function unqualifiedRelationRefs(body, relations = []) {
+  const s = String(body || '');
+  if (!s || !relations.length) return [];
+
+  const ctes = new Set();
+  for (const m of s.matchAll(/\bwith\s+(?:recursive\s+)?([A-Za-z_][A-Za-z0-9_$]*)\s+as\b/gi)) ctes.add(m[1].toLowerCase());
+  for (const m of s.matchAll(/,\s*([A-Za-z_][A-Za-z0-9_$]*)\s+as\s*\(/gi)) ctes.add(m[1].toLowerCase());
+
+  const byName = new Map();
+  for (const r of relations) {
+    const k = String(r.name ?? '').toLowerCase();
+    if (!k) continue;
+    if (!byName.has(k)) byName.set(k, []);
+    if (!byName.get(k).includes(r.schema)) byName.get(k).push(r.schema);
+  }
+
+  const out = [];
+  const seen = new Set();
+  for (const m of s.matchAll(/\b(?:from|join|into|update|table)\s+(?:only\s+)?([A-Za-z_][A-Za-z0-9_$]*)/gi)) {
+    if (s[m.index + m[0].length] === '.') continue; // schema-qualified: resolves without the path
+    const name = m[1].toLowerCase();
+    if (ctes.has(name) || seen.has(name) || !byName.has(name)) continue;
+    seen.add(name);
+    out.push({ name: m[1], schemas: byName.get(name) });
+  }
+  return out;
+}
+
+/**
+ * The declared parameters of a function, name **and** type.
+ *
+ * The type is load-bearing for the `format()` check below: `%s` does no escaping,
+ * but an `integer` or `uuid` argument cannot carry SQL through it no matter what
+ * the caller sends — the value is rendered by the type's output function, and
+ * `'1; drop table x'::int` never reaches `format()` at all. Flagging those was
+ * the false positive fixed here.
+ *
+ * `parameterNames` decides which tokens are names (it already knows `character
+ * varying` is a type, not a name); this only adds the type text beside them.
+ */
+export function parameterSignature(args) {
+  const named = new Set(parameterNames(args));
+  const out = [];
+  for (const raw of String(args || '').split(',')) {
+    let toks = raw.trim().split(/\s+/).filter(Boolean);
+    if (toks.length && /^(in|out|inout|variadic)$/i.test(toks[0])) toks = toks.slice(1);
+    if (toks.length < 2 || !named.has(toks[0])) continue;
+    out.push({ name: toks[0], type: toks.slice(1).join(' ').toLowerCase() });
+  }
+  return out;
+}
+
+/**
+ * Types whose output representation cannot carry SQL. Measured the boring way:
+ * every one of these is produced by a fixed output function over a value that had
+ * to parse as that type first, so `format('%s', v)` yields digits, a canonical
+ * uuid, or an ISO timestamp — nothing that can close a literal or start a new
+ * statement. Anything NOT on this list (text, varchar, json, an array, a domain,
+ * a type we couldn't parse) is treated as able to carry SQL, so an unknown type
+ * still gets flagged rather than waved through.
+ */
+const SQL_INERT_TYPES = new Set([
+  'smallint', 'integer', 'int', 'int2', 'int4', 'int8', 'bigint',
+  'numeric', 'decimal', 'real', 'double precision', 'float', 'float4', 'float8', 'money',
+  'boolean', 'bool', 'uuid', 'oid', 'date',
+  'timestamp', 'timestamptz', 'timestamp without time zone', 'timestamp with time zone',
+  'time', 'time without time zone', 'time with time zone', 'interval',
+]);
+
+export function canCarrySql(type) {
+  if (!type) return true; // unknown => assume the worst
+  const t = String(type).toLowerCase().replace(/\(.*$/, '').replace(/\s+/g, ' ').trim();
+  if (t.endsWith('[]')) return true;
+  return !SQL_INERT_TYPES.has(t);
+}
+
+/**
+ * Split the top-level arguments of a call whose `(` sits at `open`.
+ *
+ * Needed because the specifier→argument mapping below has to be positional, and
+ * naive comma-splitting mis-aligns on the first nested call: `format('… %L … %s',
+ * coalesce(p_o, 'x'), 50)` splits into three pieces, so the `%s` lines up with
+ * `'x'` instead of `50`. Tracks single-quoted literals (with `''` escapes),
+ * double-quoted identifiers, dollar-quoted bodies (`$tag$…$tag$`, never `$1`),
+ * and paren depth.
+ *
+ * @returns {{args:string[], end:number}|null} null when the text cannot be read.
+ */
+export function splitCallArgs(s, open) {
+  if (s[open] !== '(') return null;
+  const args = [];
+  let depth = 0;
+  let start = open + 1;
+  let i = open;
+  while (i < s.length) {
+    const c = s[i];
+    if (c === "'" || c === '"') {
+      const q = c;
+      i++;
+      for (;;) {
+        if (i >= s.length) return null; // unterminated literal: unreadable
+        if (s[i] === q) { if (s[i + 1] === q) { i += 2; continue; } i++; break; }
+        i++;
+      }
+      continue;
+    }
+    if (c === '$') {
+      const tag = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(s.slice(i));
+      if (tag) {
+        const close = s.indexOf(tag[0], i + tag[0].length);
+        if (close < 0) return null;
+        i = close + tag[0].length;
+        continue;
+      }
+      i++; // `$1` and friends are ordinary text
+      continue;
+    }
+    if (c === '(') { depth++; i++; continue; }
+    if (c === ')') {
+      depth--;
+      if (depth === 0) { args.push(s.slice(start, i)); return { args, end: i }; }
+      i++;
+      continue;
+    }
+    if (c === ',' && depth === 1) { args.push(s.slice(start, i)); start = i + 1; i++; continue; }
+    i++;
+  }
+  return null; // ran off the end without closing
+}
+
+/**
+ * Which specifier consumes each `format()` argument.
+ *
+ * `%s` at position 3 says nothing about the parameter at position 1 — that was
+ * the bug: `format('… = %L limit %s', p_owner, 50)` was reported as injection
+ * through `p_owner`, which is bound by `%L` and cannot be injected. Measured on
+ * exactly that function: three payloads (`' or true --`, `%' or true --`,
+ * `x%' union select …`) each returned zero rows, and the guard reported it as the
+ * sole violation on the build.
+ *
+ * Postgres also supports explicit `%n$s` ordering, which defeats plain counting,
+ * so positions are read rather than assumed. Anything unexpected (`%*s`, whose
+ * width comes from an argument, or a position past the end of the list) returns
+ * null: unreadable, which the caller reports as a note, never as a failure.
+ *
+ * @returns {Map<number, Set<'s'|'I'|'L'>>|null} 1-based argument position -> specifiers
+ */
+export function formatSpecifierMap(fmt, argCount) {
+  const map = new Map();
+  let next = 1;
+  for (let i = 0; i < fmt.length; i++) {
+    if (fmt[i] !== '%') continue;
+    const m = /^%(?:(\d+)\$)?(-?)(\d*)([sIL%])/.exec(fmt.slice(i));
+    if (!m) return null; // %*s, a stray %, or a type we don't model
+    i += m[0].length - 1;
+    if (m[4] === '%') continue; // a literal percent consumes no argument
+    // An explicit position does NOT advance the sequential counter (Postgres docs).
+    const pos = m[1] ? Number(m[1]) : next++;
+    if (pos < 1 || pos > argCount) return null; // list doesn't line up
+    if (!map.has(pos)) map.set(pos, new Set());
+    map.get(pos).add(m[4]);
+  }
+  return map;
+}
+
+/** Every `format(<literal>, …)` call in a statement, arguments split out. */
+function formatCalls(stmt) {
+  const out = [];
+  const re = /\bformat\s*\(/gi;
+  let m;
+  while ((m = re.exec(stmt))) {
+    const open = m.index + m[0].length - 1;
+    const split = splitCallArgs(stmt, open);
+    if (!split || split.args.length === 0) { out.push({ readable: false }); continue; }
+    const lit = /^'((?:[^']|'')*)'$/.exec(split.args[0].trim());
+    // A non-literal format string (a variable holding the SQL) is not this
+    // check's business — it falls through to the concatenation check, as before.
+    if (lit) out.push({ readable: true, fmt: lit[1].replace(/''/g, "'"), args: split.args.slice(1) });
+    re.lastIndex = split.end + 1;
+  }
+  return out;
 }
 
 /**
@@ -152,32 +403,57 @@ export function schemaCreateSql(role) {
  *
  * Deliberately narrow, so a finding is never a guess. Two unambiguous shapes:
  *   • the parameter is `||`-concatenated into the string given to `EXECUTE`;
- *   • it is passed to `format()` through **`%s`**, which does no escaping at all.
+ *   • it is the argument that `format()`'s **`%s`** consumes — positionally, not
+ *     "there is a `%s` somewhere" — and its type can carry SQL.
  * `quote_literal()`, `quote_ident()`, `format('%L'/'%I')` and `EXECUTE … USING`
- * are all correct and produce no finding. Anything this can't read confidently
- * produces no finding either — silence beats a guess.
+ * are all correct and produce no finding. Where the mapping cannot be read the
+ * result is `format-unproven`, which the caller reports as a note: a skip is not
+ * a pass, but it is not a build failure either.
  *
- * @returns {{param:string, via:'concat'|'format-%s', snippet:string}|null}
+ * `params` accepts plain names (type unknown => assumed able to carry SQL) or
+ * `{name, type}` from `parameterSignature`.
+ *
+ * @returns {{param:string, via:'concat'|'format-%s'|'format-unproven', snippet:string}|null}
  */
 export function dynamicSqlInjection(body, params = []) {
   const s = String(body || '');
-  if (!/\bexecute\b/i.test(s) || params.length === 0) return null;
+  const ps = params.map((p) => (typeof p === 'string' ? { name: p, type: null } : p)).filter((p) => p && p.name);
+  if (!/\bexecute\b/i.test(s) || ps.length === 0) return null;
   // Each EXECUTE's SQL expression: everything up to USING / end of statement.
   const stmts = [...s.matchAll(/\bexecute\b([\s\S]*?)(?:\busing\b|;|$)/gi)].map((m) => m[1]);
   for (const stmt of stmts) {
-    for (const p of params) {
-      if (!new RegExp(`\\b${p}\\b`).test(stmt)) continue;
+    const calls = formatCalls(stmt);
+    const snippet = stmt.trim().slice(0, 140);
+    for (const p of ps) {
+      const mentions = new RegExp(`\\b${p.name}\\b`);
+      if (!mentions.test(stmt)) continue;
       // Correctly quoted => not a finding.
-      if (new RegExp(`(quote_literal|quote_ident)\\s*\\(\\s*${p}\\b`, 'i').test(stmt)) continue;
-      const fmt = stmt.match(/\bformat\s*\(\s*'((?:[^']|'')*)'/i);
-      if (fmt) {
-        // format() is only unsafe through %s; %L and %I escape properly.
-        if (/%s/.test(fmt[1])) return { param: p, via: 'format-%s', snippet: stmt.trim().slice(0, 140) };
-        continue;
+      if (new RegExp(`(quote_literal|quote_ident)\\s*\\(\\s*${p.name}\\b`, 'i').test(stmt)) continue;
+      if (calls.length) {
+        let verdict = 'absent';
+        for (const call of calls) {
+          if (!call.readable) { verdict = 'unproven'; continue; }
+          const map = formatSpecifierMap(call.fmt, call.args.length);
+          const inCall = call.args.some((a) => mentions.test(a));
+          if (!inCall) continue;
+          if (!map) { verdict = 'unproven'; continue; }
+          const via = call.args.map((a, idx) => (mentions.test(a) ? map.get(idx + 1) : null));
+          const hitS = via.some((set) => set && set.has('s'));
+          const unmapped = via.some((set, idx) => mentions.test(call.args[idx]) && !set);
+          if (hitS) { verdict = 'unsafe'; break; }
+          if (unmapped) verdict = 'unproven';
+          else if (verdict !== 'unproven') verdict = 'bound';
+        }
+        // `%s` on a type that cannot carry SQL (an int limit, a uuid) is not an
+        // injection: the value is rendered by the type's output function.
+        if (verdict === 'unsafe' && !canCarrySql(p.type)) continue;
+        if (verdict === 'unsafe') return { param: p.name, via: 'format-%s', snippet };
+        if (verdict === 'unproven') return { param: p.name, via: 'format-unproven', snippet };
+        continue; // bound through %L/%I, or not passed to this format() at all
       }
       // Bare concatenation of the parameter into the SQL string.
-      if (new RegExp(`\\|\\|[^;]*\\b${p}\\b|\\b${p}\\b[^;]*\\|\\|`).test(stmt)) {
-        return { param: p, via: 'concat', snippet: stmt.trim().slice(0, 140) };
+      if (new RegExp(`\\|\\|[^;]*\\b${p.name}\\b|\\b${p.name}\\b[^;]*\\|\\|`).test(stmt)) {
+        return { param: p.name, via: 'concat', snippet };
       }
     }
   }
@@ -281,9 +557,20 @@ export function shadowableSchemas(config, writableSchemas = [], ownSchema = null
  *     SET search_path = ''  (unqualified body)       -> the function BREAKS
  *     SET search_path = ''  (qualified body)         -> legit
  *
- * So naming `pg_temp` last is the fix that is safe to apply without also editing
- * the body — and `search_path = ''` is NOT, which is worth knowing before
- * repeating the advice that is usually given for this.
+ * That measurement was taken with the function and its table in the SAME schema,
+ * and the conclusion drawn from it ("naming pg_temp last is the fix that is safe
+ * to apply without also editing the body") only holds there. A pin replaces the
+ * whole path, so it must name **every schema the body resolves unqualified names
+ * in**, not just the schema the function lives in. Measured: a definer function
+ * in `public` reading an unqualified `invoices` that lives in `app` worked
+ * unpinned and raised `42P01 relation "invoices" does not exist` once pinned to
+ * `pg_catalog, public, pg_temp` — which is what this guard used to emit.
+ * `unqualifiedRelationRefs` is what stops it emitting that now.
+ *
+ * So: `pg_temp` last is necessary and does not by itself break a body whose
+ * objects are all named in the pin; `search_path = ''` breaks any unqualified
+ * body outright; and either way the function has to be run once afterwards,
+ * because a pin that omits a schema fails at call time, not at ALTER time.
  */
 export function temporarilyShadowable(config) {
   const schemas = searchPathSchemas(config);
@@ -291,6 +578,11 @@ export function temporarilyShadowable(config) {
   return !schemas.some((x) => x.toLowerCase() === 'pg_temp');
 }
 
+/**
+ * What we are willing to CALL — not what is guaranteed harmless. Postgres blocks
+ * a direct write in a non-volatile body; it does not block that body from calling
+ * a VOLATILE helper that writes, or from consuming a sequence. See the header.
+ */
 export function isReadOnlyVolatility(volatility) {
   return volatility === 's' || volatility === 'i';
 }
@@ -432,14 +724,38 @@ export async function check({ query, config = {} }) {
   let scanned = 0;
   let proven = 0;
 
-  // Precondition for the search_path hijack: you can only shadow an object if
-  // you can create one. Without CREATE anywhere, an unpinned path is untidy, not
-  // dangerous — and saying so is the difference between a finding and noise.
+  // Where could the role plant a PERMANENT shadow on an unpinned search_path.
+  // Not the precondition for the hijack as such — pg_temp needs no CREATE at all
+  // (see tempGranted below) — but it is the precondition for the shape that
+  // outlives the session, and it is what the failing branch is built on.
   let writableSchemas = [];
   try {
     const sc = schemaCreateSql(role);
     writableSchemas = (await q(sc.text, sc.values)).map((r) => r.schema);
   } catch { /* optional */ }
+
+  // TEMP on the database, granted to PUBLIC by default. Measured with CREATE
+  // revoked on every schema: `create temp table invoices(...)` still hijacked an
+  // unpinned definer function. This is why the note below no longer says
+  // "not exploitable".
+  // null = the probe itself failed. Kept distinct from false so the note can say
+  // "could not read this" instead of "there is nowhere to plant one".
+  let tempGranted = null;
+  try {
+    const tc = tempCreateSql(role);
+    const row = (await q(tc.text, tc.values))[0];
+    tempGranted = row?.temp === true || row?.temp === 't';
+  } catch { /* stays null */ }
+
+  // Every relation in the scanned schemas, so the emitted ALTER can name the
+  // schema the BODY resolves against rather than the one the function lives in.
+  let relations = [];
+  let relationsRead = false;
+  try {
+    const rs = relationsSql(cfg.schemas);
+    relations = await q(rs.text, rs.values);
+    relationsRead = true;
+  } catch { /* the fix text falls back to fn.schema and says so */ }
 
   await query('begin', []);
   try {
@@ -484,13 +800,26 @@ export async function check({ query, config = {} }) {
       // VOLATILE functions too — which matters, because plpgsql defaults to
       // VOLATILE and that is exactly where dynamic SQL lives.
       if (canExecute) {
-        const inj = dynamicSqlInjection(fn.body, parameterNames(fn.args));
-        if (inj) {
+        const inj = dynamicSqlInjection(fn.body, parameterSignature(fn.args));
+        if (inj && inj.via === 'format-unproven') {
+          // The parameter reaches a format() whose specifier-to-argument mapping
+          // could not be read (a `%*s` width, a truncated literal, an argument
+          // list that does not line up). Not proven safe, not proven unsafe — and
+          // naming a specific parameter as injectable when it may be bound by %L
+          // is the false accusation this branch exists to avoid.
+          notes.push({
+            where: fqn,
+            message:
+              `SECURITY DEFINER function building dynamic SQL with format(), and "${inj.param}" is one of the arguments. ` +
+              `NOT PROVEN either way: tenant-guard could not map format()'s specifiers onto its arguments here, so it cannot tell whether "${inj.param}" is escaped by %L/%I or interpolated raw by %s. ` +
+              `Injected SQL in a definer function runs as the OWNER and bypasses RLS, so check this one by hand. Near: ${inj.snippet}`,
+          });
+        } else if (inj) {
           violations.push({
             where: fqn,
             kind: 'sql-injection',
             message:
-              `SQL INJECTION in a SECURITY DEFINER function: the "${inj.param}" argument is ${inj.via === 'concat' ? 'concatenated straight into' : 'passed through format() with %s into'} the SQL given to EXECUTE, and "${role}" may call it. ` +
+              `SQL INJECTION in a SECURITY DEFINER function: the "${inj.param}" argument is ${inj.via === 'concat' ? 'concatenated straight into' : 'the argument format() interpolates with %s into'} the SQL given to EXECUTE, and "${role}" may call it. ` +
               `Injected SQL runs as the function's OWNER, so it bypasses RLS entirely — a caller can append "or true --" and read every tenant's rows however correct the table's policies are. ` +
               `Near: ${inj.snippet}`,
             fix:
@@ -505,15 +834,33 @@ export async function check({ query, config = {} }) {
         // table; `= app, public` returned the real one.
         const shadowable = pinned ? shadowableSchemas(fn.config, writableSchemas, fn.schema) : [];
         const tempOpen = pinned && shadowable.length === 0 && temporarilyShadowable(fn.config);
+
+        // Where the body's unqualified names actually resolve. The emitted ALTER
+        // used to name fn.schema — where the FUNCTION lives — and a body reading
+        // an unqualified table in another schema broke with 42P01 the moment the
+        // fix was applied. fn.schema is kept in the path too (after the body's
+        // schemas) so an unqualified call to a sibling helper still resolves.
+        const unqualified = unqualifiedRelationRefs(fn.body, relations);
+        const derivedPin = [];
+        for (const r of unqualified) for (const sch of r.schemas) if (!derivedPin.includes(sch)) derivedPin.push(sch);
+        if (!derivedPin.includes(fn.schema)) derivedPin.push(fn.schema);
+        // A pin that is only missing pg_temp keeps its own schema list — that
+        // list already resolves, and reordering it would be a second change the
+        // user did not ask for. A pin that reaches a writable schema first, and
+        // an absent pin, get the derived one.
+        const existingPin = searchPathSchemas(fn.config).filter((s) => !/^(pg_catalog|pg_temp)$/i.test(s));
+        const pinSchemas = tempOpen && existingPin.length ? existingPin : derivedPin;
+        const pinPath = ['pg_catalog', ...pinSchemas, 'pg_temp'].join(', ');
+        const writableInPin = pinSchemas.filter((s) => writableSchemas.includes(s));
+
         if ((!pinned && writableSchemas.length > 0) || shadowable.length > 0 || tempOpen) {
-          const reachable = pinned ? shadowable : writableSchemas;
           violations.push({
             where: fqn,
             kind: 'search-path',
             message: tempOpen
               ? `SECURITY DEFINER function whose search_path is pinned, but does not name pg_temp — so the pin is incomplete. ` +
                 `Postgres searches pg_temp BEFORE every schema you list unless you name it, and TEMP on the database is granted to PUBLIC by default, so any role that can open a session can create a temp table and shadow an unqualified name inside this function. It needs no CREATE privilege anywhere. ` +
-                `Measured with CREATE ON SCHEMA public revoked: pinned "pg_catalog, ${fn.schema}" the function ran the attacker's temp table; with pg_temp named last it ran the real one.`
+                `Measured with CREATE ON SCHEMA public revoked: pinned "pg_catalog, ${pinSchemas[0]}" the function ran the attacker's temp table; with pg_temp named last it ran the real one.`
               : pinned
               ? `SECURITY DEFINER function whose search_path is pinned to ${shadowable.map((s) => `"${s}"`).join(', ')} — which "${role}" can CREATE objects in, so the pin protects nothing. ` +
                 `Resolution walks the pinned path in order and reaches a schema they can plant in before it reaches yours, so an unqualified name in the body finds THEIR object, executing as the owner with RLS bypassed. ` +
@@ -521,15 +868,50 @@ export async function check({ query, config = {} }) {
               : `SECURITY DEFINER function with no pinned search_path, and "${role}" can CREATE objects in ${writableSchemas.slice(0, 3).map((s) => `"${s}"`).join(', ')}. ` +
                 `Unqualified names inside the function resolve through the CALLER's search_path, so a caller who creates a table or function earlier on that path makes this function operate on THEIR object — executing as the definer's owner, with RLS bypassed.`,
             fix:
-              `Pin it to a path nobody can plant on, and name pg_temp so it is searched LAST:\n` +
-              `        ALTER FUNCTION ${fn.schema}.${fn.name}(${fn.args || ''}) SET search_path = pg_catalog, ${fn.schema}, pg_temp;\n` +
+              `Pin it to a path nobody can plant on, naming every schema the body resolves unqualified names in, with pg_temp LAST:\n` +
+              `        ALTER FUNCTION ${fn.schema}.${fn.name}(${fn.args || ''}) SET search_path = ${pinPath};\n` +
+              (unqualified.length
+                ? `      That path names ${pinSchemas.map((s) => `"${s}"`).join(', ')} because the body reads ${unqualified.slice(0, 4).map((r) => `"${r.name}"`).join(', ')} unqualified, and that is where those relations live — not necessarily "${fn.schema}", which is only where the FUNCTION lives. Pinning to the wrong schema does not fail the ALTER, it fails the next call with "relation does not exist".\n`
+                : relationsRead
+                ? `      This check found no unqualified relation reference it could resolve in the body, so "${fn.schema}" is the best available guess at where its objects live. If the body names objects in another schema (or builds names at runtime), add those schemas before pg_temp.\n`
+                : `      The relation catalog could not be read, so this check could not work out which schemas the body resolves unqualified names in — "${fn.schema}" is a guess. Check the body before applying this, and add every schema it names before pg_temp.\n`) +
+              `      Then CALL the function once. A pin that omits a schema the body needs breaks at call time, not at ALTER time.\n` +
               `      pg_temp is the part that gets left out. Postgres searches it BEFORE everything you list unless you name it, and TEMP is granted to PUBLIC by default — so without it the pin is defeated by a temp table, needing no CREATE privilege anywhere.\n` +
-              `      Verified: pinned "pg_catalog, ${fn.schema}" the function ran a planted temp table; with pg_temp named last it ran the real one.\n` +
-              (reachable.length ? `      ${reachable.map((s) => `"${s}"`).join(', ')} must also not come before your own schema — "${role}" can CREATE there.\n` : '') +
+              `      Verified: pinned "pg_catalog, ${pinSchemas[0]}" the function ran a planted temp table; with pg_temp named last it ran the real one.\n` +
+              (writableInPin.length
+                ? `      "${role}" can CREATE in ${writableInPin.map((s) => `"${s}"`).join(', ')}, which that path names — REVOKE CREATE ON SCHEMA ${writableInPin.join(', ')} FROM ${role}; or the pin just fixes the attacker on the path they were already taking.\n`
+                : '') +
               `      The strictest form is SET search_path = '' with every reference schema-qualified inside the body. Do NOT apply that one blindly: with an unqualified body the function stops working ("relation does not exist").`,
           });
         } else if (!pinned) {
-          notes.push({ where: fqn, message: `SECURITY DEFINER function with no pinned search_path. Not exploitable here — "${role}" cannot CREATE objects in any schema, so it has nowhere to plant a shadowing object — but pinning it (SET search_path = pg_catalog, ${fn.schema}) keeps it that way.` });
+          // NOT a safety claim. This used to read "Not exploitable here — cannot
+          // CREATE objects in any schema, so nowhere to plant a shadowing object",
+          // and that is false: measured on PG 18.3 with CREATE revoked on every
+          // schema (has_schema_privilege returned the empty set), a plain
+          // `create temp table invoices(...)` made an unpinned definer function
+          // read the attacker's table. pg_temp is searched first and needs no
+          // CREATE. It stays a note rather than a failure because whether the
+          // shadow BUYS the attacker anything depends on what the body does with
+          // the object — but the recommended DDL now names pg_temp, so applying
+          // it does not turn the next run red on this same guard, which is what
+          // the old advice did.
+          notes.push({
+            where: fqn,
+            message:
+              `SECURITY DEFINER function with no pinned search_path. "${role}" cannot CREATE in any schema, so it cannot plant a shadow that outlives its session` +
+              (tempGranted === true
+                ? ` — but that is not the whole precondition: pg_temp is searched BEFORE the entire search_path unless the function names it, and TEMP on this database is granted to "${role}" (the PUBLIC default), so a temp table shadows an unqualified name in the body with no CREATE privilege anywhere. ` +
+                  (unqualified.length
+                    ? `The body reads ${unqualified.slice(0, 3).map((r) => `"${r.name}"`).join(', ')} unqualified. `
+                    : relationsRead
+                    ? `This check found no unqualified relation reference in the body text; it cannot see names built at runtime in dynamic SQL. `
+                    : `This check could not read the relation catalog, so it does not know whether the body names anything unqualified. `) +
+                  `NOT REPORTED AS A FAILURE because whether the substituted object gains the caller anything depends on what the body does with it — read it, then pin it.`
+                : tempGranted === false
+                ? `, and TEMP on this database is revoked for it, so there is nowhere to plant one at all.`
+                : `. This check could not read TEMP on the database, so it cannot say whether a temp table could shadow an unqualified name here — pg_temp is searched before everything and TEMP is granted to PUBLIC by default, so assume it can.`) +
+              ` Pin it: ALTER FUNCTION ${fn.schema}.${fn.name}(${fn.args || ''}) SET search_path = ${pinPath}; then call the function once to confirm the path still resolves.`,
+          });
         }
       }
 

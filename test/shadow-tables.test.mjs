@@ -65,7 +65,12 @@ test('classify: readable + no RLS but HAS a tenant column -> leak with the simpl
   assert.doesNotMatch(v.fix, /ADD COLUMN/); // it already has one
 });
 
-test('classify: RLS on -> safe here (the other guards judge it on its merits)', () => {
+// The old name for this case was "RLS on -> safe here (the other guards judge it
+// on its merits)". That reason was wrong: with no tenant column, rls-proof never
+// plans the table, so nothing downstream judges it. The verdict is still 'safe',
+// but for the reason asserted here — RLS on with no policy denies every row.
+// The decorative-policy case is in shadow-tables-audit.test.mjs.
+test('classify: RLS on with no policy -> safe, Postgres denies every row', () => {
   assert.equal(classifyDestination({ schema: 'public', table: 'audit_log', rlsEnabled: true, canSelect: true }).status, 'safe');
 });
 

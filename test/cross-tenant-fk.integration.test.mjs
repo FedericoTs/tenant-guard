@@ -131,7 +131,10 @@ if (PGlite) {
     const { query } = await freshDb(TIGHT_FK);
     const res = await check({ query });
     assert.equal(res.skipped, true, JSON.stringify(res, null, 2));
-    assert.match(res.reason, /without carrying the tenant column/);
+    // The reason names what was EXCLUDED. It used to assert that no such foreign
+    // key existed, which was also printed when every one of them was allowlisted.
+    assert.match(res.reason, /already carries the tenant column/);
+    assert.match(res.reason, /1 foreign key\(s\)/);
   });
 
   test('CATCHES existing corruption without probing anything', async () => {

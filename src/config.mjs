@@ -95,6 +95,12 @@ export function resolveGuardConfigs(config) {
       // org-only signals give them a wall of false positives on first run. The
       // model is read from the schema; an explicit config always wins.
       tenantSignals: config.routeOrgScoping?.tenantSignals ?? signalsForModel(detectedTenancy(config).model),
+      // How a session-derived filter VALUE is spelled, and which calls are
+      // projections rather than filters. These are how the guard tells
+      // `.eq('user_id', user.id)` from `.eq('user_id', params.userId)`, so an
+      // app that spells its session value differently has to be able to say so.
+      sessionValueSignals: config.routeOrgScoping?.sessionValueSignals,
+      projectionCalls: config.routeOrgScoping?.projectionCalls,
       allowlist: config.routeOrgScoping?.allowlist ?? [],
     },
   });

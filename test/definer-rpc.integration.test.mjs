@@ -7,8 +7,12 @@
  * guard is what catches it.
  *
  * The safety rule is tested too: a VOLATILE definer function is NEVER called,
- * because an unknown body can commit autonomously. Postgres itself enforces that
- * a STABLE function cannot write, which is what makes calling those safe.
+ * because an unknown body can commit autonomously. What Postgres enforces is
+ * narrower than this header used to claim — it refuses a DIRECT write in a
+ * non-volatile body, and nothing more. `provolatile` is an author declaration,
+ * not a verified property: a STABLE body still consumes a sequence, and still
+ * runs the INSERT inside a VOLATILE helper it calls. Measured in
+ * definer-rpc-audit.test.mjs; the rollback contains table writes and not that.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -225,7 +229,7 @@ if (PGlite) {
     assert.equal(res.violations.some((x) => x.kind === 'sql-injection'), false, JSON.stringify(res.violations, null, 2));
   });
 
-  test('flags an unpinned search_path ONLY when the role can actually create objects', async () => {
+  test('an unpinned search_path FAILS when the role can create objects, and is noted honestly when it cannot', async () => {
     const withCreate = await fresh(`
       ${SECURED}
       grant create on schema public to authenticated;   -- somewhere to plant a shadow
@@ -246,9 +250,19 @@ if (PGlite) {
       grant execute on function helper() to authenticated;
     `);
     const res = await check({ query: noCreate.query });
-    // Nowhere to plant a shadowing object => a note, not a build failure.
+    // Still a note rather than a build failure — but NOT because it is safe. The
+    // note used to say "Not exploitable here", and a plain `create temp table`
+    // hijacks this exact configuration (measured in definer-rpc-audit.test.mjs).
+    // It stays a note because whether the substituted object gains the caller
+    // anything depends on the body; the text now says that instead of claiming
+    // safety, and the DDL it recommends names pg_temp so applying it does not
+    // turn the next run red.
     assert.equal(res.violations.some((x) => x.kind === 'search-path'), false, JSON.stringify(res.violations, null, 2));
-    assert.ok(res.notes.some((n) => /Not exploitable here/.test(n.message)));
+    const note = res.notes.find((n) => /helper/.test(n.where) && /search_path/.test(n.message));
+    assert.ok(note, JSON.stringify(res.notes, null, 2));
+    assert.doesNotMatch(note.message, /Not exploitable here/);
+    assert.match(note.message, /pg_temp is searched BEFORE/);
+    assert.match(note.message, /SET search_path = pg_catalog, public, pg_temp;/);
   });
 
   test('does NOT flag a function whose search_path is pinned COMPLETELY (pg_temp named)', async () => {

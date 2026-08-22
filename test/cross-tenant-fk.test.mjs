@@ -82,9 +82,17 @@ test('a reference to a shared lookup table (no tenant column) is excluded', () =
   assert.deepEqual(candidateFks([lookup], TC), []);
 });
 
-test('a self-reference is excluded — a hierarchy inside one tenant is not a boundary', () => {
+test('a self-reference IS a candidate — the boundary runs between one table\'s own rows', () => {
+  // This used to assert the opposite ("a hierarchy inside one tenant is not a
+  // boundary"). Measured on `nodes(id, organization_id, parent_id references
+  // nodes(id) on delete cascade)` with correct RLS: org_A re-pointed at a row it
+  // could not see, org_B deleted that row, and org_A's row was cascade-destroyed.
+  // The composite exclusion above still keeps the FIXED self-FK shape out.
   const self = { ...FK, parent_table: 'tasks', child_columns: ['parent_task_id'] };
-  assert.deepEqual(candidateFks([self], TC), []);
+  const [c] = candidateFks([self], TC);
+  assert.equal(c.id, 'public.tasks::tasks_project_id_fkey');
+  assert.equal(c.childColumn, 'parent_task_id');
+  assert.equal(c.parentColumn, 'id');
 });
 
 test('a composite key that still omits the tenant IS a candidate, marked as composite', () => {

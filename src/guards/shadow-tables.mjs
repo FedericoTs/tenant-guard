@@ -21,14 +21,27 @@
  * this check, not an oversight: a target assembled dynamically won't be seen.
  *
  * Conclusive case only, so a finding is never a guess: the destination is
- * readable by your app role **and RLS is off on it**. If RLS is on, the other
- * guards judge it on its merits; if the role can't read it, nothing is exposed.
+ * readable by your app role **and** either RLS is off on it, or RLS is on but
+ * every row is returned to that role anyway. If the role can't read it, nothing
+ * is exposed.
+ *
+ * The RLS carve-out used to be blanket — "RLS is on, the other guards judge it".
+ * Measured: that hand-off is empty exactly where this guard matters. With
+ * `audit_log(id, actor, detail)` (no tenant column), `enable row level security`
+ * and `create policy audit_read for select using (true)`, tenant A read BOTH
+ * tenants' rows while all 22 guards reported green — rls-proof never plans the
+ * table because `introspectionSql` joins `pg_attribute` on the tenant column,
+ * and anon-reads/column-exposure probe `anon`, not the app role. So the
+ * carve-out is now narrowed to `RLS on AND a tenant column exists`, which is
+ * precisely the case rls-proof does plan.
  */
 import {
   qualified,
+  quoteIdent,
   safeRole,
   introspectionSql,
   planTables,
+  tenantComparison,
   DEFAULTS as PROOF_DEFAULTS,
 } from './rls-proof.mjs';
 
@@ -69,8 +82,36 @@ export function triggersSql(schemas) {
   return { text, values: [schemas] };
 }
 
-/** RLS status, tenant column and the app role's SELECT grant for a set of tables. */
+/**
+ * RLS status, tenant column (and its type), the app role's SELECT grant, and
+ * what the role's SELECT policies actually do, for a set of tables.
+ *
+ * The tenant column's TYPE is carried because the emitted policy has to compile:
+ * `USING ("org_id" = current_setting('app.current_tenant'))` raises 42883
+ * `operator does not exist: uuid = text` on a uuid column — the commonest tenant
+ * type there is. Measured on the shape this guard reports most: uuid uncast
+ * FAILED 42883, uuid with `::uuid` on the setting OK, bigint uncast FAILED
+ * 42883, bigint with `::text` on the column OK. `tenantComparison()` picks.
+ *
+ * The policy counts answer one question, from the catalog, without probing:
+ * "for THIS role, on SELECT, is RLS decorative?" A policy applies to the role
+ * when `polroles` contains PUBLIC (oid 0) or a role the app role is a member of;
+ * it governs reads when `polcmd` is 'r' (SELECT) or '*' (ALL). Decorative means
+ * a PERMISSIVE applicable policy whose qual is the constant `true` AND no
+ * RESTRICTIVE applicable policy to narrow it — that combination returns every
+ * row, conclusively. Measured against the three shapes that look alike:
+ *   using (true)                             -> all_rows ['wide'], restrictive 0  (leak)
+ *   using (true) TO reporter + scoped TO app -> all_rows null                     (correct code)
+ *   using (true) + AS RESTRICTIVE tenant pol -> all_rows ['wide'], restrictive 1  (correct code)
+ * the last two both let `authenticated` see 1 of 2 rows, so neither may fire.
+ */
 export function destinationSql(qualifiedNames, tenantColumns, role) {
+  // "this policy has a say in what $3 sees when it reads this table"
+  const applies = `(
+             0 = any(p.polroles)
+             or exists (select 1 from unnest(p.polroles) r
+                         where pg_catalog.pg_has_role($3::text, r, 'USAGE'))
+           )`;
   const text = `
     select n.nspname as schema,
            c.relname as table,
@@ -80,7 +121,22 @@ export function destinationSql(qualifiedNames, tenantColumns, role) {
               from pg_catalog.pg_attribute a
              where a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
                and a.attname = any($2)
-             limit 1) as tenant_column
+             limit 1) as tenant_column,
+           (select pg_catalog.format_type(a.atttypid, a.atttypmod)
+              from pg_catalog.pg_attribute a
+             where a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
+               and a.attname = any($2)
+             limit 1) as tenant_type,
+           (select count(*) from pg_catalog.pg_policy p
+             where p.polrelid = c.oid and p.polpermissive
+               and p.polcmd in ('r', '*') and ${applies})::int as permissive_count,
+           (select count(*) from pg_catalog.pg_policy p
+             where p.polrelid = c.oid and not p.polpermissive
+               and p.polcmd in ('r', '*') and ${applies})::int as restrictive_count,
+           (select array_agg(p.polname) from pg_catalog.pg_policy p
+             where p.polrelid = c.oid and p.polpermissive
+               and p.polcmd in ('r', '*') and ${applies}
+               and pg_catalog.pg_get_expr(p.polqual, p.polrelid) = 'true') as all_rows_policies
     from pg_catalog.pg_class c
     join pg_catalog.pg_namespace n on n.oid = c.relnamespace
     where (n.nspname || '.' || c.relname) = any($1)
@@ -89,15 +145,126 @@ export function destinationSql(qualifiedNames, tenantColumns, role) {
 }
 
 /**
+ * Blank out SQL comments in a plpgsql body, leaving everything else byte-aligned.
+ *
+ * Needed because the write scan below is regex over raw text: a table named only
+ * inside a comment was reported as a write destination, and the message asserts
+ * as fact that the table "receives rows derived from tenant data". Measured on
+ * the naive shapes, all of which returned a destination before this existed:
+ *   `-- 2023: we used to "insert into app_settings" here; removed, it leaked`
+ *   `/ * old: insert into audit_log(a) values (1); * /`
+ *
+ * It has to be a lexer, not a blanket `replace` of everything after a `--`.
+ * Measured: on
+ * `raise notice 'skipped -- see ticket'; insert into audit_log(a) values (1);`
+ * the naive strip eats the rest of the line and loses a REAL write (returns []),
+ * where this pass returns ["public.audit_log"]. So single-quoted, dollar-quoted
+ * and double-quoted spans are tracked and skipped whole — and, deliberately,
+ * kept in the output: `execute 'insert into audit_log(a) values (1)'` is a
+ * genuine write this guard catches today and must keep catching.
+ *
+ * Comment characters are replaced with spaces rather than deleted so offsets and
+ * line breaks survive — a `--` comment can't glue two statements together.
+ *
+ * Deliberately NOT `stripSqlComments` from definer-grants.mjs, and named
+ * differently so the two are not confused: that one is the naive two-`replace`
+ * version. It is fine for its own input (migration files) but would lose the
+ * `raise notice` write above, and three other guards depend on it, so it is left
+ * alone rather than widened from here.
+ */
+export function blankSqlComments(sql) {
+  const s = String(sql || '');
+  const out = s.split('');
+  const n = s.length;
+  const blank = (from, to) => {
+    for (let k = from; k < to && k < n; k++) if (out[k] !== '\n') out[k] = ' ';
+  };
+  let i = 0;
+  while (i < n) {
+    const c = s[i];
+    // $tag$ … $tag$ — plpgsql nests these for dynamic SQL. Skipped whole.
+    if (c === '$') {
+      const m = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(s.slice(i));
+      if (m) {
+        const end = s.indexOf(m[0], i + m[0].length);
+        i = end === -1 ? n : end + m[0].length;
+        continue;
+      }
+    }
+    if (c === "'") {
+      // E'…' honours backslash escapes; a plain literal only doubles the quote.
+      const prev = s[i - 1] ?? '';
+      const prev2 = s[i - 2] ?? ' ';
+      const escapes = /[eE]/.test(prev) && !/[A-Za-z0-9_$]/.test(prev2);
+      i++;
+      while (i < n) {
+        if (escapes && s[i] === '\\') { i += 2; continue; }
+        if (s[i] === "'") {
+          if (s[i + 1] === "'") { i += 2; continue; }
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+    if (c === '"') {
+      i++;
+      while (i < n) {
+        if (s[i] === '"') {
+          if (s[i + 1] === '"') { i += 2; continue; }
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+    if (c === '-' && s[i + 1] === '-') {
+      let j = s.indexOf('\n', i);
+      if (j === -1) j = n;
+      blank(i, j);
+      i = j;
+      continue;
+    }
+    if (c === '/' && s[i + 1] === '*') {
+      let depth = 1;
+      let j = i + 2;
+      while (j < n && depth > 0) {
+        if (s[j] === '/' && s[j + 1] === '*') { depth++; j += 2; continue; }
+        if (s[j] === '*' && s[j + 1] === '/') { depth--; j += 2; continue; }
+        j++;
+      }
+      blank(i, j);
+      i = j;
+      continue;
+    }
+    i++;
+  }
+  return out.join('');
+}
+
+/**
  * Tables a trigger function writes to, read out of its body.
  *
  * plpgsql bodies are opaque to the catalog, so this is text analysis — and it is
- * deliberately literal: an `INSERT INTO`/`UPDATE` naming a table directly. A
- * dynamically-assembled target is not found, which is stated as a limitation
- * rather than papered over.
+ * deliberately literal: an `INSERT INTO`/`UPDATE`/`MERGE INTO` naming a table
+ * directly. A dynamically-assembled target is not found, which is stated as a
+ * limitation rather than papered over.
+ *
+ * The UPDATE pattern tolerates `ONLY` and an optional `[AS] alias`, because
+ * `\s+set\b` welded to the table name made the verdict depend on the alias, not
+ * on the leak. Measured on two databases identical but for the trigger body:
+ * `update tenant_rollup set …` -> ok=false "1 unprotected table(s)"; `update
+ * tenant_rollup r set …` -> ok=true "no triggers … write to an unguarded
+ * destination". Both leaked the same rows to the wrong tenant. The alias group
+ * is optional, so everything the old pattern matched still matches; checked that
+ * `on conflict (id) do update set n = excluded.n` and `select … for update`
+ * still yield [] (the alias group backtracks and the required `set` never
+ * arrives).
  */
 export function writeTargets(body, defaultSchema = 'public') {
-  const s = String(body || '');
+  const s = blankSqlComments(body);
   const out = new Set();
   const add = (schema, table) => {
     if (!table) return;
@@ -107,36 +274,130 @@ export function writeTargets(body, defaultSchema = 'public') {
     out.add(`${(schema || defaultSchema).replace(/"/g, '').toLowerCase()}.${t}`);
   };
   for (const m of s.matchAll(/\binsert\s+into\s+(?:("?[\w$]+"?)\s*\.\s*)?("?[\w$]+"?)/gi)) add(m[1], m[2]);
-  for (const m of s.matchAll(/\bupdate\s+(?:("?[\w$]+"?)\s*\.\s*)?("?[\w$]+"?)\s+set\b/gi)) add(m[1], m[2]);
+  for (const m of s.matchAll(/\bupdate\s+(?:only\s+)?(?:("?[\w$]+"?)\s*\.\s*)?("?[\w$]+"?)(?:\s+(?:as\s+)?"?[\w$]+"?)?\s+set\b/gi)) add(m[1], m[2]);
+  for (const m of s.matchAll(/\bmerge\s+into\s+(?:only\s+)?(?:("?[\w$]+"?)\s*\.\s*)?("?[\w$]+"?)/gi)) add(m[1], m[2]);
   return [...out];
 }
 
 /**
- * Verdict for one destination table.
- * @returns {{status:'leak'|'safe', message?:string, fix?:string}}
+ * The remediation, written so that pasting it does not break the SOURCE table.
+ *
+ * Measured, applying the previous version of this advice verbatim: the three
+ * statements applied cleanly, and the very next `insert into invoices` — the
+ * protected table the trigger hangs off — failed with 42501 "new row violates
+ * row-level security policy for table \"audit_log\"", while the guard flipped to
+ * ok=true. Two things caused it and both are now part of the recipe:
+ *   1. nothing populated the new column, so the trigger's row had NULL in it;
+ *   2. a PERMISSIVE policy with only USING supplies the WITH CHECK for INSERT,
+ *      so the AFTER trigger's write is judged by the read predicate.
+ * WITH CHECK is written out explicitly rather than left implicit, but the
+ * load-bearing step is (1) — and `WITH CHECK (true)` is NOT offered, because
+ * that trades the broken write for a write leak. Rows left NULL after the switch
+ * are invisible to every tenant, so the backfill is spelled out too: measured,
+ * reading the destination as the tenant afterwards returned 0 rows.
  */
-export function classifyDestination({ schema, table, rlsEnabled, canSelect, tenantColumn, sources = [], role = 'authenticated' }) {
+function remediation({ schema, table, tenantColumn, tenantColumnType, role, sources, sourceTenantColumn, dropPolicies = [], rlsEnabled = false }) {
+  const dest = qualified(schema, table);
+  const col = tenantColumn || 'organization_id';
+  const type = tenantColumn ? tenantColumnType : 'text';
+  const cmp = tenantComparison(quoteIdent(col), type);
+  const src = sources[0] || 'the source table';
+  const srcCol = quoteIdent(sourceTenantColumn || col);
+  const drops = dropPolicies.map((p) => `        DROP POLICY ${quoteIdent(p)} ON ${dest};\n`).join('');
+  return (
+    `Protect the destination like the source it copies from — all of it, in this\n` +
+    `      order. The policy on its own STOPS writes to ${src}:\n` +
+    (tenantColumn
+      ? ''
+      // `col` here is the synthesized literal `organization_id` — a plain
+      // lower-case identifier, so it is emitted unquoted.
+      : `        -- 1. give the row a tenant to be scoped by:\n` +
+        `        ALTER TABLE ${dest} ADD COLUMN ${col} ${type};\n`) +
+    `        -- ${tenantColumn ? '1' : '2'}. make the trigger carry the tenant across:\n` +
+    `        --      INSERT INTO ${dest} (${quoteIdent(col)}, ...) VALUES (NEW.${srcCol}, ...);\n` +
+    `        --    Until it does, every INSERT INTO ${src} fails with 42501 "new row\n` +
+    `        --    violates row-level security policy" — the trigger's write is checked\n` +
+    `        --    against the WITH CHECK below.\n` +
+    `        -- ${tenantColumn ? '2' : '3'}. backfill, or the rows already there become invisible to EVERY tenant:\n` +
+    `        --      UPDATE ${dest} SET ${quoteIdent(col)} = <owning tenant> WHERE ${quoteIdent(col)} IS NULL;\n` +
+    `        -- ${tenantColumn ? '3' : '4'}. then scope it:\n` +
+    drops +
+    (rlsEnabled ? '' : `        ALTER TABLE ${dest} ENABLE ROW LEVEL SECURITY;\n`) +
+    `        CREATE POLICY tenant_isolation ON ${dest}\n` +
+    `          USING (${cmp})\n` +
+    `          WITH CHECK (${cmp});\n` +
+    `      (If ${src} scopes by something other than the app.current_tenant GUC, use\n` +
+    `      that same mechanism here — do not copy its policy expression verbatim, it\n` +
+    `      refers to its own columns.)\n` +
+    `      Or, if it is meant to be operator-only: REVOKE SELECT ON ${dest} FROM ${role};`
+  );
+}
+
+/**
+ * Verdict for one destination table.
+ *
+ * 'note' is a real outcome here, not a soft failure: RLS is on, there is no
+ * tenant column, and the applicable policies scope by something this guard
+ * cannot read (a GUC flag, a membership join). Nothing downstream will look at
+ * the table either, so saying "I could not judge this" is the honest answer —
+ * reporting green would be a skip dressed up as a pass.
+ *
+ * @returns {{status:'leak'|'safe'|'note', message?:string, fix?:string}}
+ */
+export function classifyDestination({
+  schema,
+  table,
+  rlsEnabled,
+  canSelect,
+  tenantColumn,
+  tenantColumnType = null,
+  permissiveCount = 0,
+  restrictiveCount = 0,
+  allRowsPolicies = [],
+  sources = [],
+  sourceTenantColumn = null,
+  role = 'authenticated',
+}) {
   if (!canSelect) return { status: 'safe' };   // the role can't read it — nothing exposed
-  if (rlsEnabled) return { status: 'safe' };   // protected; the other guards judge it on its merits
+  // RLS on AND a tenant column: rls-proof's introspectionSql joins pg_attribute
+  // on the tenant column, so it plans exactly this table and judges it on its
+  // merits. That is the one case where the hand-off is real.
+  if (rlsEnabled && tenantColumn) return { status: 'safe' };
+
   const via = sources.join(', ');
+  const decorative = rlsEnabled && allRowsPolicies.length > 0 && restrictiveCount === 0;
+
+  if (rlsEnabled && !decorative) {
+    // RLS on, no applicable permissive SELECT policy => Postgres denies every row
+    // to this role. Nothing is exposed; stay silent.
+    if (permissiveCount === 0) return { status: 'safe' };
+    return {
+      status: 'note',
+      message:
+        `${schema}.${table} receives rows derived from tenant data (written by a trigger on ${via}) and has RLS enabled, but no tenant column — so no tenant-column check in this tool will ever plan it. Its ${permissiveCount} SELECT polic${permissiveCount === 1 ? 'y' : 'ies'} for "${role}" scope by something other than a tenant column, which cannot be judged from the catalog. Confirm by hand that "${role}" cannot read another tenant's rows here`,
+    };
+  }
+
+  const message = decorative
+    ? `${schema}.${table} receives rows derived from tenant data (written by a trigger on ${via}), "${role}" can read it, and although RLS is enabled the policy ${allRowsPolicies.map((p) => `"${p}"`).join(', ')} is PERMISSIVE with a constant-true qual and nothing RESTRICTIVE narrows it — so every row is returned to "${role}" anyway. There is no tenant column here either, so no other check in this tool plans this table: RLS being "on" is the only thing that looks protective about it`
+    : `${schema}.${table} receives rows derived from tenant data (written by a trigger on ${via}), "${role}" can read it, and it has NO row-level security` +
+      (tenantColumn ? ` — despite carrying a "${tenantColumn}" column that could scope it` : ` and no tenant column to scope it by`) +
+      `. The data left a protected table and nothing followed it: every tenant's activity is readable here by any logged-in user, and the tenant-column guards walk past it because there is nothing to key on`;
+
   return {
     status: 'leak',
-    message:
-      `${schema}.${table} receives rows derived from tenant data (written by a trigger on ${via}), "${role}" can read it, and it has NO row-level security` +
-      (tenantColumn ? ` — despite carrying a "${tenantColumn}" column that could scope it` : ` and no tenant column to scope it by`) +
-      `. The data left a protected table and nothing followed it: every tenant's activity is readable here by any logged-in user, and the tenant-column guards walk past it because there is nothing to key on`,
-    fix:
-      `Protect the destination like the source it copies from:\n` +
-      (tenantColumn
-        ? `        ALTER TABLE ${qualified(schema, table)} ENABLE ROW LEVEL SECURITY;\n` +
-          `        CREATE POLICY tenant_isolation ON ${qualified(schema, table)}\n` +
-          `          USING ("${tenantColumn}" = current_setting('app.current_tenant'));\n`
-        : `        -- add the tenant to the row so it CAN be scoped, then:\n` +
-          `        ALTER TABLE ${qualified(schema, table)} ADD COLUMN organization_id text;\n` +
-          `        ALTER TABLE ${qualified(schema, table)} ENABLE ROW LEVEL SECURITY;\n` +
-          `        CREATE POLICY tenant_isolation ON ${qualified(schema, table)}\n` +
-          `          USING (organization_id = current_setting('app.current_tenant'));\n`) +
-      `      Or, if it is meant to be operator-only: REVOKE SELECT ON ${qualified(schema, table)} FROM ${role};`,
+    message,
+    fix: remediation({
+      schema,
+      table,
+      tenantColumn,
+      tenantColumnType,
+      role,
+      sources,
+      sourceTenantColumn,
+      dropPolicies: decorative ? allRowsPolicies : [],
+      rlsEnabled: !!rlsEnabled,
+    }),
   };
 }
 
@@ -152,7 +413,12 @@ export async function check({ query, config = {} }) {
 
   // Which tables hold tenant data — those are the sources worth following.
   const intro = introspectionSql(cfg.schemas, cfg.tenantColumns, role);
-  const tenantTables = new Set(planTables(await q(intro.text, intro.values), cfg.tenantColumns).map((t) => `${t.schema}.${t.table}`));
+  // Keep each source's tenant column: the fix has to tell the user which value
+  // the trigger must carry into the destination (`NEW."organization_id"`), and
+  // that is the source's column, not the destination's.
+  const sourcePlan = planTables(await q(intro.text, intro.values), cfg.tenantColumns);
+  const sourceTenantColumns = new Map(sourcePlan.map((t) => [`${t.schema}.${t.table}`, t.tenantColumn]));
+  const tenantTables = new Set(sourceTenantColumns.keys());
   if (tenantTables.size === 0) {
     return OK({ skipped: true, reason: `no tenant-column tables in ${cfg.schemas.join(', ')}`, summary: 'skipped — no tenant tables' });
   }
@@ -188,21 +454,31 @@ export async function check({ query, config = {} }) {
   const violations = [];
   const notes = [];
   let scanned = 0;
+  let unjudged = 0;
 
   for (const r of rows) {
     const id = `${r.schema}.${r.table}`;
     scanned++;
+    const sources = [...(feeds.get(id) || [])];
     const verdict = classifyDestination({
       schema: r.schema,
       table: r.table,
       rlsEnabled: r.rls_enabled === true || r.rls_enabled === 't',
       canSelect: r.can_select === true || r.can_select === 't',
       tenantColumn: r.tenant_column,
-      sources: [...(feeds.get(id) || [])],
+      tenantColumnType: r.tenant_type ?? null,
+      permissiveCount: Number(r.permissive_count ?? 0),
+      restrictiveCount: Number(r.restrictive_count ?? 0),
+      allRowsPolicies: r.all_rows_policies ?? [],
+      sources,
+      sourceTenantColumn: sourceTenantColumns.get(sources[0]) ?? null,
       role,
     });
     if (verdict.status === 'leak') {
       violations.push({ where: id, kind: 'shadow', message: verdict.message, fix: verdict.fix });
+    } else if (verdict.status === 'note') {
+      notes.push({ where: id, message: verdict.message });
+      unjudged++;
     }
   }
 
@@ -226,7 +502,11 @@ export async function check({ query, config = {} }) {
     summary:
       violations.length > 0
         ? `${violations.length} unprotected table(s) receiving tenant data from a trigger`
-        : `${scanned} trigger destination(s) checked; all protected or unreadable`,
+        // Don't claim "all protected" when some destination could only be noted.
+        // A skip is not a pass; say how many were actually decided.
+        : unjudged > 0
+          ? `${scanned} trigger destination(s) checked; ${unjudged} could not be judged from the catalog (see notes)`
+          : `${scanned} trigger destination(s) checked; all protected or unreadable`,
   };
 }
 

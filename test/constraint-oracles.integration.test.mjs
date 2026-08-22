@@ -78,15 +78,19 @@ if (PGlite) {
     assert.equal(res.ok, true, JSON.stringify(res, null, 2));
   });
 
-  test('skips an expression index rather than guessing at its columns', async () => {
+  test('FLAGS a unique index on lower(email) — the case-insensitive-email idiom is still an oracle', async () => {
     const { query } = await fresh(`
       create table users (id serial primary key, organization_id text not null, email text not null);
       create unique index users_lower_email on users (lower(email));
     `);
     const res = await check({ query });
-    // We cannot read the columns of an expression index from indkey, so we say
-    // nothing rather than inventing a verdict in either direction.
-    assert.equal(res.violations.some((v) => /users_lower_email/.test(v.where)), false, JSON.stringify(res.violations, null, 2));
+    // This test previously asserted the opposite: that an expression index was
+    // skipped "rather than guessing at its columns". indkey cannot name them, but
+    // pg_get_expr(indexprs, indrelid) returns `lower(email)`, so there is nothing
+    // to guess — and measured under RLS, tenant A sees 0 rows and still gets
+    // 23505 on the victim's address. Reported as a clean pass, it was the guard's
+    // flagship case going unnoticed.
+    assert.equal(res.violations.some((v) => /users_lower_email/.test(v.where)), true, JSON.stringify(res, null, 2));
   });
 
   test('reports loose foreign keys as a NOTE, never a build failure', async () => {

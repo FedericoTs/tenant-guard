@@ -59,10 +59,15 @@ test('classifyUniqueIndex: a table with no tenant column is not tenant-scoped da
   assert.match(v.reason, /no tenant column/);
 });
 
-test('classifyUniqueIndex: expression indexes are skipped, not guessed at', () => {
-  assert.equal(classifyUniqueIndex({ hasExpression: true, columns: [null], types: [null], tenantColumn: 'organization_id' }).status, 'skip');
+test('classifyUniqueIndex: an expression index with nothing to read it against is a NOTE, not a silent skip', () => {
+  // This used to return 'skip', which meant `create unique index on users
+  // (lower(email))` — a live enumeration oracle — was reported as a clean pass.
+  // Without `expr`/`columnTypes` there is still nothing to reason about, but the
+  // honest answer is "not analysed", not "checked, fine". The verdict when the
+  // expression IS readable is pinned in constraint-oracles-audit.test.mjs.
+  assert.equal(classifyUniqueIndex({ hasExpression: true, columns: [null], types: [null], tenantColumn: 'organization_id' }).status, 'note');
   // a null slipping into the column list means the same thing
-  assert.equal(classifyUniqueIndex({ columns: [null], types: [null], tenantColumn: 'organization_id' }).status, 'skip');
+  assert.equal(classifyUniqueIndex({ columns: [null], types: [null], tenantColumn: 'organization_id' }).status, 'note');
 });
 
 test('classifyForeignKey: single-column FK between two tenant tables -> oracle', () => {

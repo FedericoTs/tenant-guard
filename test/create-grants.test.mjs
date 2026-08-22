@@ -112,7 +112,11 @@ test('with unpinned definers present it says EXPLOITABLE NOW and points at the o
 
 test('with none present it is stated as a LATENT precondition, not a false alarm', () => {
   const v = classifyCreateGrant({ ...base, role: 'anon', unpinned: [] });
-  assert.match(v.message, /nothing is exploitable today/);
+  // This used to assert "nothing is exploitable today", which was a claim about
+  // exploitability decided by a check that only tested whether a `SET` clause
+  // existed. The claim is now scoped to what was actually looked at.
+  assert.match(v.message, /nothing there is hijackable through this grant today/);
+  assert.doesNotMatch(v.message, /nothing is exploitable today/);
   assert.match(v.message, /arms the next one/);
   assert.match(v.message, /no diff will show a security change/);
 });

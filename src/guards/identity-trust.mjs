@@ -48,8 +48,16 @@
  *      is exactly right and still the bug, because **RLS is ROW-level and cannot
  *      restrict columns**. It pins which rows you may touch and says nothing about
  *      which fields, so you can set your own `role` to `'admin'`, or re-parent your
- *      own `organization_id` into another tenant. Only a column-level GRANT stops
- *      it, so that is what is read (`has_column_privilege`) and what the fix says.
+ *      own `organization_id` into another tenant. For a `role`/`is_admin` column
+ *      only a column-level GRANT stops it, so that is what is read
+ *      (`has_column_privilege`) and what the fix says. The TENANT column is the
+ *      one exception: a WITH CHECK that pins it does stop the re-parenting, and
+ *      is the canonical Supabase shape — measured, so it is not reported.
+ *
+ * Throughout (4) and (5): a policy only PERMITS a write when it is PERMISSIVE and
+ * applies to the role being reasoned about. Restrictive policies are ANDed and can
+ * only narrow; a policy `TO service_role` is not a write path for `authenticated`.
+ * Reading either as a grant failed the build on code that is strictly safer.
  *
  * Read-only: catalog reads plus, for the forgery proof, one rolled-back
  * transaction.
@@ -281,39 +289,96 @@ export function authorityDepsSql(schemas) {
   return { text, values: [schemas] };
 }
 
-/** RLS status, tenant column, and write grants for each authority table. */
+/**
+ * RLS status, tenant column, ownership, and write grants for each authority table.
+ *
+ * The write test is deliberately scoped to the TENANT COLUMN, not to the table.
+ * `has_table_privilege(…, 'INSERT')` is FALSE the moment INSERT was granted
+ * per-column, and a per-column grant that includes the tenant column is a fully
+ * working self-grant. Measured, same fixture twice, differing only in the grant:
+ *   `grant insert on memberships`                        -> has_table_privilege true,  hop ALLOWED, guard fired
+ *   `grant insert (user_id, organization_id) on …`       -> has_table_privilege FALSE, hop ALLOWED, guard SILENT
+ * `has_any_column_privilege` is the wrong repair: with `grant insert (user_id)`
+ * only — the tenant column deliberately not grantable, which is the shape this
+ * guard's own remediation pushes people toward — it is still true while the hop
+ * fails with "permission denied for table memberships". So: table privilege OR
+ * the tenant column specifically. Any-column is used only when no tenant column
+ * was recognised, and that path can produce a NOTE but never a failure.
+ */
 export function authorityDetailSql(qualifiedNames, tenantColumns, role) {
   const text = `
     select n.nspname as schema,
            c.relname as table,
            c.relrowsecurity as rls_enabled,
-           (select a.attname
-              from pg_catalog.pg_attribute a
-             where a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
-               and a.attname = any($2)
-             order by array_position($2, a.attname)
-             limit 1) as tenant_column,
-           pg_catalog.has_table_privilege($3::text, c.oid, 'INSERT') as can_insert,
-           pg_catalog.has_table_privilege($3::text, c.oid, 'UPDATE') as can_update
+           c.relforcerowsecurity as rls_forced,
+           c.relowner::regrole::text as owner_role,
+           tc.attname as tenant_column,
+           (pg_catalog.has_table_privilege($3::text, c.oid, 'INSERT')
+            or (tc.attnum is not null and pg_catalog.has_column_privilege($3::text, c.oid, tc.attnum, 'INSERT'))
+            or (tc.attnum is null and pg_catalog.has_any_column_privilege($3::text, c.oid, 'INSERT'))) as can_insert,
+           (pg_catalog.has_table_privilege($3::text, c.oid, 'UPDATE')
+            or (tc.attnum is not null and pg_catalog.has_column_privilege($3::text, c.oid, tc.attnum, 'UPDATE'))
+            or (tc.attnum is null and pg_catalog.has_any_column_privilege($3::text, c.oid, 'UPDATE'))) as can_update
     from pg_catalog.pg_class c
     join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+    left join lateral (
+      select a.attname, a.attnum
+        from pg_catalog.pg_attribute a
+       where a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
+         and a.attname = any($2)
+       order by array_position($2, a.attname)
+       limit 1) tc on true
     where (n.nspname || '.' || c.relname) = any($1)`;
   return { text, values: [qualifiedNames, tenantColumns, role] };
 }
 
-/** The INSERT/UPDATE-applicable policies on the authority tables. */
-export function writePoliciesSql(qualifiedNames) {
+/**
+ * The INSERT/UPDATE-applicable policies on the authority tables, with the two
+ * dimensions that decide whether a policy can be the thing that PERMITS a write:
+ *
+ *  - `permissive`. A RESTRICTIVE policy is ANDed onto every write and can only
+ *    ever narrow; it can never be the grant. Reading it as one turned a green
+ *    build red on strictly-safer code: adding
+ *    `AS RESTRICTIVE FOR INSERT WITH CHECK (user_id = auth.uid())` next to a
+ *    permissive policy that already pinned `organization_id` left the self-grant
+ *    BLOCKED at the database and flipped this guard from ok:true to ok:false,
+ *    naming the restrictive policy as the leak.
+ *  - `roles`. A write policy scoped `TO service_role` — the ordinary Supabase
+ *    shape, where PostgREST roles hold table grants and writes are reserved for
+ *    the backend — was reported as letting `authenticated` "write themselves a
+ *    row for ANY tenant". Measured: as authenticated, insert into another org
+ *    BLOCKED and insert into its OWN org also BLOCKED. There was no write path
+ *    at all. `{public}` in the array means every role and is not a real role, so
+ *    it must never reach pg_has_role.
+ */
+export function writePoliciesSql(qualifiedNames, role) {
   const text = `
     select p.schemaname as schema,
            p.tablename  as table,
            p.policyname as policy,
            p.cmd        as cmd,
+           p.permissive as permissive,
            p.qual       as qual,
-           p.with_check as with_check
+           p.with_check as with_check,
+           (p.roles::text[] && array['public']
+            or exists (
+              select 1 from unnest(p.roles::text[]) r
+               where r <> 'public' and pg_catalog.pg_has_role($2::text, r, 'MEMBER'))) as applies_to_role
     from pg_catalog.pg_policies p
     where (p.schemaname || '.' || p.tablename) = any($1)
       and p.cmd in ('ALL', 'INSERT', 'UPDATE')`;
-  return { text, values: [qualifiedNames] };
+  return { text, values: [qualifiedNames, role] };
+}
+
+/** Does a policy row apply to the role being reasoned about? Absent => assume yes. */
+export function policyAppliesToRole(p) {
+  return p.applies_to_role === undefined || p.applies_to_role === null
+    || p.applies_to_role === true || p.applies_to_role === 't';
+}
+
+/** Is this a RESTRICTIVE policy (ANDed, can only narrow)? Absent => PERMISSIVE. */
+export function isRestrictivePolicy(p) {
+  return String(p.permissive ?? 'PERMISSIVE').toUpperCase() === 'RESTRICTIVE';
 }
 
 /**
@@ -340,7 +405,7 @@ export function effectiveCheck(policy) {
  *
  * @returns {{status:'leak'|'safe'|'unknown', message?:string}}
  */
-export function classifyAuthority({ schema, table, tenantColumn, rlsEnabled, canInsert, canUpdate, writePolicies = [], dependents = [], role = 'authenticated' }) {
+export function classifyAuthority({ schema, table, tenantColumn, rlsEnabled, rlsForced = false, ownerRole = null, canInsert, canUpdate, writePolicies = [], dependents = [], role = 'authenticated' }) {
   if (!canInsert && !canUpdate) return { status: 'safe' };
   if (!tenantColumn) {
     return { status: 'unknown', message: `policies on ${dependents.join(', ')} derive their authority from ${schema}.${table}, which "${role}" can write — but it has no recognised tenant column, so this check can't reason about whether a self-grant is possible. Confirm by hand that a user cannot insert or update a row here that widens their own access.` };
@@ -352,18 +417,38 @@ export function classifyAuthority({ schema, table, tenantColumn, rlsEnabled, can
       message: `RLS is OFF on ${schema}.${table} and "${role}" holds a write grant on it — so a user can simply INSERT a row granting themselves membership of ANY tenant, and then read that tenant's data through a policy that is otherwise written correctly`,
     };
   }
+  // The owner of a table skips RLS entirely unless FORCE ROW LEVEL SECURITY is
+  // set, so no policy on it constrains this role and the write grant is the only
+  // gate. Checked BEFORE the per-policy reasoning below, because that reasoning
+  // now concludes "no applicable policy => denied", which is true for everyone
+  // except the owner. Verified in PGlite: table owned by the app role, RLS
+  // enabled, ZERO policies — the insert was ALLOWED.
+  if (ownerRole && ownerRole === role && !rlsForced) {
+    return {
+      status: 'leak',
+      message: `"${role}" OWNS ${schema}.${table} and RLS is not FORCED on it, so row-level security does not apply to this role at all — its policies are bypassed and the write grant is the only gate. A user can INSERT a row granting themselves membership of ANY tenant and then read that tenant's data through a policy that is otherwise written correctly. Fix with: ALTER TABLE ${qualified(schema, table)} FORCE ROW LEVEL SECURITY, or give the table a different owner`,
+    };
+  }
+  const mentionsTenant = (p) => {
+    const expr = effectiveCheck(p);
+    return !!expr && new RegExp(`\\b${tenantColumn}\\b`, 'i').test(expr);
+  };
   for (const cmd of ['INSERT', 'UPDATE']) {
     if (cmd === 'INSERT' && !canInsert) continue;
     if (cmd === 'UPDATE' && !canUpdate) continue;
-    const applicable = writePolicies.filter((p) => p.cmd === cmd || p.cmd === 'ALL');
-    if (applicable.length === 0) continue; // RLS on with no covering policy => denied
+    const applicable = writePolicies.filter((p) => (p.cmd === cmd || p.cmd === 'ALL') && policyAppliesToRole(p));
+    // Only a PERMISSIVE policy can PERMIT the write. Restrictive ones are ANDed
+    // on top, so none of them can be the reason a self-grant is possible — but
+    // one that names the tenant column DOES narrow which tenants are reachable,
+    // whatever the permissive policies allow, so it makes the table safe here.
+    const permissive = applicable.filter((p) => !isRestrictivePolicy(p));
+    const restrictive = applicable.filter((p) => isRestrictivePolicy(p));
+    if (permissive.length === 0) continue; // no permissive policy for this role => denied
+    if (restrictive.some(mentionsTenant)) continue;
     // Any policy whose check never mentions the tenant column lets the caller
     // choose the tenant. `user_id = auth.uid()` is the classic near-miss: it pins
     // WHO you are and leaves WHICH ORG entirely open.
-    const unconstrained = applicable.filter((p) => {
-      const expr = effectiveCheck(p);
-      return !expr || !new RegExp(`\\b${tenantColumn}\\b`, 'i').test(expr);
-    });
+    const unconstrained = permissive.filter((p) => !mentionsTenant(p));
     if (unconstrained.length > 0) writable.push({ cmd, policies: unconstrained.map((p) => p.policy) });
   }
   if (writable.length === 0) return { status: 'safe' };
@@ -394,18 +479,23 @@ export function classifyAuthority({ schema, table, tenantColumn, rlsEnabled, can
  * `profiles` table usually has no tenant column at all, and it is exactly where
  * self-escalation lives.
  */
-export function allPoliciesSql(schemas) {
+export function allPoliciesSql(schemas, role) {
   return {
     text: `
       select p.schemaname as schema,
              p.tablename  as table,
              p.policyname as policy,
              p.cmd        as cmd,
+             p.permissive as permissive,
              p.qual       as qual,
-             p.with_check as with_check
+             p.with_check as with_check,
+             (p.roles::text[] && array['public']
+              or exists (
+                select 1 from unnest(p.roles::text[]) r
+                 where r <> 'public' and pg_catalog.pg_has_role($2::text, r, 'MEMBER'))) as applies_to_role
       from pg_catalog.pg_policies p
       where p.schemaname = any($1)`,
-    values: [schemas],
+    values: [schemas, role],
   };
 }
 
@@ -414,6 +504,8 @@ export function escalationColumnsSql(qualifiedNames, columns, role) {
     select n.nspname as schema,
            c.relname as table,
            a.attname as column,
+           c.relowner::regrole::text as owner_role,
+           c.relforcerowsecurity as rls_forced,
            pg_catalog.has_column_privilege($3::text, c.oid, a.attnum, 'UPDATE') as can_update_col
     from pg_catalog.pg_class c
     join pg_catalog.pg_namespace n on n.oid = c.relnamespace
@@ -422,6 +514,30 @@ export function escalationColumnsSql(qualifiedNames, columns, role) {
       and a.attname = any($2)
     order by 1, 2, 3`;
   return { text, values: [qualifiedNames, columns, role] };
+}
+
+/**
+ * Policy text prepared for "does any policy READ this column?" matching.
+ *
+ * `auth.uid()`, `auth.role()`, `auth.jwt()` are functions in the `auth` schema —
+ * they can never be a column of a table in the scanned schemas. But `.` and `(`
+ * are non-word characters, so the plain `\brole\b` test matched the bare word
+ * inside `auth.role()`. Measured: the same `profiles(id, display_name, role)`
+ * with a textbook `USING (id = auth.uid())` self-update policy reported a NOTE
+ * (ok:true) — the designed outcome — and flipped to a build-failing
+ * `self-escalation` violation claiming `"role" is read by a policy to decide
+ * access` when an UNRELATED table's policy was changed from
+ * `USING (organization_id = current_setting(…))` to
+ * `USING (auth.role() = 'authenticated' AND organization_id = current_setting(…))`.
+ * Nothing read profiles.role in either run. `auth.role() = 'authenticated'` is a
+ * stock Supabase idiom and `role` is in DEFAULTS.authorizationColumns.
+ *
+ * Only the `auth.<name>` sequence is removed. A real column reference qualified
+ * as `auth.x` would need a table alias literally named `auth` inside a policy on
+ * a table in `cfg.schemas`; nothing else is dropped.
+ */
+export function policyTextForMatching(text) {
+  return String(text || '').replace(/\bauth\s*\.\s*[A-Za-z_][A-Za-z0-9_]*/gi, ' ');
 }
 
 /**
@@ -437,12 +553,43 @@ export function escalationColumnsSql(qualifiedNames, columns, role) {
 export function classifySelfEscalation({ schema, table, columns = [], updatePolicies = [], referencedColumns = [], role = 'authenticated' }) {
   // No UPDATE-applicable policy => the role cannot update any row here at all.
   if (updatePolicies.length === 0) return { status: 'safe' };
+  const applicable = updatePolicies.filter((p) => p.cmd === 'UPDATE' || p.cmd === 'ALL');
+  // Only a PERMISSIVE policy can permit the update; a RESTRICTIVE one is ANDed on
+  // and can only narrow. Rows carrying no `permissive` field — the pure unit
+  // tests, and any caller that pre-filtered — read as PERMISSIVE.
+  const permissive = applicable.filter((p) => !isRestrictivePolicy(p));
+  const restrictive = applicable.filter((p) => isRestrictivePolicy(p));
+  if (permissive.length === 0) return { status: 'safe' };
   const referenced = new Set(referencedColumns.map((c) => c.toLowerCase()));
   const writable = columns.filter((c) => c.canUpdate);
 
+  // A TENANT column is escalatable only if some applicable policy would ACCEPT
+  // the re-parented row. Column privilege alone is not enough, and reading it
+  // that way failed the build on the canonical correct Supabase table: per-command
+  // policies of the form WITH CHECK (organization_id in (select current_org_ids()))
+  // plus GRANT UPDATE to authenticated. Measured on three such tables, as
+  // `authenticated` inside a transaction: the tenant hop was REFUSED 42501 "new
+  // row violates row-level security policy" on 3/3, while updating other columns
+  // of the same rows succeeded. This is the same test classifyAuthority already
+  // applies one function up; it was simply never applied here.
+  //
+  // ANY unconstrained applicable policy is enough — not EVERY. Permissive WITH
+  // CHECKs are OR'd: measured with two permissive UPDATE policies on one table,
+  // one pinning organization_id and one not, the hop SUCCEEDED.
+  //
+  // Only the tenant column is gated this way. A non-tenant authorization column
+  // such as `role` must keep firing on USING (id = auth.uid()) WITH CHECK (id =
+  // auth.uid()) — that check says nothing about `role`, which is the entire bug.
+  const mentions = (p, name) => {
+    const expr = effectiveCheck(p);
+    return !!expr && new RegExp(`\\b${name}\\b`, 'i').test(expr);
+  };
+  const leavesUnconstrained = (name) => !restrictive.some((p) => mentions(p, name))
+    && permissive.some((p) => !mentions(p, name));
+
   // Conclusive: the DATABASE authorizes from this column, or the column IS the
-  // tenant — rewriting it re-parents the row by definition.
-  const authorized = writable.filter((c) => c.isTenant || referenced.has(c.name.toLowerCase()));
+  // tenant and no policy pins it — rewriting it re-parents the row by definition.
+  const authorized = writable.filter((c) => (c.isTenant ? leavesUnconstrained(c.name) : referenced.has(c.name.toLowerCase())));
   // Named like an authorization field, but no policy reads it. The database does
   // not treat it as a boundary; the application almost certainly does, and SQL
   // cannot see that — so it is a note, in the same spirit as every other
@@ -503,10 +650,37 @@ export function deriveClaimKey(cfg, tenantColumn) {
   return tenantColumn;
 }
 
-const USER_METADATA_FIX = (key) =>
-  `Authorize from a source the user cannot write:\n` +
-  `        USING (${key} = (auth.jwt() -> 'app_metadata' ->> '${key}'))   -- app_metadata is server-controlled\n` +
-  `      or, better, from a memberships table keyed on auth.uid(). Never user_metadata / raw_user_meta_data.`;
+/**
+ * The replacement policy to print. Two things it must not do, both measured by
+ * feeding the emitted USING clause straight back into `CREATE POLICY`:
+ *
+ *  - emit an untyped comparison. `USING (org_id = (auth.jwt() -> 'app_metadata'
+ *    ->> 'org_id'))` against a `uuid` tenant column — the commonest tenant type
+ *    there is — fails with `operator does not exist: uuid = text`. rls-proof
+ *    solved exactly this in `tenantComparison()`; this is that branch logic with
+ *    a JWT claim on the right-hand side instead of a GUC.
+ *  - use ONE token as both the column name and the claim key. They are different
+ *    things and routinely differ. With `claim: 'tenant'` on a table whose column
+ *    is `organization_id` the old text printed `USING (tenant = … ->> 'tenant')`
+ *    -> `column "tenant" does not exist`; and the policy-text branch passed
+ *    `cfg.tenantColumns[0]`, printing `organization_id` for a table whose column
+ *    is `org_id` -> `column "organization_id" does not exist`.
+ */
+export function userMetadataFix(column, columnType, claimKey) {
+  const col = quoteIdent(column);
+  const claim = `(auth.jwt() -> 'app_metadata' ->> '${claimKey}')`;
+  const t = String(columnType ?? '').toLowerCase();
+  let cmp;
+  if (t === 'uuid') cmp = `${col} = ${claim}::uuid`;
+  else if (t === '' || t === 'text' || t === 'character varying' || t === 'varchar') cmp = `${col} = ${claim}`;
+  // int, bigint, citext, a domain — cast the column rather than guess the cast.
+  else cmp = `${col}::text = ${claim}`;
+  return (
+    `Authorize from a source the user cannot write:\n` +
+    `        USING (${cmp})   -- app_metadata is server-controlled\n` +
+    `      or, better, from a memberships table keyed on auth.uid(). Never user_metadata / raw_user_meta_data.`
+  );
+}
 
 // ── async orchestration ──────────────────────────────────────────────
 
@@ -574,7 +748,7 @@ export async function check({ query, config = {} }) {
   if (depNames.length > 0) {
     const det = authorityDetailSql(depNames, cfg.tenantColumns, role);
     const details = await q(det.text, det.values);
-    const wp = writePoliciesSql(depNames);
+    const wp = writePoliciesSql(depNames, role);
     const writePolicies = await q(wp.text, wp.values);
     // Which escalation columns each authority table has and whether the role may
     // UPDATE them, plus which of those column NAMES the dependent policies
@@ -607,6 +781,8 @@ export async function check({ query, config = {} }) {
         table: d.table,
         tenantColumn: d.tenant_column,
         rlsEnabled: d.rls_enabled === true || d.rls_enabled === 't',
+        rlsForced: d.rls_forced === true || d.rls_forced === 't',
+        ownerRole: d.owner_role ?? null,
         canInsert: d.can_insert === true || d.can_insert === 't',
         canUpdate: d.can_update === true || d.can_update === 't',
         writePolicies: writePolicies.filter((p) => `${p.schema}.${p.table}` === id),
@@ -633,11 +809,22 @@ export async function check({ query, config = {} }) {
   }
 
   // ── the forgery proof for (1) ──────────────────────────────────────
-  let proven = false;
+  //
+  // The introspection is hoisted out of the probe because BOTH user_metadata
+  // branches need it: the fix text has to name the offending table's real tenant
+  // column and its type, or the policy it prints will not create. The
+  // policy-text branch used to fall back to `cfg.tenantColumns[0]`, which prints
+  // `organization_id` for a table whose column is `org_id`.
+  const umPlan = new Map();
   if (umPolicies.length > 0) {
     const intro = introspectionSql(cfg.schemas, cfg.tenantColumns, role);
-    const plan = planTables(await q(intro.text, intro.values), cfg.tenantColumns)
-      .filter((t) => umTables.includes(`${t.schema}.${t.table}`));
+    for (const t of planTables(await q(intro.text, intro.values), cfg.tenantColumns)) {
+      umPlan.set(`${t.schema}.${t.table}`, t);
+    }
+  }
+  let proven = false;
+  if (umPolicies.length > 0) {
+    const plan = [...umPlan.values()].filter((t) => umTables.includes(`${t.schema}.${t.table}`));
     await query('begin', []);
     try {
       for (const t of plan) {
@@ -665,7 +852,7 @@ export async function check({ query, config = {} }) {
               where: `${t.schema}.${t.table}`,
               kind: 'user-metadata',
               message: `PROVEN by forgery: setting user_metadata.${claimKey} to another tenant's id granted ${forged - baseline} row(s) of that tenant's data. user_metadata is writable BY THE USER (supabase.auth.updateUser({ data: … })), so any user can do this to themselves and read any tenant.`,
-              fix: USER_METADATA_FIX(claimKey),
+              fix: userMetadataFix(t.tenantColumn, t.tenantColumnType, claimKey),
             });
           }
         } catch (err) {
@@ -690,13 +877,11 @@ export async function check({ query, config = {} }) {
   // privilege, not a policy: RLS cannot restrict columns, so a textbook-correct
   // self-update policy still lets you rewrite the field that grants your access.
   {
-    const ap = allPoliciesSql(cfg.schemas);
+    const ap = allPoliciesSql(cfg.schemas, role);
     const allPolicies = await q(ap.text, ap.values);
-    const selfUpdatable = [...new Set(
-      allPolicies
-        .filter((r) => r.cmd === 'UPDATE' || r.cmd === 'ALL')
-        .map((r) => `${r.schema}.${r.table}`),
-    )].filter((n) => !skip.has(n));
+    const updatePolicies = allPolicies.filter((r) => r.cmd === 'UPDATE' || r.cmd === 'ALL');
+    const selfUpdatable = [...new Set(updatePolicies.map((r) => `${r.schema}.${r.table}`))]
+      .filter((n) => !skip.has(n));
 
     if (selfUpdatable.length > 0) {
       const ec2 = escalationColumnsSql(selfUpdatable, cfg.tenantColumns.concat(cfg.authorizationColumns), role);
@@ -704,25 +889,54 @@ export async function check({ query, config = {} }) {
       for (const r of await q(ec2.text, ec2.values)) {
         (cols[`${r.schema}.${r.table}`] = cols[`${r.schema}.${r.table}`] || []).push(r);
       }
-      // A column "is authorized from" when ANY policy in scope reads its name —
-      // including a policy on the table itself, which is the case the old
-      // dependency-only lookup could not see.
-      const allPolicyText = allPolicies.map((r) => `${r.qual || ''} ${r.with_check || ''}`).join(' ');
+      // A column "is authorized from" when a policy that could actually READ this
+      // table's rows names it: a policy ON the table itself (the case the old
+      // dependency-only lookup could not see), or one that `pg_depend` records as
+      // depending on it. Matching against every policy in the schema instead made
+      // `auth.role()` on an unrelated table promote `profiles.role` from a
+      // deliberate NOTE to a build-failing violation whose message was false.
+      const policyTextFor = (id) => {
+        const own = allPolicies.filter((r) => `${r.schema}.${r.table}` === id);
+        const viaDeps = allPolicies.filter((r) => deps.some((d) => `${d.dep_schema}.${d.dep_table}` === id
+          && d.schema === r.schema && d.policy_table === r.table && d.policy === r.policy));
+        return policyTextForMatching(
+          [...own, ...viaDeps].map((r) => `${r.qual || ''} ${r.with_check || ''}`).join(' '),
+        );
+      };
 
       for (const id of selfUpdatable) {
         const [schema, table] = [id.slice(0, id.indexOf('.')), id.slice(id.indexOf('.') + 1)];
+        const readable = policyTextFor(id);
+        const rows = cols[id] || [];
+        // Only a PERMISSIVE policy that applies to THIS role can let it update a
+        // row. Measured: a `memberships` table whose only write policy was
+        // `FOR ALL TO service_role USING (true) WITH CHECK (true)` — the ordinary
+        // Supabase shape, writes reserved for the backend — was reported as a
+        // self-escalation by `authenticated`, which in fact had no write path at
+        // all (its own-org insert was BLOCKED too).
+        //
+        // Unless the role OWNS the table and RLS is not FORCED, in which case no
+        // policy applies to it at all and nothing constrains the update. The
+        // policies are then passed WITHOUT their expressions, because that is the
+        // truth: they are bypassed, so none of them pins anything.
+        const ownerBypass = rows.length > 0 && rows[0].owner_role === role
+          && !(rows[0].rls_forced === true || rows[0].rls_forced === 't');
+        const onTable = updatePolicies.filter((r) => `${r.schema}.${r.table}` === id);
+        const applicable = ownerBypass
+          ? onTable.map((r) => ({ policy: r.policy, cmd: r.cmd }))
+          : onTable.filter((r) => policyAppliesToRole(r));
         const esc = classifySelfEscalation({
           schema,
           table,
-          columns: (cols[id] || []).map((c) => ({
+          columns: rows.map((c) => ({
             name: c.column,
             canUpdate: c.can_update_col === true || c.can_update_col === 't',
             isTenant: cfg.tenantColumns.includes(c.column),
           })),
-          updatePolicies: allPolicies.filter((r) => `${r.schema}.${r.table}` === id && (r.cmd === 'UPDATE' || r.cmd === 'ALL')),
+          updatePolicies: applicable,
           referencedColumns: (cols[id] || [])
             .map((c) => c.column)
-            .filter((n) => new RegExp(`\\b${n}\\b`, 'i').test(allPolicyText)),
+            .filter((n) => new RegExp(`\\b${n}\\b`, 'i').test(readable)),
           role,
         });
         if (esc.status === 'safe') continue;
@@ -745,12 +959,19 @@ export async function check({ query, config = {} }) {
   // ── 1. policy-text findings, for anything the probe didn't prove ───
   for (const p of umPolicies) {
     if (violations.some((v) => v.kind === 'user-metadata' && v.where === p.id)) continue;
-    const claimKey = deriveClaimKey(cfg, cfg.tenantColumns[0]);
+    // The column comes from the OFFENDING table, not from the head of the
+    // configured tenant-column list. Both are needed and they are not the same
+    // thing as the claim key: the emitted policy names a column, the JSON lookup
+    // names a claim, and with `claim: 'tenant'` on an `organization_id` table
+    // they differ.
+    const t = umPlan.get(p.id);
+    const column = t?.tenantColumn ?? cfg.tenantColumns[0];
+    const claimKey = deriveClaimKey(cfg, column);
     violations.push({
       where: `${p.id} (policy "${p.policy}")`,
       kind: 'user-metadata',
       message: `this policy authorizes from user_metadata, which is writable BY THE USER (supabase.auth.updateUser({ data: … })) — unlike app_metadata. Any user can rewrite their own tenant id and read another tenant's data. There is no safe use of user_metadata as an authorization key.`,
-      fix: USER_METADATA_FIX(claimKey),
+      fix: userMetadataFix(column, t?.tenantColumnType, claimKey),
     });
   }
 

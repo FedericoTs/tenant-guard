@@ -90,7 +90,11 @@ if (PGlite) {
     const res = await check({ query, config: { role: 'app_user' } });
     assert.equal(res.ok, true, JSON.stringify(res, null, 2));
     assert.equal(res.skipped, true);
-    assert.match(res.summary, /not a schema-per-tenant database/);
+    // The skip used to read "not a schema-per-tenant database" — an assertion of
+    // absence the guard had not earned, since grouping is exact-table-set only
+    // and a fleet that drifted by one table lands in the same branch.
+    assert.match(res.summary, /no exact schema-per-tenant shape found/);
+    assert.equal(res.notes.length, 0, 'analytics/audit share no table names, so nothing to flag');
   });
 
   test('schemaPattern overrides inference for a less regular layout', async () => {

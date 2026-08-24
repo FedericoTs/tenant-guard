@@ -1,8 +1,8 @@
 # Audit backlog — closed
 
 Two adversarial audit rounds against a real database produced **213 candidates**;
-**107 survived verification**. As of **0.43.0 all of them are closed** — 105
-fixed, 2 deliberately not, with reasons below.
+**107 survived verification**. As of **0.44.0 all of them are closed** — 106
+fixed, and one closed as won't-fix with the reasoning recorded below.
 
 This file is kept because the method turned out to be worth more than the list,
 and because "here is everything that was wrong with it" is a more useful thing to
@@ -23,18 +23,48 @@ publish than a clean slate.
 | Shared-helper drift | 7 | closed |
 | Cosmetic, perf, packaging | 12 | closed |
 
-The two left open on purpose:
+The last two, and how they closed:
 
-- **Escalating every unpinned `SECURITY DEFINER` function to a build failure.**
-  The gate was built and measured: it fires on ordinary correct code, and the
-  harm is body-dependent in a way neither the catalog nor the body text settles.
-  If the function merely *returns* rows from a shadowed relation the attacker
-  gets back their own temp rows and nothing crossed a tenant boundary. It stays a
-  note — which now states the `pg_temp` fact outright, so the tool no longer
-  asserts safety it cannot prove.
-- **Gating `definer-rpc`'s probe behind an opt-in.** Would turn off the guard's
-  headline capability by default to fix a theoretical concern about calling
-  `STABLE` functions. The header now says what is actually true instead.
+**Gating `definer-rpc`'s probe — closed with an opt-OUT, not an opt-in.** The
+proposal was to stop calling definer functions unless asked. That would silently
+turn off the guard's headline capability for everyone, to address a case the
+rolled-back transaction already contains. `probeCalls: true` is the default and
+`probeCalls: false` is there for a schema with `STABLE` functions that reach
+something with external side effects — dblink, an FDW, a NOTIFY. The two
+directions are not symmetric: a missed leak ships, a surprising probe gets a bug
+report.
+
+**Escalating every unpinned `SECURITY DEFINER` function to a build failure —
+closed as WON'T FIX, deliberately.** It stays a note, and this is the answer
+rather than a deferral.
+
+Three attempts, in order:
+
+1. The broad version — fail on any unpinned definer function where the role can
+   plant. Built, and **measured firing on ordinary correct code**: three existing
+   integration tests asserting a clean result flipped red, including a function
+   that re-filters from the session and is proven tenant-scoped by the probe in
+   the same run.
+2. A narrower version — fail only when the body *decides* something from the
+   shadowed object (an authorization lookup). Rejected on design: detecting
+   "decides" from body text is exactly the kind of inference that produced most
+   of the findings in this file.
+3. A narrower version still — fail only when the body *writes* to an unqualified
+   relation, which would be conclusive: the planted table receives the write and
+   the real one silently does not. **Could not be measured.** The fixture does
+   not run under the embedded Postgres used for verification (`0A000 input of
+   anonymous composite types is not implemented`, with or without a planted
+   table), so there is no reproduction. The read-shadow is proven; the
+   write-shadow is only inferred from the same name resolution, and inference is
+   what this project keeps getting wrong.
+
+So it remains a note — one that states the `pg_temp` fact outright, names the
+unqualified relations the body reads, and says plainly that whether the
+substituted object buys the caller anything depends on what the body does with
+it. The tool asserts nothing it has not shown.
+
+Worth reopening if someone can produce the write-shadow reproduction against a
+real server rather than an embedded one.
 
 ## The findings worth remembering
 

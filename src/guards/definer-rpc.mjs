@@ -82,6 +82,29 @@ export const DEFAULTS = {
   // Argument types we will supply a tenant id for. Anything else is skipped
   // rather than guessed at.
   tenantArgTypes: ['text', 'character varying', 'uuid'],
+  /**
+   * Whether to CALL the definer functions, or only read the catalog.
+   *
+   * Calling them is the whole point — a definer RPC that hands out every
+   * tenant's rows is invisible to any amount of policy review, and the only way
+   * to know is to invoke it and count what comes back. Every call is inside a
+   * savepoint inside a rolled-back transaction, and only STABLE/IMMUTABLE
+   * functions are called, which Postgres will not let perform direct DML.
+   *
+   * It is an opt-OUT rather than an opt-in on purpose. An audit proposed making
+   * it opt-in, on the grounds that `STABLE` is not an absolute guarantee — a
+   * STABLE function reaching a VOLATILE one does write, which is true and is why
+   * `definer-grants` no longer treats volatility as proof. But defaulting this
+   * off would silently turn off the guard's headline capability for everyone, to
+   * address a case that is rare and that the rolled-back transaction already
+   * contains. The two are not symmetric: a missed leak ships, a surprising probe
+   * gets a bug report.
+   *
+   * Set false if your schema has STABLE functions with external side effects —
+   * a callee doing dblink, a foreign data wrapper, a NOTIFY. The guard then
+   * reports what the catalog shows and says plainly that nothing was proven.
+   */
+  probeCalls: true,
 };
 
 /** A tenant id that cannot exist — the control arm for argument-trusting RPCs. */

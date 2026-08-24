@@ -246,7 +246,7 @@ export function resolveRealtimeConfig(config) {
 export function resolveDefinerRpcConfig(config) {
   const d = config.definerRpc ?? {};
   const out = {};
-  for (const k of ['url', 'urlEnv', 'schemas', 'tenantColumns', 'role', 'becomeTenant', 'claim', 'allowlist', 'tenantArgTypes']) {
+  for (const k of ['url', 'urlEnv', 'schemas', 'tenantColumns', 'role', 'becomeTenant', 'claim', 'allowlist', 'tenantArgTypes', 'probeCalls']) {
     if (d[k] !== undefined) out[k] = d[k];
   }
   const p = config.rlsProof ?? {};

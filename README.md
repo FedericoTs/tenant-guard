@@ -124,6 +124,16 @@ kind of statement each one is making:
   ways, the guard performs the write in a rolled-back transaction and reports
   what actually happened — because a fix you apply blind has to be safe, and
   advice built on inference once caused an outage in a real database.
+- **Every guard has to prove it CAN fail.** `test/negative-control.test.mjs`
+  builds a database broken in exactly the way each guard exists to detect and
+  requires a violation, then builds the corrected version of that same schema and
+  requires silence. A guard that returns green on its own worst case is not a
+  guard, however green its other tests are. Suggested by
+  [u/Guidondor](https://github.com/Guidondor/expo-supabase-starter), whose own
+  RLS smoke test sat green for weeks because Postgres was raising a type error on
+  the line that built the failure message — *a suite that can't fail looks
+  exactly like a suite that passes, and you can't tell them apart from the
+  outside.*
 
 ## The guards
 

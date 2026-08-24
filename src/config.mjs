@@ -198,13 +198,18 @@ export function resolveIdentityTrustConfig(config) {
 export function resolveStorageConfig(config) {
   const s = config.storageIsolation ?? {};
   const out = {};
-  for (const k of ['url', 'urlEnv', 'role', 'becomeTenant', 'claim', 'pathSegment', 'buckets', 'allowlist', 'sampleLimit', 'probeWrites']) {
+  for (const k of ['url', 'urlEnv', 'role', 'anonRole', 'becomeTenant', 'claim', 'pathSegment', 'buckets', 'allowlist', 'sampleLimit', 'probeWrites']) {
     if (s[k] !== undefined) out[k] = s[k];
   }
   // Identity is inherited from rlsProof so it is configured once.
   const p = config.rlsProof ?? {};
   for (const k of ['role', 'becomeTenant', 'claim']) {
     if (out[k] === undefined && p[k] !== undefined) out[k] = p[k];
+  }
+  // The unauthenticated role follows anonReads, which is where it is already
+  // configured for every other guard that probes it.
+  if (out.anonRole === undefined && config.anonReads?.role !== undefined) {
+    out.anonRole = config.anonReads.role;
   }
   return out;
 }

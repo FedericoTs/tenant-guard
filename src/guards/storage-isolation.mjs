@@ -55,7 +55,47 @@ export const DEFAULTS = {
   allowlist: [], // bucket ids that are intentionally public/shared (a CDN asset bucket)
   sampleLimit: 3,
   probeWrites: true,
+  /**
+   * The unauthenticated role, probed separately from the tenant role.
+   *
+   * Suggested by u/akl773 on r/Supabase: "tables get all the attention and the
+   * bucket policies stay wide open, so a public bucket or a leaked signed url
+   * hands over the other tenant's invoices while every table check still
+   * passes." This guard proved tenant-A-against-tenant-B and read the bucket's
+   * public flag, but it never asked the simpler question — can a visitor with
+   * no session at all list what is in here. Set to null to skip.
+   */
+  anonRole: 'anon',
 };
+
+/**
+ * `anon` listed objects in a private bucket.
+ *
+ * Conclusive and needs no second tenant: the bucket is not public, so nothing
+ * about it is supposed to be readable without a session. Storage keys tenancy
+ * off the object PATH, and `storage.objects` is an ordinary RLS-protected
+ * table — so a policy written `TO public` (or no policy plus a stray grant)
+ * hands the whole listing to anyone with the anon key, which ships in every
+ * browser bundle.
+ */
+export function classifyAnonListing({ bucket, anonVisible, tenantFolders, role = 'anon' }) {
+  return {
+    kind: 'anon-listing',
+    where: `storage.objects (bucket "${bucket}")`,
+    message:
+      `"${role}" — an unauthenticated visitor holding the public key — listed ${anonVisible} object(s) in the private bucket "${bucket}"` +
+      (tenantFolders >= 2 ? `, which holds ${tenantFolders} tenants' folders` : '') +
+      `. The bucket is not marked public, so this is a policy on storage.objects granting reads to everyone rather than a deliberate CDN bucket. ` +
+      `Object names are enumerable from here, and a name is all a signed-URL request needs.`,
+    fix:
+      `Scope the SELECT policy on storage.objects to an authenticated tenant, and make sure it is not granted TO public:\n` +
+      `        DROP POLICY <the permissive one> ON storage.objects;\n` +
+      `        CREATE POLICY tenant_read ON storage.objects FOR SELECT TO authenticated\n` +
+      `          USING (bucket_id = '${bucket}' AND (storage.foldername(name))[1] = <the caller's tenant>);\n` +
+      `      Check for a policy with no TO clause — that is TO public, which includes ${role}:\n` +
+      `        SELECT polname, polroles::regrole[] FROM pg_policy WHERE polrelid = 'storage.objects'::regclass;`,
+  };
+}
 
 /** The filename tenant-guard would upload; never committed. */
 export const PROBE_OBJECT = '.tenant-guard-probe';
@@ -282,6 +322,27 @@ export async function check({ query, config = {} }) {
         continue;
       }
       const [folderA, folderB] = folders;
+
+      // Before the tenant-against-tenant probe: can a visitor with NO session
+      // list this bucket at all? A private bucket that answers anon is a leak
+      // that every table-level check walks straight past.
+      if (cfg.anonRole) {
+        await query('savepoint tg_anon', []);
+        try {
+          await query(`set local role ${safeRole(cfg.anonRole)}`, []);
+          const all = folderObjectCountSql(seg);
+          const anonVisible = (await q(all.text, [b.id, folderA]))[0].n
+            + (await q(all.text, [b.id, folderB]))[0].n;
+          if (anonVisible > 0) {
+            const v = classifyAnonListing({ bucket: b.id, anonVisible, tenantFolders, role: cfg.anonRole });
+            violations.push({ where: v.where, kind: v.kind, message: v.message, fix: v.fix });
+          }
+        } catch { /* denied, which is the answer we wanted */ }
+        finally {
+          try { await query('rollback to savepoint tg_anon', []); await query('release savepoint tg_anon', []); }
+          catch { /* the outer rollback still discards everything */ }
+        }
+      }
 
       await query(`set local role ${role}`, []);
       if (canaryReady) {

@@ -137,6 +137,23 @@ export function extractFunctionDefs(sql) {
     const header = stripSqlComments(segment).toLowerCase();
     const rawName = starts[i].name.replace(/"/g, '');
     const name = rawName.includes('.') ? rawName.split('.').pop() : rawName;
+    // The schema the CREATE actually named, and the exact spelling to put in an
+    // ALTER/REVOKE. Everything downstream matches on the BARE name (allowlists,
+    // policy references, the revoke scan), so `name` stays bare — but the advice
+    // has to name the real function. Emitting `public.` unconditionally produced
+    // `ALTER FUNCTION public.get_priv()` for a function created as `app.get_priv`,
+    // which pglite answered with 42883 function public.get_priv() does not exist;
+    // the REVOKE line carried the same defect. `target` reuses the source's own
+    // spelling — including its quoting and case — so whatever the CREATE could
+    // write, the ALTER can write. An UNQUALIFIED create yields an unqualified
+    // target on purpose: it resolved through the migration runner's search_path
+    // and the ALTER will resolve the same way. Guessing `public` there is how the
+    // bug got in.
+    const schemaMatch = /^("(?:[^"]|"")*"|[a-z0-9_$]+)\s*\./i.exec(starts[i].name);
+    const schema = schemaMatch
+      ? schemaMatch[1].replace(/^"([\s\S]*)"$/, '$1').replace(/""/g, '"')
+      : null;
+    const target = starts[i].name;
 
     const volatility = /\bimmutable\b/.test(header) ? 'immutable'
       : /\bstable\b/.test(header) ? 'stable'
@@ -163,6 +180,8 @@ export function extractFunctionDefs(sql) {
     const searchPath = functionSearchPath(segment);
     out.push({
       name,
+      schema,
+      target,
       isDefiner: /security\s+definer/.test(header),
       returnsTrigger: /returns\s+trigger/.test(header),
       mutates,
@@ -232,6 +251,67 @@ export function searchPathReachesPublicFirst(schemas) {
 }
 
 /**
+ * Render a schema list back into something `SET search_path = …` accepts.
+ *
+ * `functionSearchPath` strips the quotes it parsed, so joining the list with
+ * commas can produce SQL the server rejects: `$user` unquoted is a syntax error,
+ * and a schema with a space in it is two schemas. An identifier that is already
+ * a plain word is emitted VERBATIM — not lowercased, not quoted — because
+ * quoting `App` would change what it resolves to (unquoted `App` folds to `app`,
+ * `"App"` does not).
+ */
+export function renderSearchPath(schemas) {
+  return (schemas ?? [])
+    .map((raw) => {
+      const s = String(raw);
+      return /^[A-Za-z_][A-Za-z0-9_$]*$/.test(s) ? s : `"${s.replace(/"/g, '""')}"`;
+    })
+    .join(', ');
+}
+
+/**
+ * Turn a pinned-but-useless path into one that holds, WITHOUT losing an entry.
+ *
+ * The rule is preserve-then-reorder, in that order of priority:
+ *   - `pg_catalog` goes first: nobody can plant in it, so resolution stops being
+ *     hijackable the moment it gets there.
+ *   - every other schema the author named is kept, in its original relative
+ *     order. Dropping one is not a hardening, it is an outage — measured in
+ *     pglite, replacing a pin of `public, app` with `pg_catalog, public, pg_temp`
+ *     turned a working call into 42P01 relation "thing" does not exist.
+ *   - `public` moves BEHIND those schemas, because `public` is what a
+ *     lower-privileged role can plant in (CREATE on it is granted to PUBLIC out
+ *     of the box on Postgres 14 and earlier). Verified: with the attacker's
+ *     `public.thing` present, `pg_catalog, public, pg_temp` returned PLANTED
+ *     while `pg_catalog, app, public, pg_temp` returned REAL.
+ *   - `pg_temp` goes last, named explicitly, or Postgres searches it FIRST.
+ *
+ * Reordering `public` backwards is not unconditionally safe and the caller must
+ * say so: if the same relation name exists in two of the listed schemas, this
+ * changes which one wins (verified — a `thing` in both schemas flipped from
+ * public's row to app's). That is a change to review, not a drop-in.
+ */
+export function hardenedSearchPath(schemas) {
+  const seen = new Set();
+  const kept = [];
+  for (const raw of schemas ?? []) {
+    const s = String(raw);
+    const k = s.toLowerCase();
+    if (!s || seen.has(k)) continue;
+    seen.add(k);
+    kept.push(s);
+  }
+  const is = (s, w) => String(s).toLowerCase() === w;
+  const named = kept.filter((s) => !is(s, 'pg_catalog') && !is(s, 'pg_temp'));
+  return [
+    'pg_catalog',
+    ...named.filter((s) => !is(s, 'public')),
+    ...named.filter((s) => is(s, 'public')),
+    'pg_temp',
+  ];
+}
+
+/**
  * Function names referenced from inside a `CREATE POLICY` expression.
  *
  * Postgres requires the CALLING role to hold EXECUTE on a function used in a
@@ -293,6 +373,24 @@ export function extractDefinerFunctions(sql) {
 }
 
 /** Does `sql` revoke EXECUTE on function `name` from PUBLIC or anon? */
+/**
+ * Parse a file once, or reuse a parse the caller already did.
+ *
+ * `run()` used to walk the same migration set five times: extractFunctionDefs in
+ * findDefinerGrantViolations, findUnpinnedDefiners, findRlsHelpers and again for
+ * the volatility notes, plus policyReferencedFunctions twice. Measured on a real
+ * 204-file corpus that repetition is only ~24 ms, so this is the small half of
+ * the cost — but it is free to remove and the finders keep their old signatures,
+ * so the unit tests that call them with plain `{name, sql}` arrays still work.
+ */
+function defsOf(file) {
+  return file?.defs ?? extractFunctionDefs(file?.sql ?? '');
+}
+
+function policyFnsOf(file) {
+  return file?.policyFns ?? policyReferencedFunctions(file?.sql ?? '');
+}
+
 export function revokesAnonExecute(sql, name) {
   const lower = sql.toLowerCase();
   const n = name.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -345,10 +443,14 @@ export function findUnpinnedDefiners(files, { baseline = 0, allowlist = [] } = {
 
   for (const file of [...(files ?? [])].sort(compareMigrations)) {
     if (migrationNumber(file.name) <= baseline) continue;
-    for (const fn of extractFunctionDefs(file.sql ?? '')) {
+    for (const fn of defsOf(file)) {
       if (!fn.isDefiner || fn.returnsTrigger) continue; // a trigger has no caller path to hijack
       if (skip.has(fn.name)) continue;
-      const at = { name: fn.name, file: file.name, searchPath: fn.searchPath };
+      const at = {
+        name: fn.name, file: file.name, searchPath: fn.searchPath,
+        // What an ALTER FUNCTION has to name. See extractFunctionDefs.
+        schema: fn.schema ?? null, target: fn.target ?? fn.name,
+      };
       if (fn.searchPath === null) unpinned.push(at);
       else if (!fn.searchPathPinned) publicFirst.push(at);
       else if (omitsTempSchema(fn.searchPath)) noTemp.push(at);
@@ -364,19 +466,46 @@ export function findDefinerGrantViolations(files, { baseline = 0, allowlist = []
 
   // The latest definition of each function name across all history.
   const latest = new Map(); // name -> { isDefiner, returnsTrigger, mutates, file, num }
-  for (const { name: filename, sql } of sorted) {
-    const num = migrationNumber(filename);
-    for (const fn of extractFunctionDefs(sql)) {
-      latest.set(fn.name, { ...fn, file: filename, num });
+  for (const file of sorted) {
+    const num = migrationNumber(file.name);
+    for (const fn of defsOf(file)) {
+      latest.set(fn.name, { ...fn, file: file.name, num });
     }
   }
 
   // Is EXECUTE ever revoked from PUBLIC/anon for a name, anywhere in history?
   // CREATE OR REPLACE preserves grants, so a revoke that appears at all keeps it
   // revoked — the "fixed later in a repair migration" case.
+  //
+  // This loop is names x files, and it used to re-lowercase every migration's
+  // FULL TEXT on every pair: `revokesAnonExecute` lowercases internally, so a
+  // 204-file / 90-name corpus did 18,360 whole-file lowercasings and this one
+  // loop was the clear majority of the guard's runtime (measured 409-830 ms out
+  // of 827 ms; the entire parse pass was 12 ms). `.some()` short-circuits, so
+  // the worst case is precisely the names that are NOT revoked — the ones that
+  // get reported.
+  //
+  // The hoist below changes no result and deliberately does NOT touch the
+  // matcher. `revokesAnonExecute`'s regex is name-anchored and gap-tolerant
+  // (`revoke … on function … <name> … from … public|anon`), which is what makes
+  // `REVOKE EXECUTE ON FUNCTION public.a(uuid), public.b(uuid) FROM PUBLIC, anon;`
+  // count for both a and b. Rewriting it to harvest names out of REVOKE
+  // statements would turn every name form it failed to harvest into a guard that
+  // fires on a migration that DID revoke — the cry-wolf failure this tool must
+  // not have. So: lower each file ONCE (idempotent, the matcher lowercases
+  // anyway) and drop the files with no `revoke` substring at all (the regex is
+  // anchored on that literal, so such a file can never match). Synthetic
+  // 400 files x 800 functions: 463 ms -> 3 ms, byte-identical violations.
+  const revokeTexts = [];
+  for (const { sql } of sorted) {
+    const lower = String(sql ?? '').toLowerCase();
+    if (lower.includes('revoke')) revokeTexts.push(lower);
+  }
   const revoked = new Set();
-  for (const name of latest.keys()) {
-    if (sorted.some(({ sql }) => revokesAnonExecute(sql, name))) revoked.add(name);
+  if (revokeTexts.length > 0) {
+    for (const name of latest.keys()) {
+      if (revokeTexts.some((sql) => revokesAnonExecute(sql, name))) revoked.add(name);
+    }
   }
 
   // Functions used inside a policy expression, anywhere in history. Postgres
@@ -384,8 +513,8 @@ export function findDefinerGrantViolations(files, { baseline = 0, allowlist = []
   // SECURITY DEFINER, so revoking from PUBLIC breaks every read the policy
   // guards. They can never carry a revoke recommendation.
   const rlsHelpers = new Set();
-  for (const { sql } of sorted) {
-    for (const n of policyReferencedFunctions(sql)) rlsHelpers.add(n);
+  for (const file of sorted) {
+    for (const n of policyFnsOf(file)) rlsHelpers.add(n);
   }
 
   // Violation only when the FINAL definition is a mutating, non-trigger
@@ -396,7 +525,14 @@ export function findDefinerGrantViolations(files, { baseline = 0, allowlist = []
     if ((def.num ?? 0) <= baseline) continue;
     if (allow.has(name)) continue;
     if (revoked.has(name)) continue;
-    violations.push({ file: def.file, fn: name, rlsHelper: rlsHelpers.has(name.toLowerCase()) });
+    violations.push({
+      file: def.file,
+      fn: name,
+      // The spelling a REVOKE has to use — `public.` was hardcoded here and
+      // errored 42883 on any function created in another schema.
+      target: def.target ?? name,
+      rlsHelper: rlsHelpers.has(name.toLowerCase()),
+    });
   }
   return violations;
 }
@@ -408,12 +544,12 @@ export function findDefinerGrantViolations(files, { baseline = 0, allowlist = []
 export function findRlsHelpers(files, { baseline = 0 } = {}) {
   const sorted = [...files].sort(compareMigrations);
   const referenced = new Set();
-  for (const { sql } of sorted) for (const n of policyReferencedFunctions(sql)) referenced.add(n);
+  for (const file of sorted) for (const n of policyFnsOf(file)) referenced.add(n);
 
   const latest = new Map();
-  for (const { name: filename, sql } of sorted) {
-    const num = migrationNumber(filename);
-    for (const fn of extractFunctionDefs(sql)) latest.set(fn.name, { ...fn, file: filename, num });
+  for (const file of sorted) {
+    const num = migrationNumber(file.name);
+    for (const fn of defsOf(file)) latest.set(fn.name, { ...fn, file: file.name, num });
   }
   const out = [];
   for (const [name, def] of latest) {
@@ -447,9 +583,15 @@ export function run(config = {}) {
       summary: 'skipped',
     };
   }
+  // Parse each migration ONCE and carry the result. The finders fall back to
+  // parsing when these fields are absent, so calling them directly with plain
+  // `{name, sql}` objects (as the unit tests do) behaves identically.
   const files = readdirSync(dir)
     .filter((f) => f.endsWith('.sql'))
-    .map((f) => ({ name: f, sql: readFileSync(join(dir, f), 'utf8') }));
+    .map((f) => {
+      const sql = readFileSync(join(dir, f), 'utf8');
+      return { name: f, sql, defs: extractFunctionDefs(sql), policyFns: policyReferencedFunctions(sql) };
+    });
   const baseline = config.baseline ?? 0;
   const raw = findDefinerGrantViolations(files, { baseline, allowlist: config.allowlist ?? [] });
   const scanned = files.filter((f) => (migrationNumber(f.name) ?? 0) > baseline).length;
@@ -471,8 +613,21 @@ export function run(config = {}) {
     : {
       where: v.file,
       message: `function "${v.fn}" is SECURITY DEFINER + mutates but EXECUTE is not revoked from PUBLIC/anon`,
+      // Two things this line used to get wrong, both of which make it error
+      // rather than help:
+      //  - `public.` was hardcoded, so a function created as `app.get_priv`
+      //    produced 42883 function public.get_priv() does not exist (pglite).
+      //  - `FROM PUBLIC, anon` names a role that only exists on Supabase. On a
+      //    plain Postgres the whole statement aborts with 42704 role "anon" does
+      //    not exist, so the revoke does not happen at all. Revoking from PUBLIC
+      //    is what actually closes this — the grant lives on PUBLIC and anon
+      //    inherits it, which is the entire premise of this guard — so PUBLIC
+      //    alone is both sufficient and portable. A DIRECT grant to anon is the
+      //    one case that needs more, and that is what the second line is for.
       fix:
-        `In the SAME migration add:  REVOKE EXECUTE ON FUNCTION public.${v.fn}(<args>) FROM PUBLIC, anon;\n` +
+        `In the SAME migration add:  REVOKE EXECUTE ON FUNCTION ${v.target}(<args>) FROM PUBLIC;\n` +
+        `      That is the one that matters: the default grant lives on PUBLIC and anon inherits it, so revoking from anon alone is a no-op.\n` +
+        `      If your project ALSO granted EXECUTE directly to anon/authenticated, revoke from those roles too (naming them unconditionally fails with 42704 on a non-Supabase database).\n` +
         `      If it is intentionally pre-auth, add "${v.fn}" to definerGrants.allowlist[] in your tenant-guard config.`,
     }));
 
@@ -481,7 +636,7 @@ export function run(config = {}) {
   // says nothing about what the callee does.
   for (const file of [...files].sort(compareMigrations)) {
     if (migrationNumber(file.name) <= baseline) continue;
-    for (const fn of extractFunctionDefs(file.sql ?? '')) {
+    for (const fn of defsOf(file)) {
       if (!fn.isDefiner || fn.returnsTrigger || !fn.mutationUnknown) continue;
       if ((config.allowlist ?? []).includes(fn.name)) continue;
       volatilityNotes.push({
@@ -502,13 +657,31 @@ export function run(config = {}) {
   const spNotes = [];
 
   for (const fn of sp.publicFirst) {
+    // Build the replacement path FROM the one the author wrote. The old string
+    // was a hardcoded `pg_catalog, public, pg_temp` that ignored fn.searchPath
+    // entirely, and on a pin of `public, app` it did both possible wrong things
+    // at once (measured in pglite, plpgsql body, plant made before the first
+    // call): with the attacker's public.thing present the "fixed" function
+    // returned PLANTED, and with it absent the function returned 42P01 relation
+    // "thing" does not exist. The preserve-and-reorder path returned the real
+    // row in both states.
+    const hardened = hardenedSearchPath(fn.searchPath);
+    const moved = hardened.filter(
+      (s) => !['pg_catalog', 'pg_temp', 'public'].includes(String(s).toLowerCase()),
+    );
     spNotes.push({
       where: fn.file,
       message:
-        `"${fn.name}" is SECURITY DEFINER and pins search_path = ${fn.searchPath.join(', ')} — which resolves through "public" first, so the pin protects nothing. ` +
+        `"${fn.name}" is SECURITY DEFINER and pins search_path = ${renderSearchPath(fn.searchPath)} — which resolves through "public" first, so the pin protects nothing. ` +
         `Verified against a real database: a definer function pinned this way returned a table planted by a lower-privileged role; the same function with its own schema first returned the real one. ` +
         `On Postgres 14 and earlier "public" is writable by every role out of the box (CREATE is granted to PUBLIC by default; changed in 15).`,
-      fix: `Put a schema nobody can plant in first, and name pg_temp so it is searched last:  ALTER FUNCTION public.${fn.name}(<args>) SET search_path = pg_catalog, public, pg_temp;`,
+      fix:
+        `Keep every schema it already names, put one nobody can plant in first, and name pg_temp so it is searched last:\n` +
+        `      ALTER FUNCTION ${fn.target}(<args>) SET search_path = ${renderSearchPath(hardened)};\n`
+        + (moved.length > 0
+          ? `      Review before applying: this moves "public" BEHIND ${moved.map((s) => `"${s}"`).join(', ')}. `
+            + `If the same relation name exists in more than one of those schemas the function will now read a different one — verified, a table present in both flipped which row came back.`
+          : `      Nothing is dropped or reordered relative to the schemas it reads; this only adds pg_catalog in front and pg_temp behind.`),
     });
   }
 
@@ -519,17 +692,29 @@ export function run(config = {}) {
         `"${fn.name}" is SECURITY DEFINER and pins search_path = ${fn.searchPath.join(', ')}, which does not name pg_temp — so the pin is incomplete. ` +
         `Postgres searches pg_temp BEFORE every schema you list unless you name it, and TEMP on the database is granted to PUBLIC by default, so a temp table shadows an unqualified name inside the function with no CREATE privilege needed anywhere. ` +
         `Measured: pinned "pg_catalog, app" the function ran a planted temp table; with pg_temp named last it ran the real one.`,
-      fix: `ALTER FUNCTION public.${fn.name}(<args>) SET search_path = ${fn.searchPath.join(', ')}, pg_temp;`,
+      // This bucket already preserved the path; only the hardcoded `public.`
+      // qualifier and the unquoted join needed fixing.
+      fix: `ALTER FUNCTION ${fn.target}(<args>) SET search_path = ${renderSearchPath([...fn.searchPath, 'pg_temp'])};`,
     });
   }
 
   for (const fn of sp.unpinned) {
+    // There is no path to preserve here, so the suggestion is a STARTING POINT,
+    // not a drop-in, and it has to say so: a pin REPLACES the caller's path, and
+    // any unqualified name that used to resolve through it now fails with 42P01
+    // if its schema is not listed. The best guess available statically is the
+    // schema the function itself was created in.
+    const own = fn.schema && String(fn.schema).toLowerCase() !== 'public' ? [fn.schema] : [];
+    const suggested = hardenedSearchPath([...own, 'public']);
     spNotes.push({
       where: fn.file,
       message:
         `"${fn.name}" is SECURITY DEFINER with no SET search_path. Unqualified names inside it resolve through the CALLER's path, so a caller who can create objects makes it operate on THEIRS — running as the owner, with RLS bypassed. ` +
         `Whether anyone can is not visible from migrations: run \`tenant-guard rpc\` against a database to settle it, and \`tenant-guard creates\` for the CREATE grants that are the precondition.`,
-      fix: `ALTER FUNCTION public.${fn.name}(<args>) SET search_path = pg_catalog, public, pg_temp;`,
+      fix:
+        `ALTER FUNCTION ${fn.target}(<args>) SET search_path = ${renderSearchPath(suggested)};\n` +
+        `      Check that list against the body first — a pin REPLACES the caller's path, so every schema this function reads unqualified has to be named or the call fails with 42P01 relation … does not exist. ` +
+        `Add them BEFORE "public", which is the one a lower-privileged role can plant in.`,
     });
   }
 

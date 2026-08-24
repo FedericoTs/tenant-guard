@@ -63,6 +63,8 @@ export function triggersSql(schemas) {
       select n.nspname     as schema,
              c.relname     as table,
              t.tgname      as trigger,
+             t.tgtype      as tgtype,
+             fn.nspname    as function_schema,
              p.proname     as function,
              p.prosecdef   as security_definer,
              p.prosrc      as body
@@ -70,12 +72,41 @@ export function triggersSql(schemas) {
       join pg_catalog.pg_class c on c.oid = t.tgrelid
       join pg_catalog.pg_namespace n on n.oid = c.relnamespace
       join pg_catalog.pg_proc p on p.oid = t.tgfoid
+      join pg_catalog.pg_namespace fn on fn.oid = p.pronamespace
       where not t.tgisinternal
         and n.nspname = any($1)
       order by n.nspname, c.relname, t.tgname
     `,
     values: [schemas],
   };
+}
+
+/**
+ * Can this trigger cancel the row by returning NULL?
+ *
+ * Only a ROW trigger that fires BEFORE, or an INSTEAD OF row trigger on a view.
+ * Everywhere else the return value is discarded, so `RETURN NULL` is a no-op and
+ * counting it as enforcement reports a trigger that decides nothing.
+ *
+ * Measured in pglite by reading pg_trigger.tgtype directly:
+ *   BEFORE ... FOR EACH ROW        = 7   (0b0000111)  bit1 ROW, bit2 BEFORE
+ *   AFTER ... FOR EACH ROW         = 5   (0b0000101)  bit1 ROW
+ *   AFTER ... FOR EACH STATEMENT   = 4   (0b0000100)
+ *   BEFORE ... FOR EACH STATEMENT  = 6   (0b0000110)
+ *   INSTEAD OF ... FOR EACH ROW    = 69  (0b1000101)  bit1 ROW, bit64 INSTEAD
+ * Confirmed separately that `RETURN NULL` from an AFTER row trigger cancels
+ * nothing: the INSERT it "rejected" was still in the table afterwards.
+ *
+ * Unknown tgtype (undefined/null — a caller passing a hand-built trigger, or an
+ * older row shape) returns true. Erring toward "it can cancel" keeps this from
+ * silently dropping real findings; the visibility measurement still has to agree
+ * before anything is reported.
+ */
+export function cancelsRowOnNull(tgtype) {
+  if (tgtype === undefined || tgtype === null) return true;
+  const n = Number(tgtype);
+  if (!Number.isFinite(n)) return true;
+  return (n & 1) !== 0 && ((n & 2) !== 0 || (n & 64) !== 0);
 }
 
 /** Tables with RLS on — the ones whose rows a trigger may not fully see. */
@@ -95,34 +126,180 @@ export function rlsTablesSql(schemas) {
 /**
  * Does this body ENFORCE anything, or does it just record?
  *
- * `RAISE` aborts the statement; `RETURN NULL` from a BEFORE trigger cancels the
- * row. Both mean the function's decision is load-bearing. A trigger that only
- * stamps a column reads the same tables and is not a finding — requiring this
- * signal is what keeps the guard off every `set_updated_at` in the schema.
+ * `RAISE` aborts the statement wherever it fires. `RETURN NULL` only cancels the
+ * row where the return value is honoured, which is why `tgtype` is a parameter:
+ * see cancelsRowOnNull. Both mean the function's decision is load-bearing. A
+ * trigger that only stamps a column reads the same tables and is not a finding —
+ * requiring this signal is what keeps the guard off every `set_updated_at`.
+ *
+ * `tgtype` is optional so the exported helper stays usable without a pg_trigger
+ * row; omitted, `RETURN NULL` counts, as it did before.
  */
-export function enforcesSomething(body) {
+export function enforcesSomething(body, tgtype) {
   const s = String(body ?? '');
-  return /\braise\s+(exception|error)\b/i.test(s) || /\breturn\s+null\b/i.test(s);
+  if (/\braise\s+(exception|error)\b/i.test(s)) return true; // aborts wherever it fires
+  // `RETURN NULL` only enforces where the return value is honoured. An
+  // append-only audit trigger (AFTER INSERT, writes a row, RETURN NULL) used to
+  // land here and get reported as enforcing a rule it does not enforce.
+  return /\breturn\s+null\b/i.test(s) && cancelsRowOnNull(tgtype);
 }
 
-/** Which of the RLS-protected tables this body reads by name. */
-export function tablesRead(body, rlsTables = []) {
+/**
+ * Split a plpgsql body into executable code and the string literals that are
+ * arguments to EXECUTE.
+ *
+ * Written here rather than reusing `stripSqlComments` because that helper runs
+ * before quoting is known, so a `--` inside a message literal
+ * (`raise exception 'a--b'`) eats the closing quote and desynchronises
+ * everything after it. One pass that tracks quoting AND comments together is the
+ * only version that survives real trigger bodies.
+ *
+ * Dollar-quoting is recognised (`$$`, `$tag$`) but `$1` placeholders are not,
+ * since the tag must be an identifier or empty. Block comments nest, as in
+ * Postgres.
+ */
+export function splitBody(body) {
   const s = String(body ?? '');
+  let code = '';
+  const dynamic = [];
+  let stmtStart = 0; // offset in `code` where the current statement began
+  let pending = []; // literals seen in the statement being scanned
+  let i = 0;
+  // Literals of ONE statement are joined back together, because that is what
+  // `||` does at runtime: `execute 'select 1 from ' || quote_ident('profiles')`
+  // is a read of profiles, and scanning the fragments separately misses it.
+  // Statements stay apart so two unrelated strings cannot form a phantom read.
+  const endStatement = () => {
+    if (pending.length && /\bexecute\b/i.test(code.slice(stmtStart))) dynamic.push(pending.join(' '));
+    pending = [];
+    stmtStart = code.length;
+  };
+  while (i < s.length) {
+    const ch = s[i];
+    if (ch === '-' && s[i + 1] === '-') {
+      const nl = s.indexOf('\n', i);
+      i = nl === -1 ? s.length : nl;
+      code += ' ';
+      continue;
+    }
+    if (ch === '/' && s[i + 1] === '*') {
+      let depth = 1;
+      i += 2;
+      while (i < s.length && depth > 0) {
+        if (s[i] === '/' && s[i + 1] === '*') { depth++; i += 2; continue; }
+        if (s[i] === '*' && s[i + 1] === '/') { depth--; i += 2; continue; }
+        i++;
+      }
+      code += ' ';
+      continue;
+    }
+    if (ch === '"') {
+      // A quoted identifier is code, not text — and consuming it here is also
+      // what stops a `--` or a `'` inside one from desynchronising the scan.
+      let j = i + 1;
+      let ident = '"';
+      while (j < s.length) {
+        if (s[j] === '"' && s[j + 1] === '"') { ident += '""'; j += 2; continue; }
+        if (s[j] === '"') break;
+        ident += s[j];
+        j++;
+      }
+      code += `${ident}"`;
+      i = j + 1;
+      continue;
+    }
+    if (ch === "'") {
+      let j = i + 1;
+      let lit = '';
+      while (j < s.length) {
+        if (s[j] === "'" && s[j + 1] === "'") { lit += "'"; j += 2; continue; }
+        if (s[j] === "'") break;
+        lit += s[j];
+        j++;
+      }
+      // Held until the statement ends: it only counts as SQL if this statement
+      // turns out to be an EXECUTE, which the keyword may not have revealed yet.
+      pending.push(lit);
+      code += ' ';
+      i = j + 1;
+      continue;
+    }
+    const dq = ch === '$' ? /^\$([A-Za-z_]\w*)?\$/.exec(s.slice(i)) : null;
+    if (dq) {
+      const tag = dq[0];
+      const end = s.indexOf(tag, i + tag.length);
+      const lit = end === -1 ? s.slice(i + tag.length) : s.slice(i + tag.length, end);
+      pending.push(lit);
+      code += ' ';
+      i = end === -1 ? s.length : end + tag.length;
+      continue;
+    }
+    code += ch;
+    i++;
+    if (ch === ';') endStatement();
+  }
+  endStatement();
+  return { code, dynamic };
+}
+
+/**
+ * Which of the RLS-protected tables this body actually READS.
+ *
+ * Matching the bare name anywhere in `prosrc` reported the textbook append-only
+ * audit trigger — `raise exception 'audit_log is append-only'` reads nothing at
+ * all, and the guard said it was "enforcing a rule by reading public.audit_log
+ * (0 of 4 rows visible)". Changing only the message text silenced it. Same
+ * failure from a `--` comment naming the table.
+ *
+ * So: comments and string literals are removed first, and what is left must sit
+ * in a position where RLS narrows what the statement sees —
+ *   FROM / JOIN / USING            a read
+ *   UPDATE [ONLY] t / DELETE FROM  the row match is RLS-filtered, so also a read
+ *   MERGE INTO t                   the ON clause matches against visible rows
+ * `INSERT INTO t` is deliberately absent: a VALUES insert consults no row of the
+ * target, and counting the write target as a read is what put an append-only
+ * audit trigger on the failure list. A read of that same table elsewhere in the
+ * body (`insert into t select … from t`) still matches on the FROM.
+ *
+ * `(?!\s*=)` drops `RAISE … USING message = '…'`, where the option keyword after
+ * USING would otherwise look like a relation.
+ */
+export function tablesRead(body, rlsTables = []) {
+  const { code, dynamic } = splitBody(body);
+  const haystack = [code, ...dynamic].join('\n;\n');
   return rlsTables.filter((t) => {
     const bare = t.split('.').pop().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return new RegExp(`\\b${bare}\\b`, 'i').test(s);
+    const re = new RegExp(
+      `\\b(?:from|join|using|merge\\s+into|update(?:\\s+only)?)\\s+` +
+        `(?:"?[A-Za-z_]\\w*"?\\s*\\.\\s*)?"?${bare}"?\\b(?!\\s*=)`,
+      'i',
+    );
+    return re.test(haystack);
   });
 }
 
 /** The verdict for one trigger, given the tables it reads and cannot fully see. */
 export function classifyTrigger({ trigger, hidden, role }) {
   const id = `${trigger.schema}.${trigger.table}`;
+  // The function does NOT have to live in the table's schema, and the ALTER
+  // statements below used to assume it did. Measured: with the function in
+  // `private` and the trigger on `public.profiles`, the emitted
+  // `ALTER FUNCTION public.check_unique_username() SECURITY DEFINER` errored —
+  // and when an unrelated same-named function existed in `public`, it RAN, left
+  // the real function untouched, and promoted the bystander to SECURITY DEFINER.
+  // Fallback to the table schema keeps hand-built trigger objects (tests,
+  // external callers) from rendering `undefined.f()`.
+  const fnSchema = trigger.function_schema ?? trigger.schema;
+  const fn = `${fnSchema}.${trigger.function}`;
+  // The body resolves unqualified names against the TABLE's schema, and may call
+  // helpers unqualified in its OWN schema. Name both; pg_temp stays last.
+  const searchPath = [...new Set(['pg_catalog', trigger.schema, fnSchema])].join(', ');
   return {
     where: `${id} (trigger "${trigger.trigger}")`,
     kind: 'trigger-reads-hidden-rows',
     message:
       `trigger "${trigger.trigger}" on ${id} enforces a rule by reading ${hidden.map((h) => `${h.table} (${h.visible} of ${h.total} rows visible)`).join(', ')}, ` +
-      `and its function "${trigger.function}" is NOT SECURITY DEFINER — so it runs as whoever is writing and sees only what RLS shows them. ` +
+      `and its function "${fn}" is NOT SECURITY DEFINER — so it runs as whoever is writing and sees only what RLS shows them. ` +
       `The check is being evaluated against a partial view of the table, which means it passes on rows it was written to reject. ` +
       `Verified end to end on this exact shape: a uniqueness trigger in invoker mode let the duplicate INSERT through, and the identical trigger marked SECURITY DEFINER raised the exception. ` +
       `Nothing errors and nothing logs — hardening the table is what breaks the guarantee, so the better your RLS gets, the more completely this stops working.`,
@@ -131,8 +308,8 @@ export function classifyTrigger({ trigger, hidden, role }) {
       `        CREATE UNIQUE INDEX ON ${id} (<column>);\n` +
       `      Scope it by the tenant column where the value is only unique per tenant — and note that a unique constraint on a tenant table is itself readable as an existence oracle, which the constraint-oracles guard covers.\n` +
       `      If it has to stay a trigger, SECURITY DEFINER is the mechanism, but it is NOT unconditional:\n` +
-      `        ALTER FUNCTION ${trigger.schema}.${trigger.function}() SECURITY DEFINER;\n` +
-      `        ALTER FUNCTION ${trigger.schema}.${trigger.function}() SET search_path = pg_catalog, ${trigger.schema}, pg_temp;\n` +
+      `        ALTER FUNCTION ${fn}() SECURITY DEFINER;\n` +
+      `        ALTER FUNCTION ${fn}() SET search_path = ${searchPath}, pg_temp;\n` +
       `      SECURITY DEFINER does not bypass RLS — it changes which role RLS is evaluated for. It only fixes this if that role is EXEMPT from the policies on ${id}: the table owner without FORCE ROW LEVEL SECURITY, a superuser, or a BYPASSRLS role. Verified: the same definer trigger owned by a role that merely holds GRANTs on the table still let the duplicate through, so check who owns the function.\n` +
       `      Pin the search_path in the same breath and name pg_temp — a SECURITY DEFINER function without a complete pin is the hijack \`definer-rpc\` reports.\n` +
       `      If this trigger is MEANT to see only the writer's own rows, add "${trigger.trigger}" to triggerVisibility.allowlist[] with that reason.`,
@@ -163,7 +340,7 @@ export async function check({ query, config = {} }) {
   for (const t of triggers) {
     if (t.security_definer === true || t.security_definer === 't') continue; // runs as owner already
     if (allow.has(t.trigger) || allow.has(`${t.schema}.${t.table}.${t.trigger}`)) continue;
-    if (!enforcesSomething(t.body)) continue; // records rather than enforces
+    if (!enforcesSomething(t.body, t.tgtype)) continue; // records rather than enforces
     const reads = tablesRead(t.body, rlsTables);
     if (reads.length) candidates.push({ ...t, reads });
   }

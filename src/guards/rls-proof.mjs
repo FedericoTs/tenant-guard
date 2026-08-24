@@ -204,12 +204,43 @@ export function tenantRowCountSql(schema, table, column, tenantId) {
 
 /**
  * Restricted-role count of ALL rows the acting tenant can SELECT (no tenant
- * filter). Used by the omitted-tenant probe: a NULL-tenant orphan matches no
- * `col = tenant` filter, so only an unfiltered visible count reveals whether the
- * read policy exposes it to this session.
+ * filter).
+ *
+ * NOT the orphan signal any more — see tenantNullVisibleSql. It was, and it was
+ * wrong: an unfiltered delta cannot tell "a NULL-tenant row appeared" from "the
+ * row I inserted was stamped into MY tenant by a BEFORE INSERT trigger and is
+ * therefore visible to me". Kept exported because it is a legitimate generic
+ * helper and callers outside this file import it.
  */
 export function tenantOwnVisibleSql(schema, table) {
   return { text: `select count(*)::int as n from ${qualified(schema, table)}`, values: [] };
+}
+
+/**
+ * Restricted-role count of rows with NO tenant (`col IS NULL`) that this session
+ * can SELECT. This is the orphan signal: it asks the database directly about the
+ * thing the violation claims — a row owned by nobody that this tenant can read —
+ * instead of inferring it from a total-row delta.
+ *
+ * Measured, on the shape that forced the change: table with `organization_id`
+ * nullable, FORCE RLS, one FOR ALL policy whose USING and WITH CHECK are both
+ * `organization_id = current_setting('app.current_tenant', true)`, plus a
+ * `BEFORE INSERT` trigger doing `new.organization_id := coalesce(new.organization_id,
+ * current_setting('app.current_tenant', true))` — the ordinary server-side stamp.
+ * Inserting an explicit NULL there: total visible 2 -> 3 (the old signal fired and
+ * reported an orphan leak), `count(*) where organization_id is null` 0 -> 0 (this
+ * signal stays quiet). Privileged ground truth afterwards: zero NULL-tenant rows.
+ * The trigger runs BEFORE the WITH CHECK, so the row was the acting tenant's own.
+ *
+ * Detection is not lost. On a genuinely leaky table — USING and WITH CHECK both
+ * `... or organization_id is null`, no trigger — this count goes 0 -> 1 and the
+ * violation still fires.
+ */
+export function tenantNullVisibleSql(schema, table, column) {
+  return {
+    text: `select count(*)::int as n from ${qualified(schema, table)} where ${quoteIdent(column)} is null`,
+    values: [],
+  };
 }
 
 /**
@@ -273,8 +304,9 @@ export function insertProbeSql(schema, table, column, otherTenantId) {
  * tenant. A strict policy (`tenant = current`) rejects NULL cleanly — `NULL =
  * 'org_A'` is NULL, not true — but where the column is nullable and the read
  * policy treats NULL as global (`… OR tenant IS NULL`), you get a row nobody owns
- * that every tenant can read. The caller detects it by whether the acting tenant
- * can then SEE the row it just made (own-row count grew) — see probeInsertOmitted.
+ * that every tenant can read. The caller detects it by whether a NULL-TENANT row
+ * is now visible to the acting session — see probeInsertOmitted; it must NOT be
+ * inferred from a total-visible delta, which a stamping trigger also produces.
  * A NOT NULL tenant column makes such orphans schema-impossible (a safe block).
  */
 export function insertOmittedProbeSql(schema, table, column) {
@@ -433,7 +465,9 @@ export function classifyTableResult({ rlsEnabled, policyCount, ownVisible, cross
     leaks.push({
       kind: 'write',
       message: `tenant A's session INSERTed a row with NO tenant ({col} = NULL) and could then read it back — the column is nullable and the read policy treats NULL as global, so this row is owned by nobody and readable by EVERY tenant. A wrong-tenant check misses it because the client simply omits the tenant`,
-      fix: `Make the tenant column NOT NULL, and make the WITH CHECK reject NULL (a bare {col} = current_setting(...) already does, since NULL = x is not true); never write a read policy as "{col} = current OR {col} IS NULL".`,
+      // No literal quotes around {col}: the substitution is quoteIdent output,
+      // already double-quoted, and wrapping it again printed ""organization_id".
+      fix: `Make the tenant column NOT NULL, and make the WITH CHECK reject NULL (a bare {col} = current_setting(...) already does, since NULL = x is not true); never write a read policy as {col} = current OR {col} IS NULL.`,
     });
   }
   if (leaks.length) return { status: 'leak', leaks };
@@ -728,25 +762,35 @@ export async function prove({ query, config = {} }) {
     };
 
     // OMITTED-tenant probe — insert a row with the tenant column NULL and see if
-    // the acting tenant can then READ it. Delta logic is INVERTED vs probeInsert:
-    // here own-count GROWING means the orphan is visible to this session (and so
-    // to every session, since NULL matches no specific tenant) => an everybody-can-
-    // read leak. A NOT NULL violation ON THE TENANT COLUMN means orphans are
-    // schema-impossible (safe); on any OTHER column it's inconclusive.
-    const probeInsertOmitted = async (insSql, insValues, ownCountSql, ownCountValues, tenantColumn) => {
+    // the acting tenant can then READ a NULL-TENANT row. Delta logic is INVERTED
+    // vs probeInsert: here the count GROWING means the orphan is visible to this
+    // session (and so to every session, since NULL matches no specific tenant) =>
+    // an everybody-can-read leak. A NOT NULL violation ON THE TENANT COLUMN means
+    // orphans are schema-impossible (safe); on any OTHER column it's inconclusive.
+    //
+    // The counted set is `where <tenant col> is null`, NOT the unfiltered visible
+    // count it used to be. The unfiltered count made this probe fire on correct
+    // code: a `BEFORE INSERT ... new.org_id := coalesce(new.org_id, current_tenant)`
+    // trigger — server-side stamping, i.e. the hardened shape — turns the NULL
+    // into the acting tenant's own row, which is then visible, which grew the
+    // total. Measured on that schema: total 2 -> 3 but NULL-tenant 0 -> 0, and
+    // zero NULL rows existed afterwards by privileged ground truth. The sibling
+    // probeInsert already treated exactly this event as 'blocked' for exactly this
+    // reason ("a trigger rewrote the tenant to the acting one"); this one didn't.
+    const probeInsertOmitted = async (insSql, insValues, nullCountSql, nullCountValues, tenantColumn) => {
       await query('savepoint tg_o', []);
       try {
-        const before = (await q(ownCountSql, ownCountValues))[0].n;
+        const before = (await q(nullCountSql, nullCountValues))[0].n;
         const res = await query(insSql, insValues);
         const affected = res.rowCount ?? res.affectedRows ?? 0;
         if (affected < 1) {
           await query('rollback to savepoint tg_o', []); await query('release savepoint tg_o', []);
           return { outcome: 'blocked' };
         }
-        const after = (await q(ownCountSql, ownCountValues))[0].n;
+        const after = (await q(nullCountSql, nullCountValues))[0].n;
         await query('rollback to savepoint tg_o', []); await query('release savepoint tg_o', []);
-        // Own count grew => this session can see a row it doesn't own (tenant NULL)
-        // => the read policy treats NULL as global => every tenant can read it.
+        // A NULL-tenant row is now visible to this session => the row is owned by
+        // nobody and the read policy exposes it => every tenant can read it.
         return after > before ? { outcome: 'leak' } : { outcome: 'blocked' };
       } catch (err) {
         try { await query('rollback to savepoint tg_o', []); await query('release savepoint tg_o', []); } catch { /* ignore */ }
@@ -902,10 +946,11 @@ export async function prove({ query, config = {} }) {
           const ownCntA = tenantRowCountSql(t.schema, t.table, t.tenantColumn, tenantA);
           insertOutcomes.push(await probeInsert(iA.text, iA.values, ownCntA.text, ownCntA.values));
           // (4) INSERT with the tenant OMITTED (NULL) — the orphan-readable-by-all
-          // case a wrong-tenant probe walks past. Own-visible count grows => leak.
+          // case a wrong-tenant probe walks past. Visible NULL-TENANT count grows
+          // => leak. (Not the total visible count: a stamping trigger grows that.)
           const oA = insertOmittedProbeSql(t.schema, t.table, t.tenantColumn);
-          const ownAllA = tenantOwnVisibleSql(t.schema, t.table);
-          orphanOutcomes.push(await probeInsertOmitted(oA.text, oA.values, ownAllA.text, ownAllA.values, t.tenantColumn));
+          const nullVisA = tenantNullVisibleSql(t.schema, t.table, t.tenantColumn);
+          orphanOutcomes.push(await probeInsertOmitted(oA.text, oA.values, nullVisA.text, nullVisA.values, t.tenantColumn));
           // (5) The positive control, tenant A only — one direction is enough,
           // and running both would report the same policy asymmetry twice.
           const ownIns = insertOwnProbeSql(t.schema, t.table, t.tenantColumn, tenantA);
@@ -927,8 +972,8 @@ export async function prove({ query, config = {} }) {
           const ownCntB = tenantRowCountSql(t.schema, t.table, t.tenantColumn, tenantB);
           insertOutcomes.push(await probeInsert(iB.text, iB.values, ownCntB.text, ownCntB.values));
           const oB = insertOmittedProbeSql(t.schema, t.table, t.tenantColumn);
-          const ownAllB = tenantOwnVisibleSql(t.schema, t.table);
-          orphanOutcomes.push(await probeInsertOmitted(oB.text, oB.values, ownAllB.text, ownAllB.values, t.tenantColumn));
+          const nullVisB = tenantNullVisibleSql(t.schema, t.table, t.tenantColumn);
+          orphanOutcomes.push(await probeInsertOmitted(oB.text, oB.values, nullVisB.text, nullVisB.values, t.tenantColumn));
         }
       } catch (err) {
         if (isPermissionDenied(err)) noAccess = true;

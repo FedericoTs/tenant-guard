@@ -19,17 +19,22 @@ test('roleExistsSql: parameterises the role name', () => {
   assert.deepEqual(s.values, ['anon']);
 });
 
-test('readSurfaceSql: binds role + schema/table, asks for grant AND privileged total', () => {
+// CHANGED in 0.43. These two assertions pinned the shape the emptiness/cap fix
+// removes: `readSurfaceSql` used to require `count(*)::int` over the relation (a
+// full seq scan answering a yes/no question, taken even for relations anon cannot
+// select at all), and `anonSelectCountSql` used to require an unbounded count
+// (scanning past the point at which the verdict, `anonVisible > 0`, stops caring).
+// Both are now asserted for the cheap shape instead; anon-reads-audit.test.mjs
+// holds the tests that fail if the expensive shape ever comes back.
+test('readSurfaceSql: binds role + schema/table, and is catalog-only', () => {
   const s = readSurfaceSql('public', 'invoices', 'anon');
   assert.match(s.text, /has_table_privilege\(\$1,.*'SELECT'\)/);
-  assert.match(s.text, /count\(\*\)::int/);
-  assert.match(s.text, /from "public"\."invoices"/);
   assert.deepEqual(s.values, ['anon', 'public', 'invoices']);
 });
 
-test('anonSelectCountSql: whole-table count, no WHERE', () => {
+test('anonSelectCountSql: whole-relation count (no WHERE), bounded by a LIMIT', () => {
   const c = anonSelectCountSql('public', 'invoices');
-  assert.match(c.text, /^select count\(\*\)::int as n from "public"\."invoices"$/);
+  assert.match(c.text, /^select count\(\*\)::int as n from \(select 1 from "public"\."invoices" limit \d+\) s$/);
   assert.doesNotMatch(c.text, /where/i);
 });
 

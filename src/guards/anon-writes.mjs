@@ -107,9 +107,30 @@ const bool = (v) => v === true || v === 't';
  *     writes pass through. Non-zero for an auto-updatable view, 0 for one with
  *     an aggregate or a join. Measured: a grant-only check calls those writable
  *     too, so it false-positives on every reporting view in the schema.
- *   • `security_invoker` — with it on, the base table's RLS applies to the
- *     caller and the write is refused. Verified both ways: 1 row affected with
- *     it off, 42501 with it on.
+ *   • `security_invoker` — with it ON, the base table's RLS is evaluated as the
+ *     CALLER, and what that yields depends on whether the caller also holds a
+ *     privilege on the BASE table. All four cases measured (PG 18.3 via pglite,
+ *     `SET ROLE anon` inside a rolled-back txn, definer view over an RLS-on
+ *     table whose policy matches nothing for anon):
+ *       invoker off, no base grant -> 1 row affected            <- the leak
+ *       invoker off, base grant    -> 1 row affected            <- the leak
+ *       invoker on,  no base grant -> ERROR 42501, permission denied for the BASE table
+ *       invoker on,  base grant    -> 0 rows affected, and NO error
+ *     So invoker-on is never a leak here, which is why `runsAsOwner` filters
+ *     those rows out — but it is only SOMETIMES an error. This comment used to
+ *     claim the unconditional "42501 with it on"; that holds in the third case
+ *     only, and the third case is the rarer one. `ALTER DEFAULT PRIVILEGES …
+ *     ON TABLES` — the usual origin of this whole bug — grants the base table
+ *     as well as the view (measured: has_table_privilege true for both relkind
+ *     'r' and 'v'), so the caller usually DOES hold the base grant and gets the
+ *     silent zero-row case instead. The fix text in violationForView() states
+ *     this same conditional; the two have to stay in step, and drifting apart
+ *     is exactly what happened between 0.36.0 and here.
+ *     The "never a leak" half is conditional on the base table having RLS on.
+ *     Measured with RLS OFF: invoker on + base grant -> 1 row affected. Still
+ *     not a hole in this filter, because a role that can write the base table
+ *     directly is caught by the TABLE surface above — verified, check() returns
+ *     ok:false naming the base table rather than the view.
  *   • the role's actual privilege.
  */
 export function viewSurfaceSql(schemas, role) {

@@ -35,10 +35,31 @@ export const DEFAULTS = {
 
 // ── pure helpers (unit-tested, no I/O) ───────────────────────────────
 
-/** Strip one layer of surrounding double-quotes from an identifier. */
+/**
+ * Resolve one SQL identifier the way Postgres itself does.
+ *
+ * A double-quoted identifier keeps its exact text; an UNQUOTED one is folded to
+ * LOWER case before it is stored in the catalog. We must apply the same rule to
+ * the declared (migration) side, because the actual side is read straight out of
+ * `pg_policies` / `pg_class`, which only ever holds folded names.
+ *
+ * Measured before this fix: a migration containing the perfectly ordinary
+ * `create table Invoices (...); alter table Invoices enable row level security;
+ * create policy TenantIsolation on Invoices using (...)` — applied verbatim and
+ * nothing else — failed the build with `policy "tenantisolation" exists in the
+ * database but is in NO migration`, plus the mirror-image note claiming the
+ * database did NOT have "TenantIsolation". Both halves of one identifier, both
+ * wrong, on code that was already fully in version control.
+ *
+ * Caveat recorded honestly: toLowerCase() matches Postgres exactly for ASCII.
+ * Postgres folds non-ASCII per the database encoding/locale, so an identifier
+ * with non-ASCII letters can still mismatch. That direction only ever produces a
+ * report, never silence, so it stays a known limit rather than a risk.
+ */
 export function stripQuotes(id) {
   const t = id.trim();
-  return t.startsWith('"') && t.endsWith('"') ? t.slice(1, -1) : t;
+  if (t.length > 1 && t.startsWith('"') && t.endsWith('"')) return t.slice(1, -1);
+  return t.toLowerCase();
 }
 
 /** Normalise a (possibly schema-qualified, possibly quoted) table ref to `schema.table` (default schema `public`). */
@@ -183,9 +204,55 @@ export async function drift({ query, files, config = {} }) {
 }
 
 /**
- * CLI/programmatic entry: read the migration files, resolve a Postgres
- * connection from the environment, dynamically import `pg`, and run the diff.
- * SKIPS cleanly (never fails the build) with no database URL or no `pg`.
+ * How deep under the migrations directory we look for `*.sql`.
+ *
+ * 2 covers every layout we have seen: flat (`supabase/migrations/001.sql`,
+ * `db/migrations/*.sql`) at level 1, and one-directory-per-version at level 2 —
+ * Prisma (`prisma/migrations/<timestamp>_<name>/migration.sql`, which has NO
+ * flat form at all, so this was a 100% miss rate there), Atlas, and Flyway
+ * layouts that group by version directory. Deeper than that and we would start
+ * sweeping in unrelated SQL (seeds, fixtures, snapshots) and reporting their
+ * policies as declared, which would be a false CLEAN — the wrong direction to
+ * be wrong in.
+ */
+const MIGRATION_SCAN_DEPTH = 2;
+
+/**
+ * Collect `{name, sql}` for every migration file, `name` being the path
+ * RELATIVE to the migrations dir with '/' separators.
+ *
+ * Relative path, not basename, on purpose: parseDeclaredState replays
+ * CREATE/DROP in `name` order, and under Prisma EVERY file is called
+ * `migration.sql`, so keying by basename would make create-then-drop ordering
+ * depend on readdir order. The version directory carries the ordering, so it
+ * has to stay in the key. '/' is forced so the sort is identical on Windows.
+ *
+ * `fs` is injected ({readdirSync, readFileSync, join}) so the discovery half can
+ * be tested directly — run() itself needs a live Postgres, which the embedded
+ * pglite used by the rest of the suite cannot speak over a socket.
+ */
+export function collectSqlFiles(fs, dir, depth = MIGRATION_SCAN_DEPTH, prefix = '') {
+  const out = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    const full = fs.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (depth > 1) out.push(...collectSqlFiles(fs, full, depth - 1, rel));
+    } else if (entry.name.endsWith('.sql')) {
+      out.push({ name: rel, sql: fs.readFileSync(full, 'utf8') });
+    }
+  }
+  return out;
+}
+
+/**
+ * CLI/programmatic entry: read the migration files (recursively, see
+ * MIGRATION_SCAN_DEPTH), resolve a Postgres connection from the environment,
+ * dynamically import `pg`, and run the diff.
+ *
+ * SKIPS cleanly (never fails the build, always with a reason that says what was
+ * NOT checked) when: the migrations dir is unset or missing; the dir holds no
+ * readable `*.sql`; there is no database URL; or `pg` is not installed.
  * @param {object} config  see DEFAULTS, plus `migrationsDir` and optional `url`
  */
 export async function run(config = {}) {
@@ -197,7 +264,23 @@ export async function run(config = {}) {
   if (!dir || !existsSync(dir)) {
     return OK({ skipped: true, reason: dir ? `migrations dir not found: ${dir}` : 'no migrations dir configured', summary: 'skipped — no migrations' });
   }
-  const files = readdirSync(dir).filter((f) => f.endsWith('.sql')).map((f) => ({ name: f, sql: readFileSync(join(dir, f), 'utf8') }));
+  const files = collectSqlFiles({ readdirSync, readFileSync, join }, dir, MIGRATION_SCAN_DEPTH, '');
+  // A live catalog diffed against an EMPTY declared set reports every policy in
+  // the database as hand-applied drift. That is the loudest possible wrong
+  // answer, and it is exactly what happened on a stock Prisma layout, where
+  // every migration lives at <dir>/<version>/migration.sql and the old
+  // non-recursive read found zero files (measured: 0 files, ok=false, "2
+  // database RLS setting(s) not in any migration", on a database that matched
+  // its migrations perfectly). Recursion above fixes the Prisma/Atlas/Flyway
+  // case; this short-circuit covers every layout we still cannot read. It is a
+  // SKIP, not a pass: the reason says plainly that nothing was compared.
+  if (files.length === 0) {
+    return OK({
+      skipped: true,
+      reason: `no .sql files under ${dir} (searched ${MIGRATION_SCAN_DEPTH} directory level(s)) — nothing to compare the live catalog against, so RLS drift was NOT checked`,
+      summary: 'skipped — no migration SQL found',
+    });
+  }
 
   const url = cfg.url || process.env[cfg.urlEnv] || process.env.DATABASE_URL;
   if (!url) {

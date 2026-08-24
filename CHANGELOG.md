@@ -1,5 +1,159 @@
 # Changelog
 
+## 0.43.0
+
+**The audit backlog is closed.** 213 candidates across two adversarial rounds,
+107 verified, 105 fixed, 2 left open on purpose with reasons in
+`AUDIT-BACKLOG.md`.
+
+This release is the last 19, plus the packaging debt that had accumulated behind
+them.
+
+### the ones worth naming
+
+`trigger-visibility` was reporting an ordinary append-only audit trigger. Three
+separate causes, all measured: `RETURN NULL` from an AFTER row trigger cancels
+nothing — only BEFORE and INSTEAD OF can, read from `tgtype` — a table named
+inside a string literal counted as a read, and the emitted `ALTER FUNCTION` used
+the TABLE's schema, so with a same-named function in `public` it left the real
+one untouched and promoted an unrelated bystander to SECURITY DEFINER,
+manufacturing the exact surface `definer-rpc` reports.
+
+`default-privileges` only ever created its probe table as the connecting role, so
+`ALTER DEFAULT PRIVILEGES FOR ROLE <migration role>` — the usual shape — was
+never exercised.
+
+`anon-reads` ran `count(*)` over whole tables to answer a question that only
+needed "is this empty": 306ms and 3704 buffers on 300k rows, against 0.05ms and
+2 buffers for the bounded form.
+
+`--json=` with an empty value silently wrote nothing, and `--json="   "` wrote a
+real report into a file named three spaces. Both now exit 2 — the same contract
+as an unknown option, which the shipped Action maps to a workflow-configuration
+failure. Deliberately not mapped to stdout: that would dump a SARIF document
+into the middle of a human run.
+
+### packaging
+
+Thirteen releases were undocumented; the entries above 0.29.0 are written
+retroactively from their commits. `package.json` claimed 22 guards against an
+actual 24.
+
+## 0.42.0
+
+Two contributions from r/Supabase, both from people who had hit the thing they
+were describing.
+
+**Every guard must now prove it CAN fail** (u/Guidondor). His RLS smoke test sat
+green for weeks and the green meant nothing — Postgres was raising a type error
+on the line that built the failure message, so the assertion was unreachable. In
+his words: *a suite that can't fail looks exactly like a suite that passes, and
+you can't tell them apart from the outside.* `test/negative-control.test.mjs`
+now builds, per guard, a database broken in exactly the way that guard exists to
+detect and requires a violation; then the corrected version of the same schema
+and requires silence.
+
+It caught something on the first run, and the catch was ours: the foreign-key
+fixture had no rows in the child table, so the guard correctly reported a note
+rather than claiming a proof it could not make. The fixture only *looked*
+broken.
+
+**`anon` can now be proven unable to list a private bucket** (u/akl773).
+`storage-isolation` did the path-hop and flagged public buckets, but impersonated
+the *authenticated* role for both directions — it never asked whether a visitor
+with no session could list the bucket at all. A policy with no `TO` clause is
+`TO public`, and `public` includes `anon`.
+
+## 0.41.0
+
+57 verified audit findings across twelve guards, fixed one worker per file. The
+recurring shapes: advice that did not work when applied (a `DROP CONSTRAINT` for
+an index with no backing constraint; a fix that made every INSERT into the
+*protected* table fail); guards firing on correct code (globally-unique bearer
+tokens, whose recommended fix would have destroyed the uniqueness a credential
+lookup depends on); and guards reporting clean on real problems (`pooler-bleed`
+skipping when the policy read its GUC through a helper function).
+
+Six findings were rejected on inspection rather than fixed, with reasons.
+
+## 0.40.0
+
+Five places the tool asserted safety it had never tested. Not missed leaks —
+confident greens about probes that never ran, which is the one failure a user
+cannot check for themselves. `column-exposure` reported *"1 relation probed,
+nothing readable"* on a database with no `anon` role, where nothing was probed;
+`trigger-visibility` said *"sees every row, so nothing is missed"* about an empty
+table; `storage-isolation` claimed *"N/N proven isolated"* when the session could
+see none of its own objects.
+
+## 0.39.0
+
+Seven more false negatives. Each is a place where a guard stopped looking early —
+at `pg_catalog`, at a declared volatility, at a read probe, at the first error,
+at a bare object name. Notably: `rls-proof` counted single-tenant tables toward
+"proven isolated (read + write)" on a read probe alone, and `anon-writes`' DELETE
+probe was silently defeated by any foreign key.
+
+## 0.38.0
+
+Advice that did not work when applied, and two guards that fired on correct code.
+`rls-proof`'s policy would not compile against a `uuid` tenant column (42883);
+its write-leak fix said "add a FOR ALL policy", which changes nothing because
+permissive policies OR; `view-isolation`'s `security_invoker` fix took the
+legitimate tenant from reading its own row to 42501.
+
+## 0.37.0
+
+Four ways the tool reported GREEN on a proven leak. Missing savepoints meant one
+erroring probe poisoned an entire scan — whether a leak failed the build was
+decided by *alphabetical order*. The uuid control-arm sentinel discarded an
+already-measured cross-tenant read. Column-level grants were invisible to the
+whole anon surface.
+
+## 0.36.0
+
+Four pieces of advice that were wrong, found by fact-checking a write-up before
+publishing it. Chiefly: a `search_path` pinned to `pg_catalog, <schema>` is still
+hijackable, because `pg_temp` is searched before every listed schema unless named
+explicitly, and TEMP is granted to PUBLIC by default.
+
+## 0.35.0
+
+`trigger-visibility` — triggers that enforce a rule by reading a table RLS hides
+from them. A trigger function runs as the invoker unless declared SECURITY
+DEFINER, so a uniqueness check sees only what the writer sees. Harden the table
+and the check stops finding collisions: the duplicate is *inserted*, and nothing
+errors.
+
+## 0.34.0
+
+Views are part of the write surface. `anon-writes` scanned `relkind in ('r','p')`
+and returned OK where `anon` could DELETE through a view over an RLS-protected
+table.
+
+## 0.33.0
+
+A positive control in `rls-proof`. Isolation fails in two directions, and the
+tool named one: a policy that is too *tight* never leaks anything and still
+breaks the product.
+
+## 0.32.0
+
+A `search_path` pinned to a writable schema is not a pin. Verified: pinned
+`= public, app` with `public` writable returned an attacker's planted table.
+
+## 0.31.0
+
+`column-exposure` — sensitive columns `anon` actually reads, on relations with no
+tenant column, which every tenancy guard skips by construction. Grant-based
+detection was measured failing first: one table-level `GRANT SELECT` expands to
+every column in `information_schema.column_privileges`.
+
+## 0.30.0
+
+`anon-writes` and `rls-drift` skipped partitioned parents — a recurrence of the
+same `relkind` class fixed in `rls-proof` long before.
+
 ## 0.29.0
 
 More of the MonkeyTravel brief — and reviewing it turned up **two real bugs in

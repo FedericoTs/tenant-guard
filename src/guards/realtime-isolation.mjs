@@ -141,10 +141,66 @@ export function publicationTablesSql(tenantColumns) {
 }
 
 /**
+ * The remediation preamble both leak arms share.
+ *
+ * Measured, not assumed. In pglite (PG 18.3) with
+ * `create policy p_all on realtime.messages for select using (true)` already present,
+ * this guard's previous advice — a bare `CREATE POLICY ... USING (split_part(...) = ...)`
+ * — applied verbatim left check() at ok:false with a byte-identical violation. The
+ * statement that flipped it to ok:true was `drop policy p_all`. Same result on the write
+ * arm starting from `for insert with check (true)`.
+ *
+ * The reason is that Postgres OR-combines PERMISSIVE policies: a new permissive policy
+ * can only ever ADD access, never remove it. So advice that says nothing but CREATE
+ * POLICY is advice that provably does not work on the codebase that triggered the
+ * finding — every real project already has the loose policy, which is why the guard
+ * fired in the first place.
+ *
+ * The DROP step is deliberately conditional ("whose <clause> does not pin ...") instead
+ * of naming policies. A permissive policy can be correctly scoped through a helper
+ * function that never mentions split_part, and telling someone to drop that would take
+ * their app down — a strictly worse failure than leaving the leak one more day. The
+ * enumeration query puts the real expressions in front of them so they decide.
+ *
+ * @param {string} cmd        'SELECT' | 'INSERT'
+ * @param {string} clause     'USING' | 'WITH CHECK' — the clause that actually governs `cmd`
+ * @param {string} topicExpr  the SAME expression the detection probe used
+ */
+function orCombinePreamble(cmd, clause, topicExpr) {
+  return (
+    `Adding a policy is NOT enough on its own. Postgres OR-combines permissive policies, so a permissive ${cmd} policy that does not pin the topic keeps granting every channel no matter what you add beside it — verified: with a \`${clause} (true)\` policy present, adding the policy below left exactly the same violation, and dropping the loose one was what fixed it.\n` +
+    `  1. Read the policies already on the table, and what they actually allow:\n` +
+    `       SELECT polname, polcmd, polpermissive,\n` +
+    `              pg_get_expr(polqual, polrelid)      AS using_expr,\n` +
+    `              pg_get_expr(polwithcheck, polrelid) AS check_expr\n` +
+    `         FROM pg_policy WHERE polrelid = 'realtime.messages'::regclass;\n` +
+    `  2. DROP POLICY "<name>" ON realtime.messages;   -- for each PERMISSIVE one covering ${cmd}\n` +
+    `                                                  -- whose ${clause} does not pin ${topicExpr}\n` +
+    `     Do NOT reach for AS RESTRICTIVE as the whole remedy: a restrictive policy only subtracts,\n` +
+    `     so with no permissive grant beside it every client is locked out of every channel.\n` +
+    `  3. Then add the scoped policy:`
+  );
+}
+
+/**
  * Verdict for the broadcast surface.
+ *
+ * `separator` is threaded in so the RECOMMENDED predicate is built from the same
+ * `topicTenantExpr()` the DETECTION probe used, and the two can no longer drift. It was
+ * hardcoded to ':' while detection honoured the configured value: measured on
+ * `{ topicSeparator: '-' }`, the guard derived tenant `org_A` from topic
+ * `org_A-notifications`, then printed a policy whose `split_part(topic, ':', 1)`
+ * evaluates to the whole string `org_A-notifications` — equal to no tenant id. Applying
+ * it literally gave own-tenant rows visible 0 and other-tenant rows 0, where the correct
+ * segment gives 1 and 0. An "isolating" policy that blanks the table is precisely what
+ * gets a developer to loosen it again.
+ *
  * @returns {{status:'leak'|'isolated'|'insufficient-data'|'no-access'|'no-policy', kind?:string, message?:string, fix?:string}}
  */
-export function classifyRealtime({ rlsEnabled, policyCount, tenantCount, crossVisible, broadcastIntoOther, ownBroadcastWorked, noAccess, role = 'authenticated' }) {
+export function classifyRealtime({ rlsEnabled, policyCount, tenantCount, crossVisible, broadcastIntoOther, ownBroadcastWorked, noAccess, role = 'authenticated', separator = DEFAULTS.topicSeparator }) {
+  // Throws on an unsafe separator exactly as the detection path does. check() validates
+  // before any I/O, so by the time we get here this is belt-and-braces.
+  const topicExpr = topicTenantExpr(separator);
   if (rlsEnabled === false) {
     return {
       status: 'leak',
@@ -154,9 +210,16 @@ export function classifyRealtime({ rlsEnabled, policyCount, tenantCount, crossVi
         `Enable RLS and scope channel access by the topic's tenant segment:\n` +
         `        ALTER TABLE realtime.messages ENABLE ROW LEVEL SECURITY;\n` +
         `        CREATE POLICY tenant_channels ON realtime.messages FOR SELECT\n` +
-        `          USING (split_part(topic, ':', 1) = <the caller's tenant>);\n` +
+        `          USING (${topicExpr} = <the caller's tenant>);\n` +
         `        CREATE POLICY tenant_publish ON realtime.messages FOR INSERT\n` +
-        `          WITH CHECK (split_part(topic, ':', 1) = <the caller's tenant>);`,
+        `          WITH CHECK (${topicExpr} = <the caller's tenant>);\n` +
+        `      Then look at what ENABLE just switched on. Policies can sit on a table while RLS is\n` +
+        `      off and go live the moment you enable it; any permissive one that does not pin\n` +
+        `      ${topicExpr} is OR-ed in beside yours and re-opens every channel:\n` +
+        `        SELECT polname, polcmd, polpermissive,\n` +
+        `               pg_get_expr(polqual, polrelid)      AS using_expr,\n` +
+        `               pg_get_expr(polwithcheck, polrelid) AS check_expr\n` +
+        `          FROM pg_policy WHERE polrelid = 'realtime.messages'::regclass;`,
     };
   }
   if (policyCount === 0) {
@@ -170,9 +233,9 @@ export function classifyRealtime({ rlsEnabled, policyCount, tenantCount, crossVi
       kind: 'read',
       message: `a session acting as one tenant read ${crossVisible} message(s) on ANOTHER tenant's channel — the SELECT policy on realtime.messages does not pin the topic's tenant segment, so any client can subscribe to any tenant's broadcast and presence traffic`,
       fix:
-        `Scope channel reads by the topic:\n` +
-        `        CREATE POLICY tenant_channels ON realtime.messages FOR SELECT\n` +
-        `          USING (split_part(topic, ':', 1) = <the caller's tenant>);`,
+        `Scope channel reads by the topic. ${orCombinePreamble('SELECT', 'USING', topicExpr)}\n` +
+        `       CREATE POLICY tenant_channels ON realtime.messages FOR SELECT\n` +
+        `         USING (${topicExpr} = <the caller's tenant>);`,
     };
   }
   if (broadcastIntoOther) {
@@ -181,9 +244,10 @@ export function classifyRealtime({ rlsEnabled, policyCount, tenantCount, crossVi
       kind: 'write',
       message: `a session acting as one tenant PUBLISHED into ANOTHER tenant's channel. The client chooses the topic when it joins, so unless the INSERT policy pins the tenant segment, any user can inject events into anyone's live channel — pushing fabricated updates straight into another tenant's running app. Reads being correctly scoped does not prevent this`,
       fix:
-        `Pin the topic on publish as well as subscribe — INSERT is governed only by WITH CHECK:\n` +
-        `        CREATE POLICY tenant_publish ON realtime.messages FOR INSERT\n` +
-        `          WITH CHECK (split_part(topic, ':', 1) = <the caller's tenant>);`,
+        `Pin the topic on publish as well as subscribe — INSERT is governed only by WITH CHECK. ` +
+        `${orCombinePreamble('INSERT', 'WITH CHECK', topicExpr)}\n` +
+        `       CREATE POLICY tenant_publish ON realtime.messages FOR INSERT\n` +
+        `         WITH CHECK (${topicExpr} = <the caller's tenant>);`,
     };
   }
   return { status: 'isolated', ownBroadcastWorked };
@@ -233,7 +297,7 @@ export async function check({ query, config = {} }) {
   const policyCount = rlsRow ? Number(rlsRow.policy_count || 0) : 0;
 
   if (rlsEnabled === false) {
-    const v = classifyRealtime({ rlsEnabled: false, role });
+    const v = classifyRealtime({ rlsEnabled: false, role, separator: sep });
     violations.push({ where: 'realtime.messages', kind: v.kind, message: v.message, fix: v.fix });
     return { id: meta.id, ok: false, violations, notes, scanned: 1, summary: '1 realtime isolation issue (RLS is off on realtime.messages)' };
   }
@@ -242,7 +306,7 @@ export async function check({ query, config = {} }) {
     // SUBJECT to RLS. Returning here skipped the identity canary below, so a
     // configured role that bypasses RLS — a superuser, BYPASSRLS, or the table
     // owner — got a green verdict asserting a denial that does not apply to it.
-    notes.push({ where: 'realtime.messages', message: classifyRealtime({ rlsEnabled: true, policyCount: 0, role }).message });
+    notes.push({ where: 'realtime.messages', message: classifyRealtime({ rlsEnabled: true, policyCount: 0, role, separator: sep }).message });
     notes.push({
       where: `role "${role}"`,
       message: `this verdict is read from the catalog, not probed. It holds only if "${role}" is subject to RLS — a superuser, a BYPASSRLS role, or the owner of realtime.messages reads it regardless of the policy count. Confirm the configured role is the one your clients actually connect as.`,
@@ -258,7 +322,7 @@ export async function check({ query, config = {} }) {
     const dt = distinctTopicTenantsSql(sep, cfg.sampleLimit);
     const tenants = (await q(dt.text, [cfg.sampleLimit])).map((r) => r.t).filter((t) => t && !skip.has(t));
     if (tenants.length < 2) {
-      notes.push({ where: 'realtime.messages', message: classifyRealtime({ rlsEnabled: true, policyCount, tenantCount: tenants.length, role }).message });
+      notes.push({ where: 'realtime.messages', message: classifyRealtime({ rlsEnabled: true, policyCount, tenantCount: tenants.length, role, separator: sep }).message });
       try { await query('rollback', []); } catch { /* ignore */ }
       return { id: meta.id, ok: true, violations, notes, scanned, summary: 'realtime.messages not proven — fewer than two tenants have channel traffic (see notes)' };
     }
@@ -321,7 +385,7 @@ export async function check({ query, config = {} }) {
     if (probeError) {
       notes.push({ where: 'realtime.messages', message: `could not probe — check role/becomeTenant: ${probeError}` });
     } else {
-      const verdict = classifyRealtime({ rlsEnabled: true, policyCount, tenantCount: tenants.length, crossVisible, broadcastIntoOther, ownBroadcastWorked, noAccess, role });
+      const verdict = classifyRealtime({ rlsEnabled: true, policyCount, tenantCount: tenants.length, crossVisible, broadcastIntoOther, ownBroadcastWorked, noAccess, role, separator: sep });
       if (verdict.status === 'leak') {
         violations.push({ where: 'realtime.messages', kind: verdict.kind, message: verdict.message, fix: verdict.fix, crossVisible });
       } else if (verdict.status === 'isolated') {

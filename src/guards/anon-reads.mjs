@@ -54,21 +54,70 @@ export function roleExistsSql(role) {
   return { text: `select 1 from pg_catalog.pg_roles where rolname = $1`, values: [role] };
 }
 
-/** Whether `role` holds a SELECT grant on a table, plus its total row count seen
- *  by the PRIVILEGED connection (to tell "anon sees none of N" from "empty"). */
+/**
+ * Whether `role` holds a SELECT grant. CATALOG ONLY — it does not touch the
+ * relation's heap.
+ *
+ * It used to carry `(select count(*)::int from <rel>) as total` as well, run once
+ * per relation before we drop to `anon`. That number had exactly one consumer,
+ * `classifyRead`'s `total === 0` emptiness test, so a full seq scan was paid to
+ * answer a yes/no question — and paid even for relations `anon` holds no grant on,
+ * where `classifyRead` returns 'safe' at its first line without ever looking at it.
+ * Measured under PGlite on a 300k-row table: `count(*)` planned as Aggregate over
+ * Seq Scan, 3704 shared buffers, 306 ms; `exists(select 1 ...)` planned as an
+ * InitPlan that stops at the first row, 2 buffers, 0.05 ms. Emptiness now lives in
+ * `nonEmptySql` and is asked only when the answer can change the verdict.
+ *
+ * Splitting them also removes a spurious "not examined" note: a materialized view
+ * created WITH NO DATA raises 55000 on any read, so the old combined query failed
+ * for such a matview even when `anon` had no grant on it — a case the catalog
+ * alone settles conclusively (no grant ⇒ safe).
+ */
 export function readSurfaceSql(schema, table, role) {
   return {
     text:
       `select (has_table_privilege($1, format('%I.%I', $2::text, $3::text), 'SELECT') or has_any_column_privilege($1, format('%I.%I', $2::text, $3::text), 'SELECT')) as can_select, ` +
-      `has_table_privilege($1, format('%I.%I', $2::text, $3::text), 'SELECT') as can_select_all, ` +
-      `(select count(*)::int from ${qualified(schema, table)}) as total`,
+      `has_table_privilege($1, format('%I.%I', $2::text, $3::text), 'SELECT') as can_select_all`,
     values: [role, schema, table],
   };
 }
 
-/** Restricted-role probe: how many rows can `anon` actually SELECT. No WHERE. */
-export function anonSelectCountSql(schema, table) {
-  return { text: `select count(*)::int as n from ${qualified(schema, table)}`, values: [] };
+/**
+ * "Does this relation hold at least one row?", asked as the PRIVILEGED role.
+ * Its only job is to tell "anon sees none of N rows" (safe) from "the table is
+ * empty, so the probe proved nothing" (not-proven). A boolean, never a count —
+ * no caller has ever rendered the number.
+ */
+export function nonEmptySql(schema, table) {
+  return { text: `select exists(select 1 from ${qualified(schema, table)}) as nonempty`, values: [] };
+}
+
+/**
+ * Upper bound on the rows the anon probe counts.
+ *
+ * The verdict only ever asks `anonVisible > 0`, so counting past the bound buys
+ * nothing but a full scan of a relation we have just proven is readable by the
+ * unauthenticated internet — i.e. the unbounded form was slowest precisely on the
+ * databases that are broken. Measured on 300k rows: unbounded `count(*)` 306 ms /
+ * 3704 buffers vs bounded 1.7 ms / 14 buffers. When the bound is hit the message
+ * reads "1000+", never a wrong exact number.
+ */
+export const ANON_PROBE_CAP = 1000;
+
+/**
+ * Restricted-role probe: how many rows can `anon` actually SELECT, counted up to
+ * `cap + 1`. No WHERE — RLS still applies to the inner scan, so detection is
+ * identical to the unbounded form; only the reported magnitude saturates. `cap` is
+ * forced to a safe positive integer before interpolation: it is a literal, not a
+ * bind parameter, because a LIMIT inside a sub-select cannot take `$n` on every
+ * driver path this guard runs under (PGlite's simple-protocol path included).
+ */
+export function anonSelectCountSql(schema, table, cap = ANON_PROBE_CAP) {
+  const n = Number.isSafeInteger(cap) && cap > 0 ? cap : ANON_PROBE_CAP;
+  return {
+    text: `select count(*)::int as n from (select 1 from ${qualified(schema, table)} limit ${n + 1}) s`,
+    values: [],
+  };
 }
 
 /**
@@ -81,9 +130,13 @@ export function anonSelectCountSql(schema, table) {
  * so applying it would false-flag a perfectly-safe `security_invoker` view over an
  * RLS'd table. Views are therefore always judged by the PROBE.
  *
+ * `nonempty` is the emptiness answer (see `nonEmptySql`). `total` is the pre-0.43
+ * numeric form of the same question and is still honoured, so an external caller
+ * of this exported helper is not silently re-classified by the switch.
+ *
  * @returns {{status:'leak'|'safe'|'not-proven', viaRls?:boolean, message?:string}}
  */
-export function classifyRead({ kind = 'table', rlsEnabled, canSelect, total, anonVisible, role = 'anon' }) {
+export function classifyRead({ kind = 'table', rlsEnabled, canSelect, nonempty, total, anonVisible, anonVisibleCapped = false, role = 'anon' }) {
   if (!canSelect) return { status: 'safe' }; // no grant at all — nothing exposed, whatever the kind
   if (kind === 'table' && !rlsEnabled) {
     // No RLS: the SELECT grant is the whole story — structural, true even if empty.
@@ -96,9 +149,20 @@ export function classifyRead({ kind = 'table', rlsEnabled, canSelect, total, ano
         : kind === 'view'
           ? `the view exposes tenant rows to an unauthenticated caller (it runs with its owner's rights unless security_invoker is set)`
           : `a policy permits unauthenticated reads`;
-    return { status: 'leak', viaRls: true, message: `"${role}" can read ${anonVisible} row(s) through this ${KIND_LABEL[kind]} — ${why} (proven by probe)` };
+    return { status: 'leak', viaRls: true, message: `"${role}" can read ${anonVisible}${anonVisibleCapped ? '+' : ''} row(s) through this ${KIND_LABEL[kind]} — ${why} (proven by probe)` };
   }
-  if (total === 0) {
+  // Emptiness decides "anon saw none of N rows" (safe) from "there were no rows to
+  // see" (proved nothing). Neither key given means the question was never asked —
+  // a skip is not a pass, so say so rather than returning 'safe'. check() asks
+  // under exactly the condition that reaches this line, so this branch is defence,
+  // not an expected path.
+  const empty = nonempty !== undefined ? nonempty === false
+    : total !== undefined ? total === 0
+      : null;
+  if (empty === null) {
+    return { status: 'not-proven', message: `could not determine whether this ${KIND_LABEL[kind].toLowerCase()} holds any rows, so the "${role}" probe proved nothing either way` };
+  }
+  if (empty) {
     return { status: 'not-proven', message: `${KIND_LABEL[kind].toLowerCase()} is empty — could not prove whether "${role}" can read it; seed a row or add it to the check's data` };
   }
   return { status: 'safe' };
@@ -173,27 +237,38 @@ export async function check({ query, config = {} }) {
 
   await query('begin', []);
   try {
-    // Read the privileged surface (grant + total rows) BEFORE dropping role.
+    // Read the privileged surface BEFORE dropping role: the SELECT grant always,
+    // and emptiness ONLY where emptiness can change the verdict.
     for (const t of tables) {
-      // Each relation in its own savepoint. The privileged pre-pass counts rows,
-      // and some relations raise when read: a materialized view created WITH NO
-      // DATA raises 55000, which threw straight out of check() and lost the
-      // ENTIRE scan — every real leak with it. Verified: a database with an
-      // unpopulated matview and a genuinely anon-readable table reported nothing
-      // at all, because the whole run aborted.
+      // Each relation in its own savepoint. Some relations raise when read: a
+      // materialized view created WITH NO DATA raises 55000, which threw straight
+      // out of check() and lost the ENTIRE scan — every real leak with it.
+      // Verified: a database with an unpopulated matview and a genuinely
+      // anon-readable table reported nothing at all, because the whole run
+      // aborted.
       await query('savepoint tg_r', []);
       try {
         const s = readSurfaceSql(t.schema, t.name, role);
         const row = (await q(s.text, s.values))[0];
         t.canSelect = row.can_select === true || row.can_select === 't';
-        t.total = row.total ?? 0;
+        // Ask emptiness under exactly the condition `classifyRead` consults it:
+        // there is a grant AND the structural table rule has not already settled
+        // it. Everything else — every relation anon cannot select at all, which is
+        // most of them in a locked-down database — is now never touched by this
+        // pass. Measured: on a 200k-row table with no anon grant the old pre-pass
+        // spent 24 ms producing a number that `classifyRead` never read.
+        if (t.canSelect && (t.kind !== 'table' || t.rlsEnabled)) {
+          const e = nonEmptySql(t.schema, t.name);
+          const erow = (await q(e.text, e.values))[0];
+          t.nonempty = erow.nonempty === true || erow.nonempty === 't';
+        }
         await query('release savepoint tg_r', []);
       } catch (err) {
         try { await query('rollback to savepoint tg_r', []); await query('release savepoint tg_r', []); }
         catch { /* the outer rollback still discards everything */ }
         t.introspectError = err.message;
         t.canSelect = false;
-        t.total = null;
+        t.nonempty = undefined;
       }
     }
 
@@ -235,19 +310,24 @@ export async function check({ query, config = {} }) {
       }
       scanned++;
       let anonVisible = 0;
+      let anonVisibleCapped = false;
       // Probe whenever anon holds a grant and the structural rule doesn't already
       // settle it. Views ALWAYS get probed (see classifyRead) — their
-      // relrowsecurity is meaninglessly false.
+      // relrowsecurity is meaninglessly false. Same predicate as the emptiness
+      // question above, deliberately: the two answers are consumed together.
       if (t.canSelect && (t.kind !== 'table' || t.rlsEnabled)) {
         await query('savepoint tg_r', []);
         try {
           const c = anonSelectCountSql(t.schema, t.name);
           anonVisible = (await q(c.text, c.values))[0].n;
+          // The probe counts to ANON_PROBE_CAP + 1; saturating means "at least
+          // this many", so the message says 1000+ rather than a wrong exact count.
+          if (anonVisible > ANON_PROBE_CAP) { anonVisible = ANON_PROBE_CAP; anonVisibleCapped = true; }
         } catch { /* denied => 0 */ }
         await query('rollback to savepoint tg_r', []);
         await query('release savepoint tg_r', []);
       }
-      const verdict = classifyRead({ kind: t.kind, rlsEnabled: t.rlsEnabled, canSelect: t.canSelect, total: t.total, anonVisible, role });
+      const verdict = classifyRead({ kind: t.kind, rlsEnabled: t.rlsEnabled, canSelect: t.canSelect, nonempty: t.nonempty, anonVisible, anonVisibleCapped, role });
       const id = `${t.schema}.${t.name}`;
       if (verdict.status === 'leak') {
         violations.push(violationForRead(id, t.schema, t.name, role, verdict.viaRls, { kind: t.kind, securityInvoker: t.securityInvoker, pgVersionNum }));

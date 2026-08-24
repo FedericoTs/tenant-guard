@@ -89,6 +89,33 @@ for (const arg of argv) {
   if (!arg.startsWith('-')) { positionals.push(arg); continue; }
   const [name, ...rest] = arg.split('=');
   const value = rest.length > 0 ? rest.join('=') : null;
+  // `--json=` (an '=' with nothing after it) is NOT the same as `--json`. It used
+  // to parse to '', which is falsy, so `if (flags.json)` in emit() skipped the
+  // writer and the requested report was silently never written — measured on
+  // examples/leaky-demo: `run --json= --sarif= --markdown=` printed the human
+  // report, exited 1, and produced no files and no '→ wrote' lines. The realistic
+  // trigger is `--json=$SOME_UNSET_VAR` in a hand-written CI step, or a typo.
+  //
+  // Rejected the alternative of mapping '' to 'stdout': that would dump a JSON or
+  // SARIF document into the middle of a human run, and two such flags would then
+  // collide on stdout. There is no path here, so this is a usage error — exit 2,
+  // the same contract as `Unknown option` above, which the shipped action already
+  // maps to a workflow-configuration failure.
+  //
+  // Whitespace-only is folded in deliberately. Measured: `run --json="   "` in
+  // examples/leaky-demo did NOT throw — it wrote a real 3990-byte report into a
+  // file literally named three spaces, which is junk nobody will ever find and
+  // is invisible in most directory listings. A real file path never trims to
+  // empty, so rejecting it costs no legitimate invocation.
+  const PATH_FLAGS = { '--json': 'json', '--sarif': 'sarif', '--markdown': 'md', '--md': 'md' };
+  if (value !== null && value.trim() === '' && Object.hasOwn(PATH_FLAGS, name)) {
+    console.error(
+      `${name} needs a file path, e.g. ${name}=tenant-guard.${PATH_FLAGS[name]}
+` +
+      `Omit the '=' entirely to write to stdout.`,
+    );
+    process.exit(2);
+  }
   switch (name) {
     case '--json': flags.json = value ?? 'stdout'; break;
     case '--sarif': flags.sarif = value ?? 'stdout'; break;
@@ -176,7 +203,7 @@ ${bold('OPTIONS')}
 ${bold('EXIT CODES')}
   0  every guard that ran passed        ${dim('(a skip is not a pass)')}
   1  at least one guard failed
-  2  bad usage — unknown command or option
+  2  bad usage — unknown command or option, or a flag missing its value
 
   ${dim('The exit code is identical in every output format.')}
 
@@ -246,7 +273,13 @@ if (cmd === 'run') {
   process.exit(emit(runAll(cwd), { command: 'run' }));
 }
 
-if (RUNTIME_COMMANDS[cmd]) {
+// Object.hasOwn, not a bare lookup: RUNTIME_COMMANDS is a plain object literal, so
+// its prototype is intact and `RUNTIME_COMMANDS['constructor']` (or toString, valueOf,
+// hasOwnProperty, __proto__) is truthy. Measured before the fix: each of those five
+// names passed this check, destructured `fn` as undefined and died with an uncaught
+// `TypeError: fn is not a function` — exit 1, which the HELP text and the shipped
+// action both read as "a guard failed" rather than the documented 2 = bad usage.
+if (Object.hasOwn(RUNTIME_COMMANDS, cmd)) {
   const { fn, needs, many } = RUNTIME_COMMANDS[cmd];
   const out = await fn(cwd);
   const results = many ? out : [out];

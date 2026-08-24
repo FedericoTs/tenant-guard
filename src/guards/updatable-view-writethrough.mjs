@@ -131,12 +131,91 @@ export function autoUpdatableShape(select) {
   if (/\bjoin\b/.test(fromClause)) reasons.push('a JOIN');
   else if (/,/.test(fromClause.replace(/\([^)]*\)/g, ''))) reasons.push('more than one relation');
 
-  const baseTable = (() => {
-    const t = /\bfrom\s+([a-z0-9_."]+)/.exec(s);
-    return t ? bare(t[1]) : null;
-  })();
+  // WHAT the FROM clause names decides whether a write can reach a table at all,
+  // and none of the shape checks above ask. Measured in PGlite 0.5.5 / PG 18.3
+  // with anon holding SELECT+INSERT+UPDATE+DELETE on every view, so nothing
+  // failed for want of a privilege — pg_relation_is_updatable(oid, true):
+  //     from users            (a table)            -> 28, DELETE affected 2 rows
+  //     from (select ...) s   (a subquery)         ->  0
+  //     from active_users()   (a set-returning fn) ->  0, DELETE raised 55000
+  // So a name followed IMMEDIATELY by `(` is a function call and a leading `(` is
+  // a subquery; neither is a write path. `from users u(a,b)` is a table with
+  // column aliases — the space before `(` is what separates the two, and that
+  // form measured 28, still updatable, so requiring no-space is not merely a
+  // convention.
+  const head = fromClause.replace(/^\s+/, '');
+  const baseIsSubquery = head.startsWith('(');
+  const nameMatch = baseIsSubquery ? null : /^([a-z0-9_."]+)(\()?/.exec(head);
+  const baseIsCallable = Boolean(nameMatch && nameMatch[2]);
+  const baseTable = nameMatch ? bare(nameMatch[1]) : null;
+  const baseQualified = nameMatch ? qualifiedName(nameMatch[1]) : null;
 
-  return { autoUpdatable: reasons.length === 0, notUpdatableBecause: reasons, baseTable };
+  return {
+    autoUpdatable: reasons.length === 0,
+    notUpdatableBecause: reasons,
+    baseTable,
+    baseQualified,
+    baseIsCallable,
+    baseIsSubquery,
+  };
+}
+
+/**
+ * Relations a migration gives an INSTEAD OF trigger or a rule.
+ *
+ * These are the two ways a shape Postgres would refuse a write on becomes
+ * writable again, and they are why the base-relation reasoning below can never
+ * conclude "blocked" over one. Measured: a GROUP BY view read
+ * pg_relation_is_updatable 0; after `create rule ... as on delete to agg do
+ * instead delete from users`, 16 — and `delete from` a thin view stacked on top
+ * of it removed 2 rows from the RLS-protected base table as anon.
+ *
+ * Only creations are collected. A later DROP TRIGGER is not tracked, which
+ * leaves the guard reporting a view it could have cleared — the safe direction.
+ */
+export function extractInsteadWritable(sql) {
+  const text = stripSqlComments(sql);
+  const out = new Set();
+  const trig = /create\s+(?:or\s+replace\s+)?(?:constraint\s+)?trigger\s+[a-z0-9_."]+\s+instead\s+of\b[^;]{0,400}?\bon\s+([a-z0-9_."]+)/gi;
+  let m;
+  while ((m = trig.exec(text)) !== null) out.add(qualifiedName(m[1]));
+  const rule = /create\s+(?:or\s+replace\s+)?rule\s+[a-z0-9_."]+\s+as\s+on\s+(?:insert|update|delete)\s+to\s+([a-z0-9_."]+)/gi;
+  while ((m = rule.exec(text)) !== null) out.add(qualifiedName(m[1]));
+  return out;
+}
+
+/**
+ * Can a write actually reach a TABLE through this view's FROM target?
+ *
+ * The shape checks in autoUpdatableShape() only look at THIS select, so a thin
+ * `select a, b from reporting_view` passes every one of them and was reported as
+ * a write-through even though Postgres refuses the write outright. On a schema
+ * with ordinary reporting views that was three false reports for every true one,
+ * and a guard that fires on correct code teaches people to silence it.
+ *
+ * Returns:
+ *   'blocked'  — Postgres refuses the write (SQLSTATE 55000). Proven safe.
+ *   'writable' — the chain reaches a table, or a rule/trigger re-opens it.
+ *   'unknown'  — the base relation is not defined in these migrations (a table,
+ *                or `auth.users`, or another schema entirely). Stays reported:
+ *                downgrading unknowns would hide the exact bug this guard was
+ *                written for, which was a view over a table it could not see.
+ */
+export function resolveBaseWritable(view, views, insteadWritable = new Set(), seen = new Set()) {
+  if (!view) return 'unknown';
+  if (view.baseIsSubquery || view.baseIsCallable) return 'blocked';
+  const key = view.baseQualified;
+  if (!key || seen.has(key)) return 'unknown'; // cycle: refuse to conclude either way
+  seen.add(key);
+  const base = views.get(key);
+  if (!base) return 'unknown';
+  // A matview can carry neither an INSTEAD OF trigger (42809 "relation ... cannot
+  // have triggers") nor a rule (0A000 "rules on materialized views are not
+  // supported"), both measured, so this leg needs no escape hatch.
+  if (base.isMaterialized) return 'blocked';
+  if (insteadWritable.has(key)) return 'writable';
+  if (!base.autoUpdatable) return 'blocked';
+  return resolveBaseWritable(base, views, insteadWritable, seen);
 }
 
 /**
@@ -162,27 +241,63 @@ export function autoUpdatableShape(select) {
  * had an explicit GRANT of their own — the ones that got their write access from
  * ALTER DEFAULT PRIVILEGES, which is exactly the population this guard is about.
  *
- * @returns {Map<string, {granted:Set<string>, revoked:Set<string>}>} keyed by bare object name
+ * **The privilege list may not cross a `;`.** It was `[\s\S]*?`, and on the
+ * single-file Supabase lockdown — a `GRANT SELECT … TO anon;` immediately
+ * followed by `REVOKE INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public FROM
+ * anon;` — the lazy group backtracked over the semicolon and matched from the
+ * GRANT's verb through the REVOKE's privilege list. The schema-wide REVOKE was
+ * therefore recorded as a schema-wide *GRANT* of INSERT/UPDATE/DELETE on every
+ * view: not a missed revoke, an inverted one. Splitting the same two statements
+ * across two files hid it, which is why it survived the earlier fix.
+ *
+ * **PUBLIC is a different grantee from `anon`.** `REVOKE … FROM PUBLIC` removes
+ * only what was granted to the PUBLIC pseudo-role; it does not touch a grant made
+ * directly to `anon`, nor the ALTER DEFAULT PRIVILEGES writes that arrive on
+ * `anon` by name. Measured: after `revoke all on all tables in schema public from
+ * public`, has_table_privilege('anon', view, 'DELETE') was still true and anon
+ * deleted 2 rows through the view. Folding PUBLIC into the role match made that
+ * REVOKE read as proof the hole was closed and the guard went green on it. So the
+ * two grantees are tracked in separate lanes and only the role lane can prove a
+ * privilege gone.
+ *
+ * @returns {Map<string, {granted:Set<string>, revoked:Set<string>}>} keyed by `schema.name`
  */
 export function netWriteGrants(files, exposedRoles, viewNames = []) {
   const roles = new Set(exposedRoles.map((r) => r.toLowerCase()));
   const state = new Map();
   const touch = (name) => {
-    if (!state.has(name)) state.set(name, { granted: new Set(), revoked: new Set() });
+    if (!state.has(name)) {
+      state.set(name, {
+        role: { granted: new Set(), revoked: new Set() },
+        pub: { granted: new Set(), revoked: new Set() },
+      });
+    }
     return state.get(name);
   };
   for (const v of viewNames) touch(qualifiedName(v));
 
-  const hitsRole = (targets) =>
-    [...roles].some((r) => new RegExp(`\\b${r}\\b`).test(targets)) || /\bpublic\b/.test(targets);
+  // Which grantee lanes a TO/FROM list touches. Both can be true at once
+  // (`REVOKE … FROM anon, PUBLIC`).
+  const lanesOf = (targets) => ({
+    role: [...roles].some((r) => new RegExp(`\\b${r}\\b`).test(targets)),
+    pub: /\bpublic\b/.test(targets),
+  });
+  const hitsRole = (targets) => {
+    const l = lanesOf(targets);
+    return l.role || l.pub;
+  };
 
   const privsOf = (privs) =>
     /\ball\b/.test(privs) ? WRITE_PRIVS : WRITE_PRIVS.filter((x) => new RegExp(`\\b${x}\\b`).test(privs));
 
-  const apply = (entry, verb, applies) => {
-    for (const priv of applies) {
-      if (verb === 'grant') { entry.granted.add(priv); entry.revoked.delete(priv); }
-      else { entry.revoked.add(priv); entry.granted.delete(priv); }
+  const apply = (entry, verb, applies, lanes) => {
+    for (const laneName of ['role', 'pub']) {
+      if (!lanes[laneName]) continue;
+      const lane = entry[laneName];
+      for (const priv of applies) {
+        if (verb === 'grant') { lane.granted.add(priv); lane.revoked.delete(priv); }
+        else { lane.revoked.add(priv); lane.granted.delete(priv); }
+      }
     }
   };
 
@@ -190,21 +305,27 @@ export function netWriteGrants(files, exposedRoles, viewNames = []) {
     const text = stripSqlComments(sql);
     const events = [];
 
-    const allRe = /\b(grant|revoke)\s+([\s\S]*?)\s+on\s+all\s+tables\s+in\s+schema\s+([a-z0-9_."]+)\s+(?:to|from)\s+([^;]+)/gi;
+    const allRe = /\b(grant|revoke)\s+([^;]*?)\s+on\s+all\s+tables\s+in\s+schema\s+([a-z0-9_."]+)\s+(?:to|from)\s+([^;]+)/gi;
     let a;
     while ((a = allRe.exec(text)) !== null) {
-      if (!hitsRole(a[4].toLowerCase())) continue;
+      const targets = a[4].toLowerCase();
+      if (!hitsRole(targets)) continue;
       const applies = privsOf(a[2].toLowerCase());
-      if (applies.length) events.push({ at: a.index, verb: a[1].toLowerCase(), applies, all: true });
+      if (applies.length) {
+        events.push({ at: a.index, verb: a[1].toLowerCase(), applies, lanes: lanesOf(targets), all: true });
+      }
     }
 
-    const re = /\b(grant|revoke)\s+([\s\S]*?)\s+on\s+(?:table\s+)?([a-z0-9_."]+)\s+(?:to|from)\s+([^;]+)/gi;
+    const re = /\b(grant|revoke)\s+([^;]*?)\s+on\s+(?:table\s+)?([a-z0-9_."]+)\s+(?:to|from)\s+([^;]+)/gi;
     let m;
     while ((m = re.exec(text)) !== null) {
       if (/^all$/i.test(m[3])) continue; // the schema-wide form, handled above
-      if (!hitsRole(m[4].toLowerCase())) continue;
+      const targets = m[4].toLowerCase();
+      if (!hitsRole(targets)) continue;
       const applies = privsOf(m[2].toLowerCase());
-      if (applies.length) events.push({ at: m.index, verb: m[1].toLowerCase(), applies, obj: qualifiedName(m[3]) });
+      if (applies.length) {
+        events.push({ at: m.index, verb: m[1].toLowerCase(), applies, lanes: lanesOf(targets), obj: qualifiedName(m[3]) });
+      }
     }
 
     // DROP VIEW wipes the object's ACL. A recreated view gets FRESH default
@@ -220,15 +341,30 @@ export function netWriteGrants(files, exposedRoles, viewNames = []) {
     for (const ev of events) {
       if (ev.drop) {
         const entry = state.get(ev.drop);
-        if (entry) { entry.granted.clear(); entry.revoked.clear(); }
+        if (entry) {
+          for (const lane of [entry.role, entry.pub]) { lane.granted.clear(); lane.revoked.clear(); }
+        }
       } else if (ev.all) {
-        for (const entry of state.values()) apply(entry, ev.verb, ev.applies);
+        for (const entry of state.values()) apply(entry, ev.verb, ev.applies, ev.lanes);
       } else {
-        apply(touch(ev.obj), ev.verb, ev.applies);
+        apply(touch(ev.obj), ev.verb, ev.applies, ev.lanes);
       }
     }
   }
-  return state;
+
+  // Collapse the two lanes into the {granted, revoked} the caller reasons about.
+  //   granted — the browser roles hold this privilege, from either grantee.
+  //   revoked — PROVEN gone, which also has to clear the ALTER DEFAULT PRIVILEGES
+  //             writes classifyView() otherwise assumes. Those arrive on the
+  //             named role, so only a revoke on the role lane can prove it; a
+  //             revoke from PUBLIC leaves them in place (measured above).
+  const out = new Map();
+  for (const [name, e] of state) {
+    const granted = new Set(WRITE_PRIVS.filter((p) => e.role.granted.has(p) || e.pub.granted.has(p)));
+    const revoked = new Set(WRITE_PRIVS.filter((p) => !granted.has(p) && e.role.revoked.has(p)));
+    out.set(name, { granted, revoked });
+  }
+  return out;
 }
 
 /**
@@ -251,8 +387,23 @@ export function detectDefaultWriteGrants(files, exposedRoles) {
   return { assume: false, evidence: null };
 }
 
-/** The verdict for one view. */
-export function classifyView({ view, grants, assumeDefaults, evidence, exposedRoles }) {
+/**
+ * The verdict for one view.
+ *
+ * `baseWritable` is resolveBaseWritable()'s answer about the FROM target and
+ * defaults to 'unknown', which is the behaviour every caller had before it
+ * existed. `selfInstead` says this view carries its own INSTEAD OF trigger or
+ * rule, which makes it writable no matter what it selects from.
+ */
+export function classifyView({
+  view,
+  grants,
+  assumeDefaults,
+  evidence,
+  exposedRoles,
+  baseWritable = 'unknown',
+  selfInstead = false,
+}) {
   const roles = exposedRoles.join(', ');
 
   if (view.isMaterialized) {
@@ -263,6 +414,19 @@ export function classifyView({ view, grants, assumeDefaults, evidence, exposedRo
   }
   if (!view.autoUpdatable) {
     return { status: 'safe' }; // Postgres rejects writes through this shape
+  }
+  // The shape is auto-updatable but the FROM target is not a write path: a
+  // MATERIALIZED VIEW, a set-returning function, a subquery, or a view Postgres
+  // itself refuses writes on. Measured with anon holding all four privileges so
+  // nothing failed for want of one — pg_relation_is_updatable was 0 for each and
+  // `delete from` raised 55000 ("cannot delete from view …"), as owner too, so it
+  // is the relation kind refusing the write and not RLS or grants. Reporting
+  // these was three false violations for every true one on a schema that has any
+  // reporting views at all. `selfInstead` holds the exception: a rule or INSTEAD
+  // OF trigger on THIS view re-opens the write regardless of the base, and one
+  // such stack really did delete 2 rows from an RLS-protected table as anon.
+  if (baseWritable === 'blocked' && !selfInstead) {
+    return { status: 'safe' };
   }
 
   const explicitWrites = [...(grants?.granted ?? [])];
@@ -357,6 +521,10 @@ export function run(config = {}) {
     for (const v of extractViews(sql)) views.set(v.qualified, { ...v, file });
   }
 
+  // Rules and INSTEAD OF triggers, over the whole history: the two things that
+  // make a shape Postgres would refuse a write on writable again.
+  const insteadWritable = extractInsteadWritable(files.map((f) => f.sql).join('\n'));
+
   const violations = [];
   const notes = [];
   for (const [key, view] of views) {
@@ -369,6 +537,8 @@ export function run(config = {}) {
       assumeDefaults,
       evidence,
       exposedRoles: cfg.exposedRoles,
+      baseWritable: resolveBaseWritable(view, views, insteadWritable),
+      selfInstead: insteadWritable.has(key),
     });
     if (verdict.status === 'leak') {
       violations.push({ where: view.file, kind: verdict.kind, message: verdict.message, fix: verdict.fix });

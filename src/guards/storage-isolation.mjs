@@ -78,15 +78,16 @@ export const DEFAULTS = {
  * hands the whole listing to anyone with the anon key, which ships in every
  * browser bundle.
  */
-export function classifyAnonListing({ bucket, anonVisible, tenantFolders, role = 'anon' }) {
+export function classifyAnonListing({ bucket, anonVisible, tenantFolders = 0, role = 'anon' }) {
   return {
     kind: 'anon-listing',
     where: `storage.objects (bucket "${bucket}")`,
     message:
-      `"${role}" — an unauthenticated visitor holding the public key — listed ${anonVisible} object(s) in the private bucket "${bucket}"` +
+      `"${role}" — an unauthenticated visitor holding the public key — listed ${anonVisible} object name(s) in the private bucket "${bucket}"` +
       (tenantFolders >= 2 ? `, which holds ${tenantFolders} tenants' folders` : '') +
-      `. The bucket is not marked public, so this is a policy on storage.objects granting reads to everyone rather than a deliberate CDN bucket. ` +
-      `Object names are enumerable from here, and a name is all a signed-URL request needs.`,
+      `. The bucket is not marked public, so this is a policy on storage.objects granting SELECT to everyone rather than a deliberate CDN bucket.\n` +
+      `      **Blocking downloads does not fix this.** Listing is SELECT on storage.objects; downloading goes through the storage API with its own gate, so a bucket can refuse every download and still hand over every filename — reported from a real deployment. ` +
+      `And filenames are not metadata here: "acme-invoice-2024-Q3.pdf" names a customer, dates the relationship and implies the volume, and a name is the one input a signed-URL request needs.`,
     fix:
       `Scope the SELECT policy on storage.objects to an authenticated tenant, and make sure it is not granted TO public:\n` +
       `        DROP POLICY <the permissive one> ON storage.objects;\n` +
@@ -94,6 +95,27 @@ export function classifyAnonListing({ bucket, anonVisible, tenantFolders, role =
       `          USING (bucket_id = '${bucket}' AND (storage.foldername(name))[1] = <the caller's tenant>);\n` +
       `      Check for a policy with no TO clause — that is TO public, which includes ${role}:\n` +
       `        SELECT polname, polroles::regrole[] FROM pg_policy WHERE polrelid = 'storage.objects'::regclass;`,
+  };
+}
+
+/**
+ * Can this role list the objects in a bucket at all?
+ *
+ * Deliberately NOT scoped to a tenant folder. Listing is `SELECT` on
+ * `storage.objects`; downloading is a separate path through the storage API with
+ * its own gate. **A bucket can refuse every download and still hand over every
+ * filename** — reported from a real deployment, and the shape this exists to
+ * catch.
+ *
+ * Filenames are not metadata in this context. `acme-invoice-2024-Q3.pdf` names a
+ * customer, dates the relationship and implies the volume; a name is also the
+ * one input a signed-URL request needs. So the listing is the finding, whether
+ * or not the bytes are reachable.
+ */
+export function bucketListingSql(limit = 50) {
+  return {
+    text: `select count(*)::int as n from (select 1 from storage.objects where bucket_id = $1 limit ${Number(limit) || 50}) s`,
+    values: [],
   };
 }
 
@@ -302,6 +324,37 @@ export async function check({ query, config = {} }) {
       const isPublic = b.is_public === true || b.is_public === 't';
       const tenantFolders = Number(b.tenant_folders || 0);
 
+      // FIRST, before any early return: can a visitor with no session list this
+      // bucket at all?
+      //
+      // This used to sit after the tenant-folder checks, so it never ran on a
+      // bucket with fewer than two tenant folders — which is precisely the shape
+      // that leaks worst. Measured: a FLAT bucket holding
+      // "acme-invoice-2024.pdf" and "globex-invoice-2024.pdf", with SELECT on
+      // storage.objects granted to public, produced ZERO findings. The filenames
+      // there ARE the customer list. Same for a single-tenant bucket.
+      //
+      // It needs no second tenant and no folder convention: the bucket is not
+      // public, so nothing in it should be listable without a session. Skipped
+      // for a bucket that IS public, where listing is the stated intent and the
+      // separate public-bucket verdict below covers it.
+      if (cfg.anonRole && !isPublic) {
+        await query('savepoint tg_anon', []);
+        try {
+          await query(`set local role ${safeRole(cfg.anonRole)}`, []);
+          const l = bucketListingSql(cfg.sampleLimit ? Math.max(cfg.sampleLimit, 50) : 50);
+          const anonVisible = (await q(l.text, [b.id]))[0].n;
+          if (anonVisible > 0) {
+            const v = classifyAnonListing({ bucket: b.id, anonVisible, tenantFolders, role: cfg.anonRole });
+            violations.push({ where: v.where, kind: v.kind, message: v.message, fix: v.fix });
+          }
+        } catch { /* denied, which is the answer we wanted */ }
+        finally {
+          try { await query('rollback to savepoint tg_anon', []); await query('release savepoint tg_anon', []); }
+          catch { /* the outer rollback still discards everything */ }
+        }
+      }
+
       // A public bucket is settled from the catalog — no probe can observe the
       // CDN, and none is needed: RLS is not consulted for public reads.
       if (isPublic && tenantFolders >= 2) {
@@ -322,27 +375,6 @@ export async function check({ query, config = {} }) {
         continue;
       }
       const [folderA, folderB] = folders;
-
-      // Before the tenant-against-tenant probe: can a visitor with NO session
-      // list this bucket at all? A private bucket that answers anon is a leak
-      // that every table-level check walks straight past.
-      if (cfg.anonRole) {
-        await query('savepoint tg_anon', []);
-        try {
-          await query(`set local role ${safeRole(cfg.anonRole)}`, []);
-          const all = folderObjectCountSql(seg);
-          const anonVisible = (await q(all.text, [b.id, folderA]))[0].n
-            + (await q(all.text, [b.id, folderB]))[0].n;
-          if (anonVisible > 0) {
-            const v = classifyAnonListing({ bucket: b.id, anonVisible, tenantFolders, role: cfg.anonRole });
-            violations.push({ where: v.where, kind: v.kind, message: v.message, fix: v.fix });
-          }
-        } catch { /* denied, which is the answer we wanted */ }
-        finally {
-          try { await query('rollback to savepoint tg_anon', []); await query('release savepoint tg_anon', []); }
-          catch { /* the outer rollback still discards everything */ }
-        }
-      }
 
       await query(`set local role ${role}`, []);
       if (canaryReady) {

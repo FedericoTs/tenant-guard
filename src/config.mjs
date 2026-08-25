@@ -85,6 +85,11 @@ export function resolveGuardConfigs(config) {
       assumeDefaultWriteGrants: config.updatableViews?.assumeDefaultWriteGrants,
       allowlist: config.updatableViews?.allowlist ?? [],
     },
+    'mcp-config': {
+      cwd,
+      configPaths: config.mcpConfig?.configPaths,
+      allowlist: config.mcpConfig?.allowlist ?? [],
+    },
     'route-org-scoping': {
       cwd,
       routesDir: routesRel ?? undefined,

@@ -29,13 +29,14 @@ import * as updatableViews from './guards/updatable-view-writethrough.mjs';
 import * as mfaEnforcement from './guards/mfa-enforcement.mjs';
 import * as columnExposure from './guards/column-exposure.mjs';
 import * as triggerVisibility from './guards/trigger-visibility.mjs';
+import * as mcpConfig from './guards/mcp-config.mjs';
 import { loadConfig, resolveGuardConfigs, resolveProveConfig, resolveDriftConfig, resolveAnonWritesConfig, resolveAnonReadsConfig, resolveViewIsolationConfig, resolveIdentityTrustConfig, resolveStorageConfig, resolveOraclesConfig, resolveRealtimeConfig, resolveDefinerRpcConfig, resolveShadowConfig, resolveCapabilitiesConfig, resolveSchemaTenancyConfig, resolvePoolerBleedConfig, resolveDefaultPrivilegesConfig, resolveCrossTenantFkConfig, resolveCreateGrantsConfig, resolveMfaEnforcementConfig, resolveColumnExposureConfig, resolveTriggerVisibilityConfig } from './config.mjs';
 
 // The static guards: synchronous, zero-dependency, no database. These are what
 // `tenant-guard run` executes and what a project's vitest/jest suite imports.
-export const GUARDS = [migrationCollisions, definerGrants, routeOrgScoping, updatableViews];
+export const GUARDS = [migrationCollisions, definerGrants, routeOrgScoping, updatableViews, mcpConfig];
 
-export { migrationCollisions, definerGrants, routeOrgScoping, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation, definerRpc, shadowTables, roleCapabilities, schemaTenancy, poolerBleed, defaultPrivileges, crossTenantFk, createGrants, updatableViews, mfaEnforcement, columnExposure, triggerVisibility };
+export { migrationCollisions, definerGrants, routeOrgScoping, rlsProof, rlsDrift, anonWrites, anonReads, viewIsolation, identityTrust, storageIsolation, constraintOracles, realtimeIsolation, definerRpc, shadowTables, roleCapabilities, schemaTenancy, poolerBleed, defaultPrivileges, crossTenantFk, createGrants, updatableViews, mfaEnforcement, columnExposure, triggerVisibility, mcpConfig };
 export { prove } from './guards/rls-proof.mjs';
 export { drift } from './guards/rls-drift.mjs';
 export { check as checkAnonWrites } from './guards/anon-writes.mjs';

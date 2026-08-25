@@ -26,3 +26,10 @@ verify-*.mjs
 check-*.mjs
 fix-*.py
 patch-*.py
+wire-*.py
+add-*.py
+close-*.py
+cl*.py
+build-*.py
+extract.py
+write-*.py

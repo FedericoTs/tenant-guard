@@ -33,7 +33,7 @@ npx tenant-guard all      # everything: static guards + every runtime proof
 Or run one at a time: `prove`, `drift`, `anon-reads`, `anon-writes`, `identity`,
 `rpc`, `views`, `storage`, `realtime`, `oracles`, `shadows`, `caps`, `schemas`, `pooler`, `defaults`, `fks`, `creates`, `mfa`,
 `columns`, `triggers`.
-The view write-through check runs inside `run`, with no database.
+The view write-through and MCP-config checks run inside `run`, with no database.
 `npx tenant-guard list` describes each, and `--help` documents the rest.
 
 Every command also speaks machine: `--json` for anything downstream, `--sarif`

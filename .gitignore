@@ -33,3 +33,8 @@ cl*.py
 build-*.py
 extract.py
 write-*.py
+
+# Never commit a registry token. A project-level .npmrc holding an _authToken is
+# the same class of mistake the mcp-config guard fails the build over, and it
+# survives in git history long after the file is cleaned.
+.npmrc

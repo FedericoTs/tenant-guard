@@ -73,6 +73,54 @@ export function roleExistsSql(role) {
  * for such a matview even when `anon` had no grant on it — a case the catalog
  * alone settles conclusively (no grant ⇒ safe).
  */
+/**
+ * Tables with RLS OFF that the role can read — WITHOUT requiring a tenant column.
+ *
+ * This is the gap that made the guard miss the most prevalent real-world failure
+ * there is. Every other query here starts from the tenant column, so a table
+ * without one was never examined, however open it was.
+ *
+ * Measured on the exact shape the DeepStrike survey names as its second-most
+ * common finding — "RLS enabled on `users` but forgotten on related tables like
+ * `projects` or `teams`":
+ *
+ *   select * from projects   -> 1 row, as anon
+ *   select * from teams      -> 1 row, as anon
+ *   anon-reads / anon-writes / column-exposure / rls-proof -> ok, 0 findings
+ *
+ * `projects` had no tenant column and no sensitive-looking column name, so it
+ * fell between every guard. That is CVE-2025-48757's shape: 170+ Lovable apps,
+ * 303 endpoints, entire tables readable with nothing but the public anon key.
+ *
+ * RLS OFF plus a grant is CONCLUSIVE — there is no policy that could be
+ * narrowing it, so the whole table is readable by anyone holding the key that
+ * ships in your browser bundle. A deliberately public reference table (countries,
+ * plans, feature flags) is a real and common case, and the allowlist is how that
+ * intent gets written down rather than assumed.
+ *
+ * Column grants count, for the same reason they do everywhere else here:
+ * `has_table_privilege` returns false for `GRANT SELECT (a, b)`.
+ */
+export function unprotectedTablesSql(schemas, role) {
+  return {
+    text: `
+      select n.nspname as schema,
+             c.relname as name,
+             c.relrowsecurity as rls_enabled,
+             (select count(*) from pg_catalog.pg_policy pol where pol.polrelid = c.oid)::int as policy_count
+      from pg_catalog.pg_class c
+      join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+      where c.relkind in ('r', 'p')
+        and n.nspname = any($1)
+        and not c.relrowsecurity
+        and (pg_catalog.has_table_privilege($2::text, c.oid, 'SELECT')
+             or pg_catalog.has_any_column_privilege($2::text, c.oid, 'SELECT'))
+      order by n.nspname, c.relname
+    `,
+    values: [schemas, role],
+  };
+}
+
 export function readSurfaceSql(schema, table, role) {
   return {
     text:
@@ -136,11 +184,24 @@ export function anonSelectCountSql(schema, table, cap = ANON_PROBE_CAP) {
  *
  * @returns {{status:'leak'|'safe'|'not-proven', viaRls?:boolean, message?:string}}
  */
-export function classifyRead({ kind = 'table', rlsEnabled, canSelect, nonempty, total, anonVisible, anonVisibleCapped = false, role = 'anon' }) {
+export function classifyRead({ kind = 'table', rlsEnabled, canSelect, nonempty, total, anonVisible, anonVisibleCapped = false, role = 'anon', hasTenantColumn = true }) {
   if (!canSelect) return { status: 'safe' }; // no grant at all — nothing exposed, whatever the kind
   if (kind === 'table' && !rlsEnabled) {
     // No RLS: the SELECT grant is the whole story — structural, true even if empty.
-    return { status: 'leak', viaRls: false, message: `"${role}" can read this tenant table — RLS is OFF and "${role}" holds a SELECT grant, so every tenant's rows are readable with no login (the CVE-2025-48757 class)` };
+    //
+    // Worded per case. A table with no tenant column is the one the tenant-first
+    // queries never reached, and it is the shape the DeepStrike survey ranks
+    // second: RLS remembered on `users`, forgotten on `projects` and `teams`.
+    // Calling it "every tenant's rows" there would be wrong — there are no
+    // tenants in it — and the reason it matters is different: the whole table is
+    // public, not one tenant's slice of it.
+    return {
+      status: 'leak',
+      viaRls: false,
+      message: hasTenantColumn
+        ? `"${role}" can read this tenant table — RLS is OFF and "${role}" holds a SELECT grant, so every tenant's rows are readable with no login (the CVE-2025-48757 class)`
+        : `"${role}" can read this table in full — RLS is OFF and "${role}" holds a SELECT grant, so the whole table is served to anyone holding the anon key`,
+    };
   }
   if (anonVisible > 0) {
     const why =
@@ -170,11 +231,29 @@ export function classifyRead({ kind = 'table', rlsEnabled, canSelect, nonempty, 
 
 const KIND_LABEL = { table: 'tenant table', view: 'VIEW', matview: 'MATERIALIZED VIEW' };
 
+/**
+ * The same finding reads differently depending on whether the table carries a
+ * tenant column, and getting that wrong makes the report untrustworthy: calling
+ * a table with no tenant column "every tenant's rows" is plainly false to anyone
+ * who opens it, and a report that is wrong about the easy part does not get
+ * believed about the hard part.
+ *
+ * The no-tenant-column case is also the one worth explaining, because it is the
+ * one nothing else here examines — every tenancy query starts from that column —
+ * and it is the commonest way this fails in the wild: RLS remembered on the
+ * obvious table, forgotten on the ones beside it.
+ */
+const label = (kind, hasTenantColumn) =>
+  (kind === 'table' && !hasTenantColumn ? 'table' : KIND_LABEL[kind]);
+
 /** Build a violation for a flagged table / view / materialized view. */
 export function violationForRead(id, schema, table, role, viaRls, opts = {}) {
-  const { kind = 'table', securityInvoker = false, pgVersionNum = null } = opts;
+  const { kind = 'table', securityInvoker = false, pgVersionNum = null, hasTenantColumn = true } = opts;
   const base =
-    `Unauthenticated reads of tenant data are the CVE class this tool exists to stop. ` +
+    (hasTenantColumn
+      ? `Unauthenticated reads of tenant data are the CVE class this tool exists to stop. `
+      : `This table has no tenant column, so nothing else here examined it — every tenancy check starts from that column. RLS off plus a grant means the whole table is served to anyone holding the anon key that ships in your browser bundle. `
+        + `If it is genuinely public (a country list, a price table, a blog), allowlist it so the intent is on the record rather than assumed. `) +
     (kind === 'table'
       ? `Enable RLS with a tenant policy, or REVOKE SELECT ON ${qualified(schema, table)} FROM ${role};`
       : fixForView({ kind, schema, view: table, securityInvoker, role, pgVersionNum }));
@@ -182,7 +261,7 @@ export function violationForRead(id, schema, table, role, viaRls, opts = {}) {
     where: id,
     kind,
     message:
-      `the "${role}" role can SELECT this ${KIND_LABEL[kind]} ` +
+      `the "${role}" role can SELECT this ${label(kind, hasTenantColumn)} ` +
       (!viaRls
         ? `(RLS is OFF, so its SELECT grant is unguarded)`
         : kind === 'matview'
@@ -223,10 +302,31 @@ export async function check({ query, config = {} }) {
   const vintro = viewIntrospectionSql(cfg.schemas, cfg.tenantColumns);
   const viewPlan = planViews(await q(vintro.text, vintro.values), cfg.tenantColumns, cfg.grandfather)
     .map((v) => ({ ...v, name: v.view, rlsEnabled: false }));
+  // Tables with RLS OFF that anon can read, tenant column or not. See
+  // unprotectedTablesSql — this is the arm that catches the "forgot to enable it
+  // on projects and teams" shape, which every tenant-column-first query misses.
+  let unprotectedPlan = [];
+  try {
+    const up = unprotectedTablesSql(cfg.schemas, role);
+    const known = new Set(tablePlan.map((t) => `${t.schema}.${t.name}`));
+    unprotectedPlan = (await q(up.text, up.values))
+      .filter((r) => !known.has(`${r.schema}.${r.name}`))
+      .map((r) => ({
+        schema: r.schema,
+        name: r.name,
+        table: r.name,
+        kind: 'table',
+        rlsEnabled: false,
+        policyCount: Number(r.policy_count ?? 0),
+        tenantColumn: null,
+      }));
+  } catch { /* older server or no catalog access — the tenant arm still ran */ }
+
   const skip = new Set(cfg.allowlist);
-  const tables = [...tablePlan, ...viewPlan].filter((t) => !skip.has(`${t.schema}.${t.name}`) && !skip.has(t.name));
+  const tables = [...tablePlan, ...viewPlan, ...unprotectedPlan]
+    .filter((t) => !skip.has(`${t.schema}.${t.name}`) && !skip.has(t.name));
   if (tables.length === 0) {
-    return OK({ skipped: true, reason: `no tenant-column tables or views in ${cfg.schemas.join(', ')}`, summary: 'skipped — no tenant tables' });
+    return OK({ skipped: true, reason: `no readable tables or views in ${cfg.schemas.join(', ')}`, summary: 'skipped — nothing to examine' });
   }
   let pgVersionNum = null;
   try { pgVersionNum = Number((await q(`select current_setting('server_version_num') as v`, []))[0].v); } catch { /* optional */ }
@@ -327,10 +427,10 @@ export async function check({ query, config = {} }) {
         await query('rollback to savepoint tg_r', []);
         await query('release savepoint tg_r', []);
       }
-      const verdict = classifyRead({ kind: t.kind, rlsEnabled: t.rlsEnabled, canSelect: t.canSelect, nonempty: t.nonempty, anonVisible, anonVisibleCapped, role });
+      const verdict = classifyRead({ kind: t.kind, rlsEnabled: t.rlsEnabled, canSelect: t.canSelect, nonempty: t.nonempty, anonVisible, anonVisibleCapped, role, hasTenantColumn: Boolean(t.tenantColumn) });
       const id = `${t.schema}.${t.name}`;
       if (verdict.status === 'leak') {
-        violations.push(violationForRead(id, t.schema, t.name, role, verdict.viaRls, { kind: t.kind, securityInvoker: t.securityInvoker, pgVersionNum }));
+        violations.push(violationForRead(id, t.schema, t.name, role, verdict.viaRls, { kind: t.kind, securityInvoker: t.securityInvoker, pgVersionNum, hasTenantColumn: Boolean(t.tenantColumn) }));
       } else if (verdict.status === 'not-proven') {
         notes.push({ where: id, message: verdict.message });
       }

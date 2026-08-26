@@ -1,6 +1,6 @@
 {
   "name": "tenant-guard",
-  "version": "0.46.0",
+  "version": "0.47.0",
   "description": "Guard tests that fail your CI when multi-tenant Postgres code can leak across tenants. 24 guards: static ones run zero-dependency; runtime ones PROVE isolation by running real SQL as your app role in a rolled-back transaction — reads, the full write path, views, partitions, SECURITY DEFINER RPCs, Storage, Realtime, foreign keys that let one tenant delete another's rows, the anon surface, and whether the identity your policies trust can be forged. Every guard is itself proven able to fail. GitHub Action + SARIF + JSON output.",
   "type": "module",
   "license": "MIT",

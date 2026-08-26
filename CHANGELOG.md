@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.47.0
+
+**Upgrading will surface new findings.** This release closes the biggest blind
+spot the tool has had, and doing it required reversing a calibration decision.
+Read the second half before you upgrade a pipeline that has to stay green.
+
+### the gap
+
+Every tenancy query in this project starts from the tenant column, and
+`column-exposure` covers only columns whose NAME looks sensitive. So a table with
+no tenant column, RLS off, and a grant to `anon` was examined by nothing.
+
+Measured, on exactly that shape:
+
+```
+REALITY:  select * from projects  -> 1 row, as anon
+          select * from teams     -> 1 row, as anon
+GUARDS:   anon-reads ok · anon-writes ok · column-exposure ok · rls-proof ok
+```
+
+That is the pattern [DeepStrike's survey of misconfigured Supabase
+instances](https://deepstrike.io/blog/hacking-thousands-of-misconfigured-supabase-instances-at-scale)
+ranks second — *"protected `/rest/v1/users`, exploited `/rest/v1/projects` and
+`/rest/v1/teams`"* — and it is CVE-2025-48757's shape: 170+ apps, 303 endpoints,
+entire tables readable with nothing but the public anon key.
+
+`anon-reads` now examines RLS-off tables whether or not they carry a tenant
+column. RLS off plus a grant is conclusive — there is no policy narrowing it, so
+the whole table is served to anyone holding the key that ships in your browser
+bundle.
+
+### the calibration reversal, and its cost
+
+A test asserted the old behaviour: a table with no tenant column was deliberately
+NOT scanned, reasoning that `blog_posts` is public content.
+
+That reasoning is right about `blog_posts` and wrong about the class.
+`blog_posts (id, slug, body)` is indistinguishable from
+`projects (id, name, description)` holding confidential client work — the
+database cannot tell them apart, so the only choice is which error to make.
+
+The cost is real and it lands on you, not on a hypothetical user: a project with
+genuinely public tables now gets findings it did not get before, and has to
+allowlist them. Given 303 breached endpoints, that is the right trade, and the
+allowlist is what the README already prescribes for shared tables — it puts the
+intent on the record instead of leaving it assumed.
+
+The finding is worded per case. A table with no tenant column is not described as
+exposing "every tenant's rows", because it has no tenants, and a report that is
+wrong about the easy part does not get believed about the hard part.
+
 ## 0.43.0
 
 **The audit backlog is closed.** 213 candidates across two adversarial rounds,

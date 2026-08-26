@@ -85,15 +85,46 @@ if (PGlite) {
     assert.equal(res.violations.length, 0);
   });
 
-  test('does NOT scan a public table with no tenant column (only tenant tables are checked)', async () => {
+  // CALIBRATION REVERSED in 0.47.0, deliberately. This test used to assert that a
+  // table with no tenant column was NOT scanned, on the reasoning that
+  // `blog_posts` is public content. That reasoning is fine for blog_posts and
+  // wrong for the class: `blog_posts (id, slug, body)` is indistinguishable from
+  // `projects (id, name, description)` holding confidential client work. The
+  // database cannot tell them apart, so the only choice is which error to make.
+  //
+  // Measured before the change, on exactly the shape the DeepStrike survey ranks
+  // second — RLS remembered on `users`, forgotten on `projects` and `teams`:
+  // anon read both tables, and anon-reads, anon-writes, column-exposure and
+  // rls-proof ALL returned ok with zero findings. That is CVE-2025-48757's
+  // shape: 170+ apps, 303 endpoints, whole tables readable with the public key.
+  //
+  // So it now fires, and a genuinely public table is allowlisted — which is what
+  // the README already tells you to do with shared tables, and which puts the
+  // intent on the record instead of leaving it assumed.
+  test('FLAGS a table with no tenant column that anon can read — RLS off plus a grant is the whole story', async () => {
     const { query } = await fresh(`
       create table blog_posts (id serial primary key, slug text, body text);   -- no tenant column
       grant select on blog_posts to anon;
       insert into blog_posts (slug, body) values ('hello','world');
     `);
     const res = await check({ query });
-    assert.equal(res.ok, true, JSON.stringify(res, null, 2)); // blog_posts is public content, never a tenant table
-    assert.match(res.summary, /skipped|none readable/);
+    assert.equal(res.ok, false, JSON.stringify(res, null, 2));
+    const v = res.violations.find((x) => /blog_posts/.test(x.where));
+    assert.ok(v, JSON.stringify(res.violations, null, 2));
+    // Worded for a table with no tenant column — not "every tenant's rows".
+    assert.match(v.message, /can SELECT this table/);
+    assert.doesNotMatch(v.message, /tenant table/);
+    assert.match(v.fix, /allowlist it/);
+  });
+
+  test('…and the allowlist is how a genuinely public table is recorded as intended', async () => {
+    const { query } = await fresh(`
+      create table blog_posts (id serial primary key, slug text, body text);
+      grant select on blog_posts to anon;
+      insert into blog_posts (slug, body) values ('hello','world');
+    `);
+    const res = await check({ query, config: { allowlist: ['public.blog_posts'] } });
+    assert.equal(res.ok, true, JSON.stringify(res, null, 2));
   });
 
   test('FLAGS a MATERIALIZED VIEW anon can read — this CVE class at its worst, invisible to a table-only scan', async () => {

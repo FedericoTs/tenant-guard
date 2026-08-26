@@ -203,7 +203,7 @@ export function resolveIdentityTrustConfig(config) {
 export function resolveStorageConfig(config) {
   const s = config.storageIsolation ?? {};
   const out = {};
-  for (const k of ['url', 'urlEnv', 'role', 'anonRole', 'becomeTenant', 'claim', 'pathSegment', 'buckets', 'allowlist', 'sampleLimit', 'probeWrites']) {
+  for (const k of ['url', 'urlEnv', 'role', 'anonRole', 'becomeTenant', 'claim', 'pathSegment', 'buckets', 'allowlist', 'sampleLimit', 'probeWrites', 'checkOrphans', 'maxLinkCandidates', 'schemas']) {
     if (s[k] !== undefined) out[k] = s[k];
   }
   // Identity is inherited from rlsProof so it is configured once.

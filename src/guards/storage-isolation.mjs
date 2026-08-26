@@ -55,6 +55,11 @@ export const DEFAULTS = {
   allowlist: [], // bucket ids that are intentionally public/shared (a CDN asset bucket)
   sampleLimit: 3,
   probeWrites: true,
+  // Where to look for the columns that track storage object names.
+  schemas: ['public'],
+  // Objects that outlived their row. See classifyOrphans.
+  checkOrphans: true,
+  maxLinkCandidates: 200,
   /**
    * The unauthenticated role, probed separately from the tenant role.
    *
@@ -116,6 +121,109 @@ export function bucketListingSql(limit = 50) {
   return {
     text: `select count(*)::int as n from (select 1 from storage.objects where bucket_id = $1 limit ${Number(limit) || 50}) s`,
     values: [],
+  };
+}
+
+/**
+ * Objects that outlived the row they belonged to.
+ *
+ * Reported by a user: a signed URL kept serving for its whole expiry window with
+ * the record long gone. That is not a policy failure and no policy can fix it — a
+ * Supabase signed URL is a **bearer capability**, a JWT signed by the storage
+ * service carrying the path and an expiry. The storage API checks the signature
+ * and the clock; it does not re-evaluate RLS per request, and there is no
+ * revocation list. Deleting the row, the policy, or even the user changes
+ * nothing about a URL already in someone's hands.
+ *
+ * So the URL is not the testable thing. The OBJECT is. Every orphaned object is
+ * one a still-valid signed URL keeps serving, and it is invisible to every other
+ * check in this file because there is no row left to scope it against — the
+ * tenant-folder probes compare tenants, and an orphan belongs to nobody.
+ *
+ * It is also the shape that quietly breaks a deletion promise: "delete my
+ * account" removed the record and left the PDFs.
+ *
+ * **The link is established by evidence, not by column name.** A column is
+ * treated as tracking storage paths only when its values actually match object
+ * names — measured, not guessed from `storage_path` / `file_url` / `attachment`.
+ * On the fixture this was built against it picked `documents.storage_path` and
+ * ignored `avatars.url` and `unrelated.note`, which look similar and match
+ * nothing.
+ *
+ * And if NO column can be proven to reference objects, this reports a skip
+ * rather than declaring every object orphaned — an app may track paths in a
+ * service the database cannot see.
+ */
+export function linkingColumnsSql(schemas) {
+  return {
+    text: `
+      select n.nspname as schema, c.relname as table, a.attname as column
+      from pg_catalog.pg_class c
+      join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+      join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
+      join pg_catalog.pg_type t on t.oid = a.atttypid
+      where c.relkind in ('r', 'p')
+        and n.nspname = any($1)
+        and t.typname in ('text', 'varchar', 'bpchar')
+      order by 1, 2, 3
+    `,
+    values: [schemas],
+  };
+}
+
+/** Does this column actually hold object names? Bounded, so it stays cheap. */
+export function columnMatchesObjectsSql(schema, table, column, limit = 500) {
+  const q = (x) => `"${String(x).replace(/"/g, '""')}"`;
+  return {
+    text: `select count(*)::int as n from (
+             select 1 from storage.objects o
+             where exists (select 1 from ${q(schema)}.${q(table)} x where x.${q(column)} = o.name)
+             limit ${Number(limit) || 500}) s`,
+    values: [],
+  };
+}
+
+/** Objects no proven-link column references. */
+export function orphanObjectsSql(links, limit = 200) {
+  const q = (x) => `"${String(x).replace(/"/g, '""')}"`;
+  const preds = links.map(
+    (l) => `exists (select 1 from ${q(l.schema)}.${q(l.table)} x where x.${q(l.column)} = o.name)`,
+  );
+  return {
+    text: `select o.bucket_id, o.name from storage.objects o
+           ${preds.length ? `where not (${preds.join(' or ')})` : 'where false'}
+           order by o.bucket_id, o.name
+           limit ${Number(limit) || 200}`,
+    values: [],
+  };
+}
+
+/** The verdict for a set of orphaned objects. */
+export function classifyOrphans({ orphans, links, tenantSegments = [], role = 'authenticated' }) {
+  const byBucket = new Map();
+  for (const o of orphans) byBucket.set(o.bucket_id, (byBucket.get(o.bucket_id) ?? 0) + 1);
+  const buckets = [...byBucket.entries()].map(([b, n]) => `${b} (${n})`).join(', ');
+  const tenantOwned = tenantSegments.length;
+
+  return {
+    where: 'storage.objects (orphaned)',
+    message:
+      `${orphans.length} object(s) are referenced by no row: ${buckets}. ` +
+      (tenantOwned
+        ? `${tenantOwned} of them sit under a tenant folder (${tenantSegments.slice(0, 3).join(', ')}${tenantSegments.length > 3 ? ', …' : ''}), so that is one tenant's data outliving its record. `
+        : '') +
+      `Any signed URL issued for these before the row was deleted STILL SERVES until it expires — a signed URL is a bearer token checked against its signature and clock, not against RLS, and it cannot be revoked. ` +
+      `Deleting the row does not reach the object, and no policy you write will. ` +
+      `These are also invisible to every other check here: the tenant probes compare one tenant against another, and an orphan belongs to nobody.\n` +
+      `      Reported as a note, not a failure — an app may legitimately hold untracked assets, or track paths somewhere this database cannot see. The count is the thing to look at.`,
+    fix:
+      `Delete the objects when you delete the row, in the same operation — storage is not covered by ON DELETE CASCADE, so nothing does this for you:\n` +
+      `        await supabase.storage.from('<bucket>').remove([path]);   // before, or transactionally with, the row delete\n` +
+      `      To find them, and confirm this list:\n` +
+      `        select o.bucket_id, o.name from storage.objects o\n` +
+      `         where not exists (select 1 from ${links[0] ? `${links[0].schema}.${links[0].table} x where x.${links[0].column} = o.name` : '<your tracking table> x where x.<path column> = o.name'});\n` +
+      `      And shorten the signed-URL expiry: it is the ONLY bound on how long a leaked or stale URL keeps working. Minutes for a download link, not days.\n` +
+      `      If some of these are deliberately untracked (a logo, a seeded asset), narrow storageIsolation.schemas or add their bucket to storageIsolation.allowlist[].`,
   };
 }
 
@@ -444,6 +552,56 @@ export async function check({ query, config = {} }) {
     }
   } finally {
     try { await query('rollback', []); } catch { /* ignore */ }
+  }
+
+  // ── objects that outlived their row ────────────────────────────────
+  // Runs outside the impersonation transaction: this is a question about what
+  // EXISTS, not about what a role can reach, so it is asked privileged.
+  if (cfg.checkOrphans !== false) {
+    try {
+      const lc = linkingColumnsSql(cfg.schemas ?? ['public']);
+      const candidates = (await q(lc.text, lc.values)).slice(0, cfg.maxLinkCandidates ?? 200);
+
+      const links = [];
+      for (const c of candidates) {
+        const m = columnMatchesObjectsSql(c.schema, c.table, c.column, cfg.sampleLimit ? Math.max(cfg.sampleLimit, 500) : 500);
+        try {
+          if ((await q(m.text, m.values))[0].n > 0) links.push(c);
+        } catch { /* a column we cannot compare tells us nothing */ }
+      }
+
+      if (links.length === 0) {
+        // A skip, not a pass. With no proven link every object would look
+        // orphaned, and an app may track paths somewhere this database cannot
+        // see.
+        notes.push({
+          where: 'storage.objects (orphaned)',
+          message:
+            `could not identify any column that tracks storage object names, so objects with no owning row were NOT looked for. ` +
+            `This is not a clean result — it means the link between your tables and storage could not be established here. ` +
+            `A signed URL outlives the row it belonged to (it is a bearer token checked against its signature and clock, never against RLS, and it cannot be revoked), so an object left behind by a delete keeps being served for the whole expiry window.`,
+        });
+      } else {
+        const oq = orphanObjectsSql(links, 200);
+        const orphans = await q(oq.text, oq.values);
+        if (orphans.length > 0) {
+          const seg = Number(cfg.pathSegment ?? 1);
+          // Which tenant folders the orphans sit under, if the bucket uses
+          // that convention. A path with no separator has no tenant segment.
+          const tenantSegments = [...new Set(
+            orphans
+              .map((o) => String(o.name ?? ''))
+              .filter((name) => name.includes('/'))
+              .map((name) => name.split('/')[seg - 1])
+              .filter(Boolean),
+          )].slice(0, 6);
+          const v = classifyOrphans({ orphans, links, tenantSegments, role });
+          notes.push({ where: v.where, message: v.message, fix: v.fix });
+        }
+      }
+    } catch (err) {
+      notes.push({ where: 'storage.objects (orphaned)', message: `could not check for orphaned objects (${String(err.message).slice(0, 90)}) — NOT examined.` });
+    }
   }
 
   return {

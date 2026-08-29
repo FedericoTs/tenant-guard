@@ -193,6 +193,41 @@ kind of statement each one is making:
 |---|---|---|
 | `constraint-oracles` | a constraint answers questions **across** tenants | RLS hides rows, not constraints — and constraints are enforced *below* it. `users.email UNIQUE` on a tenant table means inserting `victim@corp.com` raises a duplicate-key error even though RLS hides the row that caused it, so anyone can test whether a value exists in another tenant (and `ON CONFLICT DO NOTHING` asks the same question with no error at all). Nothing about the policies is wrong; the *schema* is the leak |
 
+## Which architectures this is for
+
+Worth being straight about, because it decides how much of your safety this tool
+is carrying.
+
+**If the browser talks to PostgREST directly** — the anon key in the bundle,
+`supabase.from('invoices').select()` in a component — then RLS *is* your
+authorization boundary. There is no server layer to hold a tenant filter, every
+table in the exposed schema has an endpoint, and a policy that silently does not
+apply is the whole breach. That is the case this tool was built for, and it is
+the shape behind CVE-2025-48757.
+
+**If you put a server in front of it** — an API route, an ORM, a connection with
+a scoped role, PostgREST not exposed to the browser at all — then your tenant
+filter lives in application code and RLS is defence-in-depth. That is a
+legitimate architecture and arguably a better one: a single enforcement point you
+control, in a language with types.
+
+Supabase is a standard Postgres instance and nothing stops you doing this. The
+client-direct pattern is the default in the quickstarts, not a requirement.
+
+This tool is still worth running on the second architecture, for a narrower
+reason: defence-in-depth is only depth if it actually holds, and "RLS is enabled"
+is not the same as "RLS applies." A view runs as its owner. A materialized view
+ignores RLS entirely. Foreign key checks bypass it. `service_role` — which is
+usually what your server layer connects as — bypasses it wholesale, and every
+guarantee here is silent on that path (`prove` says so out loud rather than
+reporting green). If you are relying on RLS as a backstop, this tells you whether
+the backstop is there.
+
+But the honest ranking is: primary boundary → run it in CI and block the merge;
+backstop behind a server layer → run it, and know that your application-layer
+check is doing the real work. `route-org-scoping` is the guard aimed at that
+layer, and it is a static heuristic, not a proof.
+
 ## Which databases this is for
 
 **PostgreSQL, and anything that speaks it.** The runtime guards work by dropping to
